@@ -150,30 +150,17 @@ async function collectVideos(folderId, pathSoFar = '') {
 
 // ─── VLC LAUNCH ───────────────────────────────────────────────────────────────
 async function prefetchCdnUrl(fileId) {
-  // Issue a full GET with an AbortController so the browser follows Drive’s
-  // 302 redirect to the signed CDN URL, then cancel the body immediately.
-  // A Range request is served directly (206) without redirecting, so it
-  // never reveals the CDN host; a plain GET does trigger the redirect.
-  const ctrl = new AbortController();
   try {
     const res = await fetch(
-      `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,
-      { headers: { Authorization: `Bearer ${accessToken}` }, signal: ctrl.signal }
+      `https://random-vid-pick.vercel.app/api/resolve-drive` +
+      `?id=${encodeURIComponent(fileId)}&token=${encodeURIComponent(accessToken)}`
     );
-    if (res.body) res.body.cancel();
-
-    const finalUrl = res.url;
-    if (finalUrl && lastPicked && lastPicked.id === fileId) {
-      const host = new URL(finalUrl).host;
-      if (host !== 'www.googleapis.com') {
-        // Landed on a signed CDN URL — VLC can stream this without OAuth
-        lastStreamUrl = finalUrl;
-      }
+    if (!res.ok) return;
+    const { url } = await res.json();
+    if (url && lastPicked && lastPicked.id === fileId) {
+      lastStreamUrl = url;
     }
-  } catch (e) {
-    if (e.name === 'AbortError') return; // our own cancel, not an error
-    // CORS or network failure — openInVlc() will use the token-in-URL fallback
-  }
+  } catch (_) {}
 }
 
 function openInVlc() {
