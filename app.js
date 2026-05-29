@@ -154,11 +154,9 @@ function openInVlc() {
   const token  = encodeURIComponent(accessToken);
   const title  = encodeURIComponent(lastPicked.name);
 
-  // VLC's intent filter for https:// streams requires mimeType="video/*" with
-  // the BROWSABLE category. Without type=video%2F* in the intent URL, Android
-  // cannot match the installed VLC app and falls back to the Play Store listing.
-  // The vlc:// scheme is not registered as BROWSABLE, so Chrome cannot dispatch
-  // it to VLC from a PWA context.
+  // type=video%2F* matches VLC's BROWSABLE intent filter for https:// streams.
+  // This must be triggered by a direct user tap (no async gap) so Android
+  // grants VLC permission to launch in the foreground.
   const intentUrl =
     `intent://www.googleapis.com/drive/v3/files/${fileId}` +
     `?alt=media&access_token=${token}` +
@@ -188,15 +186,13 @@ async function pickRandom() {
     lastPicked = picked;
 
     pickingOverlay.classList.remove('visible');
-    setStatus(`Picked 1 of ${videos.length} videos`, 'ready');
+    setStatus(`Picked · tap OPEN IN VLC to play`, 'ready');
 
     videoFilename.textContent = picked.name;
     videoPath.textContent     = picked.path || '(root folder)';
     videoInfo.classList.add('visible');
     openVlcBtn.style.display  = '';
     pickBtn.disabled          = false;
-
-    openInVlc();
 
   } catch (err) {
     pickingOverlay.classList.remove('visible');
