@@ -55,7 +55,6 @@ function handleAuthCallback() {
     const expiry = Date.now() + (parseInt(expiresIn) * 1000);
     sessionStorage.setItem('rvp_token', token);
     sessionStorage.setItem('rvp_token_expiry', expiry.toString());
-    // Clean URL
     history.replaceState(null, '', window.location.pathname);
     updateUI(true);
   }
@@ -106,12 +105,10 @@ async function driveRequest(url) {
   return res.json();
 }
 
-// Recursively collect all video file objects under a folder
 async function collectVideos(folderId, pathSoFar = '') {
   const videos = [];
   let pageToken = null;
 
-  // First get all video files in this folder
   do {
     const mimeQuery = VIDEO_MIME_TYPES.map(m => `mimeType='${m}'`).join(' or ');
     let url = `https://www.googleapis.com/drive/v3/files`
@@ -119,7 +116,6 @@ async function collectVideos(folderId, pathSoFar = '') {
       + `&fields=nextPageToken,files(id,name)`
       + `&pageSize=1000`;
     if (pageToken) url += `&pageToken=${pageToken}`;
-
     const data = await driveRequest(url);
     if (data.files) {
       for (const f of data.files) {
@@ -129,7 +125,6 @@ async function collectVideos(folderId, pathSoFar = '') {
     pageToken = data.nextPageToken || null;
   } while (pageToken);
 
-  // Then recurse into subfolders
   let subPageToken = null;
   do {
     let url = `https://www.googleapis.com/drive/v3/files`
@@ -137,7 +132,6 @@ async function collectVideos(folderId, pathSoFar = '') {
       + `&fields=nextPageToken,files(id,name)`
       + `&pageSize=1000`;
     if (subPageToken) url += `&pageToken=${subPageToken}`;
-
     const data = await driveRequest(url);
     if (data.files) {
       for (const folder of data.files) {
@@ -150,6 +144,21 @@ async function collectVideos(folderId, pathSoFar = '') {
   } while (subPageToken);
 
   return videos;
+}
+
+// ─── VLC LAUNCH ───────────────────────────────────────────────────────────────
+function openInVlc() {
+  if (!lastPicked) return;
+  const streamUrl = `https://www.googleapis.com/drive/v3/files/${lastPicked.id}?alt=media&access_token=${accessToken}`;
+  const vlcIntent = `intent:${streamUrl}#Intent;package=org.videolan.vlc;action=android.intent.action.VIEW;type=video/*;end`;
+
+  // Must use a real anchor element click — Chrome blocks intent:// via window.location
+  const a = document.createElement('a');
+  a.href = vlcIntent;
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => document.body.removeChild(a), 1000);
 }
 
 // ─── PICK & PLAY ──────────────────────────────────────────────────────────────
@@ -187,15 +196,6 @@ async function pickRandom() {
     setStatus(err.message || 'Something went wrong', 'error');
     pickBtn.disabled = false;
   }
-}
-
-function openInVlc() {
-  if (!lastPicked) return;
-  // Direct streaming URL for the file
-  const streamUrl = `https://www.googleapis.com/drive/v3/files/${lastPicked.id}?alt=media&access_token=${accessToken}`;
-  // Intent URL to open directly in VLC with the stream
-  const vlcIntent = `intent:${streamUrl}#Intent;package=org.videolan.vlc;action=android.intent.action.VIEW;type=video/*;end`;
-  window.location.href = vlcIntent;
 }
 
 // ─── INIT ─────────────────────────────────────────────────────────────────────
