@@ -11,7 +11,7 @@ const VIDEO_MIME_TYPES = [
 // ─── STATE ────────────────────────────────────────────────────────────────────
 let accessToken   = null;
 let lastPicked    = null;
-let lastStreamUrl = null; // pre-fetched CDN URL; null → fall back to API URL + token
+let lastStreamUrl = null; // pre-fetched signed CDN URL; null → fall back to API URL
 
 // ─── DOM REFS ─────────────────────────────────────────────────────────────────
 const statusBar       = document.getElementById('statusBar');
@@ -150,25 +150,29 @@ async function collectVideos(folderId, pathSoFar = '') {
 
 // ─── VLC LAUNCH ───────────────────────────────────────────────────────────────
 async function prefetchCdnUrl(fileId) {
-  // Fetch one byte through the Drive API (with our Bearer token) so the
-  // browser follows any redirect. The final response.url is the signed CDN
-  // URL that VLC can stream directly without needing an OAuth header.
+  // Issue a full GET with an AbortController so the browser follows Drive’s
+  // 302 redirect to the signed CDN URL, then cancel the body immediately.
+  // A Range request is served directly (206) without redirecting, so it
+  // never reveals the CDN host; a plain GET does trigger the redirect.
+  const ctrl = new AbortController();
   try {
     const res = await fetch(
       `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,
-      { headers: { Authorization: `Bearer ${accessToken}`, Range: 'bytes=0-0' } }
+      { headers: { Authorization: `Bearer ${accessToken}` }, signal: ctrl.signal }
     );
+    if (res.body) res.body.cancel();
+
     const finalUrl = res.url;
-    // Only use it when the redirect actually landed on a different host (CDN),
-    // not when the API served the content directly from www.googleapis.com.
-    if (finalUrl && new URL(finalUrl).host !== 'www.googleapis.com') {
-      // Guard against a stale prefetch racing with a new pick
-      if (lastPicked && lastPicked.id === fileId) {
+    if (finalUrl && lastPicked && lastPicked.id === fileId) {
+      const host = new URL(finalUrl).host;
+      if (host !== 'www.googleapis.com') {
+        // Landed on a signed CDN URL — VLC can stream this without OAuth
         lastStreamUrl = finalUrl;
       }
     }
-  } catch (_) {
-    // Network/CORS failure — openInVlc() falls back to token-in-URL
+  } catch (e) {
+    if (e.name === 'AbortError') return; // our own cancel, not an error
+    // CORS or network failure — openInVlc() will use the token-in-URL fallback
   }
 }
 
@@ -176,23 +180,30 @@ function openInVlc() {
   if (!lastPicked) return;
 
   const title = encodeURIComponent(lastPicked.name);
+  const token = encodeURIComponent(accessToken);
 
-  // Prefer the pre-fetched signed CDN URL (no auth needed from VLC).
-  // Fall back to the Drive API URL with access_token in the query string.
-  const streamUrl = lastStreamUrl ||
-    `https://www.googleapis.com/drive/v3/files/${lastPicked.id}` +
-    `?alt=media&access_token=${encodeURIComponent(accessToken)}`;
+  let host, extraIntent = '';
 
-  const parsed = new URL(streamUrl);
-  const host   = parsed.host + parsed.pathname + parsed.search;
+  if (lastStreamUrl) {
+    // Happy path: signed CDN URL needs no OAuth from VLC
+    const p = new URL(lastStreamUrl);
+    host = p.host + p.pathname + p.search;
+  } else {
+    // Fallback: Drive API URL with token in query string.
+    // Also pass an Authorization header via S.headers — VLC versions that
+    // support this extra will use it instead of relying on the query param.
+    host = `www.googleapis.com/drive/v3/files/${lastPicked.id}` +
+           `?alt=media&access_token=${token}`;
+    extraIntent = `;S.headers=${encodeURIComponent('Authorization: Bearer ' + accessToken)}`;
+  }
 
-  // openInVlc() is synchronous: no await between button tap and intent dispatch,
-  // so Android sees a live user-activation and grants VLC foreground permission.
   // type=video%2F* matches VLC’s BROWSABLE intent filter for https:// streams.
+  // openInVlc() is synchronous so the button-tap user-activation survives
+  // to the intent dispatch, letting Android grant VLC foreground permission.
   const intentUrl =
     `intent://${host}` +
     `#Intent;scheme=https;package=org.videolan.vlc;type=video%2F*` +
-    `;S.title=${title};end`;
+    `;S.title=${title}${extraIntent};end`;
 
   window.location.href = intentUrl;
 }
@@ -218,21 +229,22 @@ async function pickRandom() {
     lastPicked = picked;
 
     pickingOverlay.classList.remove('visible');
-    setStatus('Picked · tap OPEN IN VLC to play', 'ready');
 
     videoFilename.textContent = picked.name;
     videoPath.textContent     = picked.path || '(root folder)';
     videoInfo.classList.add('visible');
     pickBtn.disabled = false;
 
-    // Show button disabled while resolving the CDN URL in the background.
-    // The button tap that eventually calls openInVlc() will be async-free,
-    // keeping the user-activation window alive for foreground launch.
+    // Button disabled + loading state while we resolve the CDN URL.
+    // openInVlc() stays synchronous, so the eventual tap has a live
+    // user-activation and Android launches VLC in the foreground.
     openVlcBtn.disabled = true;
     openVlcBtn.style.display = '';
+    setStatus('Resolving stream…', 'loading');
 
     prefetchCdnUrl(picked.id).finally(() => {
       openVlcBtn.disabled = false;
+      setStatus('Picked · tap OPEN IN VLC to play', 'ready');
     });
 
   } catch (err) {
