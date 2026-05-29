@@ -191,10 +191,10 @@ async function pickRandom() {
 
 function openInVlc() {
   if (!lastPicked) return;
-  // VLC Android can open Google Drive files via their web content link
-  const driveUrl = `https://drive.google.com/uc?export=download&id=${lastPicked.id}`;
-  // Try vlc:// deep link first; Android will fall back to intent if VLC handles it
-  const vlcIntent = `intent:${driveUrl}#Intent;package=org.videolan.vlc;action=android.intent.action.VIEW;end`;
+  // Direct streaming URL for the file
+  const streamUrl = `https://www.googleapis.com/drive/v3/files/${lastPicked.id}?alt=media&access_token=${accessToken}`;
+  // Intent URL to open directly in VLC with the stream
+  const vlcIntent = `intent:${streamUrl}#Intent;package=org.videolan.vlc;action=android.intent.action.VIEW;type=video/*;end`;
   window.location.href = vlcIntent;
 }
 
