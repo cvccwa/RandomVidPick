@@ -9,9 +9,8 @@ const VIDEO_MIME_TYPES = [
 ];
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
-let accessToken   = null;
-let lastPicked    = null;
-let lastStreamUrl = null; // pre-fetched signed CDN URL; null → fall back to API URL
+let accessToken = null;
+let lastPicked  = null;
 
 // ─── DOM REFS ─────────────────────────────────────────────────────────────────
 const statusBar       = document.getElementById('statusBar');
@@ -38,9 +37,8 @@ function signIn() {
 }
 
 function signOut() {
-  accessToken   = null;
-  lastPicked    = null;
-  lastStreamUrl = null;
+  accessToken = null;
+  lastPicked  = null;
   sessionStorage.removeItem('rvp_token');
   sessionStorage.removeItem('rvp_token_expiry');
   updateUI(false);
@@ -149,50 +147,16 @@ async function collectVideos(folderId, pathSoFar = '') {
 }
 
 // ─── VLC LAUNCH ───────────────────────────────────────────────────────────────
-async function prefetchCdnUrl(fileId) {
-  try {
-    const res = await fetch(
-      `https://random-vid-pick.vercel.app/api/resolve-drive` +
-      `?id=${encodeURIComponent(fileId)}&token=${encodeURIComponent(accessToken)}`
-    );
-    if (!res.ok) return;
-    const { url } = await res.json();
-    if (url && lastPicked && lastPicked.id === fileId) {
-      lastStreamUrl = url;
-    }
-  } catch (_) {}
-}
-
 function openInVlc() {
   if (!lastPicked) return;
-
   const title = encodeURIComponent(lastPicked.name);
+  const id    = encodeURIComponent(lastPicked.id);
   const token = encodeURIComponent(accessToken);
-
-  let host, extraIntent = '';
-
-  if (lastStreamUrl) {
-    // Happy path: signed CDN URL needs no OAuth from VLC
-    const p = new URL(lastStreamUrl);
-    host = p.host + p.pathname + p.search;
-  } else {
-    // Fallback: Drive API URL with token in query string.
-    // Also pass an Authorization header via S.headers — VLC versions that
-    // support this extra will use it instead of relying on the query param.
-    host = `www.googleapis.com/drive/v3/files/${lastPicked.id}` +
-           `?alt=media&access_token=${token}`;
-    extraIntent = `;S.headers=${encodeURIComponent('Authorization: Bearer ' + accessToken)}`;
-  }
-
-  // type=video%2F* matches VLC’s BROWSABLE intent filter for https:// streams.
-  // openInVlc() is synchronous so the button-tap user-activation survives
-  // to the intent dispatch, letting Android grant VLC foreground permission.
-  const intentUrl =
+  const host  = `random-vid-pick.vercel.app/api/stream?id=${id}&token=${token}`;
+  window.location.href =
     `intent://${host}` +
     `#Intent;scheme=https;package=org.videolan.vlc;type=video%2F*` +
-    `;S.title=${title}${extraIntent};end`;
-
-  window.location.href = intentUrl;
+    `;S.title=${title};end`;
 }
 
 // ─── PICK & PLAY ──────────────────────────────────────────────────────────────
@@ -200,7 +164,6 @@ async function pickRandom() {
   pickBtn.disabled = true;
   pickingOverlay.classList.add('visible');
   setStatus('Scanning library...', 'loading');
-  lastStreamUrl = null;
 
   try {
     const videos = await collectVideos(ROOT_FOLDER);
@@ -222,17 +185,9 @@ async function pickRandom() {
     videoInfo.classList.add('visible');
     pickBtn.disabled = false;
 
-    // Button disabled + loading state while we resolve the CDN URL.
-    // openInVlc() stays synchronous, so the eventual tap has a live
-    // user-activation and Android launches VLC in the foreground.
-    openVlcBtn.disabled = true;
     openVlcBtn.style.display = '';
-    setStatus('Resolving stream…', 'loading');
-
-    prefetchCdnUrl(picked.id).finally(() => {
-      openVlcBtn.disabled = false;
-      setStatus('Picked · tap OPEN IN VLC to play', 'ready');
-    });
+    openVlcBtn.disabled = false;
+    setStatus('Picked · tap OPEN IN VLC to play', 'ready');
 
   } catch (err) {
     pickingOverlay.classList.remove('visible');
