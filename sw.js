@@ -1,9 +1,9 @@
 const CACHE = 'rvp-v1';
 const ASSETS = [
-  '/random-video-picker/',
-  '/random-video-picker/index.html',
-  '/random-video-picker/app.js',
-  '/random-video-picker/manifest.json'
+  '/RandomVidPick/',
+  '/RandomVidPick/index.html',
+  '/RandomVidPick/app.js',
+  '/RandomVidPick/manifest.json'
 ];
 
 self.addEventListener('install', e => {

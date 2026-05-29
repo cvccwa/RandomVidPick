@@ -2,7 +2,7 @@
   "name": "Random Video Picker",
   "short_name": "RandVid",
   "description": "Pick a random video from your Google Drive",
-  "start_url": "/random-video-picker/",
+  "start_url": "/RandomVidPick/",
   "display": "standalone",
   "background_color": "#0a0a0a",
   "theme_color": "#0a0a0a",
