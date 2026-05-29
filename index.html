@@ -201,6 +201,16 @@
 
     .btn-secondary:hover:not(:disabled) { border-color: var(--muted); color: var(--text); }
 
+    .btn-filtered {
+      background: transparent;
+      color: var(--accent);
+      border: 2px solid var(--accent);
+      font-family: 'Bebas Neue', sans-serif;
+      font-size: 1.4rem;
+      letter-spacing: 0.1em;
+    }
+    .btn-filtered:hover:not(:disabled) { background: rgba(232,255,0,0.08); }
+
     /* Auth section */
     .auth-section {
       width: 100%;
@@ -274,6 +284,9 @@
   <div class="btn-group">
     <button class="btn btn-primary" id="pickBtn" disabled onclick="pickRandom()">
       PICK RANDOM VIDEO
+    </button>
+    <button class="btn btn-filtered" id="pickFilteredBtn" disabled onclick="pickRandom(FILTER_KEYWORDS)">
+      PICK FILTERED VIDEO
     </button>
     <button class="btn btn-secondary" id="openVlcBtn" style="display:none" onclick="openInVlc()">
       &#9654; OPEN IN VLC

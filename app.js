@@ -7,6 +7,7 @@ const VIDEO_MIME_TYPES = [
   'video/quicktime', 'video/x-msvideo', 'video/mpeg',
   'video/3gpp', 'video/x-flv', 'video/x-ms-wmv'
 ];
+const FILTER_KEYWORDS = /pixel|censor|blur/i;
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
 let accessToken = null;
@@ -21,8 +22,9 @@ const signOutBtn      = document.getElementById('signOutBtn');
 const videoInfo       = document.getElementById('videoInfo');
 const videoFilename   = document.getElementById('videoFilename');
 const videoPath       = document.getElementById('videoPath');
-const openVlcBtn      = document.getElementById('openVlcBtn');
-const pickingOverlay  = document.getElementById('pickingOverlay');
+const openVlcBtn       = document.getElementById('openVlcBtn');
+const pickFilteredBtn  = document.getElementById('pickFilteredBtn');
+const pickingOverlay   = document.getElementById('pickingOverlay');
 
 // ─── AUTH ─────────────────────────────────────────────────────────────────────
 function signIn() {
@@ -81,12 +83,14 @@ function updateUI(signedIn) {
     setStatus('Signed in · Ready to pick', 'ready');
     signInBtn.style.display  = 'none';
     signOutBtn.style.display = '';
-    pickBtn.disabled         = false;
+    pickBtn.disabled          = false;
+    pickFilteredBtn.disabled  = false;
   } else {
     setStatus('Not signed in');
     signInBtn.style.display  = '';
     signOutBtn.style.display = 'none';
     pickBtn.disabled         = true;
+    pickFilteredBtn.disabled = true;
     videoInfo.classList.remove('visible');
     openVlcBtn.style.display = 'none';
   }
@@ -160,18 +164,22 @@ function openInVlc() {
 }
 
 // ─── PICK & PLAY ──────────────────────────────────────────────────────────────
-async function pickRandom() {
-  pickBtn.disabled = true;
+async function pickRandom(filter = null) {
+  pickBtn.disabled         = true;
+  pickFilteredBtn.disabled = true;
   pickingOverlay.classList.add('visible');
   setStatus('Scanning library...', 'loading');
 
   try {
-    const videos = await collectVideos(ROOT_FOLDER);
+    let videos = await collectVideos(ROOT_FOLDER);
+
+    if (filter) videos = videos.filter(v => filter.test(v.name));
 
     if (videos.length === 0) {
-      setStatus('No videos found in folder', 'error');
+      setStatus(filter ? 'No matching videos found' : 'No videos found in folder', 'error');
       pickingOverlay.classList.remove('visible');
-      pickBtn.disabled = false;
+      pickBtn.disabled         = false;
+      pickFilteredBtn.disabled = false;
       return;
     }
 
@@ -183,7 +191,8 @@ async function pickRandom() {
     videoFilename.textContent = picked.name;
     videoPath.textContent     = picked.path || '(root folder)';
     videoInfo.classList.add('visible');
-    pickBtn.disabled = false;
+    pickBtn.disabled         = false;
+    pickFilteredBtn.disabled = false;
 
     openVlcBtn.style.display = '';
     openVlcBtn.disabled = false;
@@ -192,7 +201,8 @@ async function pickRandom() {
   } catch (err) {
     pickingOverlay.classList.remove('visible');
     setStatus(err.message || 'Something went wrong', 'error');
-    pickBtn.disabled = false;
+    pickBtn.disabled         = false;
+    pickFilteredBtn.disabled = false;
   }
 }
 
