@@ -149,11 +149,23 @@ async function collectVideos(folderId, pathSoFar = '') {
 // ─── VLC LAUNCH ───────────────────────────────────────────────────────────────
 function openInVlc() {
   if (!lastPicked) return;
-  // Use the authenticated stream URL
-  const streamUrl = `https://www.googleapis.com/drive/v3/files/${lastPicked.id}?alt=media&access_token=${accessToken}`;
-  // vlc:// scheme — VLC registers this as a custom URL handler on Android
-  const vlcUrl = `vlc://${streamUrl.replace('https://', '')}`;
-  window.location.href = vlcUrl;
+
+  const fileId = lastPicked.id;
+  const token  = encodeURIComponent(accessToken);
+  const title  = encodeURIComponent(lastPicked.name);
+
+  // VLC's intent filter for https:// streams requires mimeType="video/*" with
+  // the BROWSABLE category. Without type=video%2F* in the intent URL, Android
+  // cannot match the installed VLC app and falls back to the Play Store listing.
+  // The vlc:// scheme is not registered as BROWSABLE, so Chrome cannot dispatch
+  // it to VLC from a PWA context.
+  const intentUrl =
+    `intent://www.googleapis.com/drive/v3/files/${fileId}` +
+    `?alt=media&access_token=${token}` +
+    `#Intent;scheme=https;package=org.videolan.vlc;type=video%2F*` +
+    `;S.title=${title};end`;
+
+  window.location.href = intentUrl;
 }
 
 // ─── PICK & PLAY ──────────────────────────────────────────────────────────────
