@@ -10,7 +10,7 @@ const VIDEO_MIME_TYPES = [
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
 let accessToken   = null;
-let lastPicked    = null; // { id, name, path }
+let lastPicked    = null;
 
 // ─── DOM REFS ─────────────────────────────────────────────────────────────────
 const statusBar       = document.getElementById('statusBar');
@@ -48,8 +48,8 @@ function handleAuthCallback() {
   const hash = window.location.hash;
   if (!hash) return;
   const params = new URLSearchParams(hash.substring(1));
-  const token      = params.get('access_token');
-  const expiresIn  = params.get('expires_in');
+  const token     = params.get('access_token');
+  const expiresIn = params.get('expires_in');
   if (token) {
     accessToken = token;
     const expiry = Date.now() + (parseInt(expiresIn) * 1000);
@@ -149,16 +149,11 @@ async function collectVideos(folderId, pathSoFar = '') {
 // ─── VLC LAUNCH ───────────────────────────────────────────────────────────────
 function openInVlc() {
   if (!lastPicked) return;
+  // Use the authenticated stream URL
   const streamUrl = `https://www.googleapis.com/drive/v3/files/${lastPicked.id}?alt=media&access_token=${accessToken}`;
-  const vlcIntent = `intent:${streamUrl}#Intent;package=org.videolan.vlc;action=android.intent.action.VIEW;type=video/*;end`;
-
-  // Must use a real anchor element click — Chrome blocks intent:// via window.location
-  const a = document.createElement('a');
-  a.href = vlcIntent;
-  a.style.display = 'none';
-  document.body.appendChild(a);
-  a.click();
-  setTimeout(() => document.body.removeChild(a), 1000);
+  // vlc:// scheme — VLC registers this as a custom URL handler on Android
+  const vlcUrl = `vlc://${streamUrl.replace('https://', '')}`;
+  window.location.href = vlcUrl;
 }
 
 // ─── PICK & PLAY ──────────────────────────────────────────────────────────────
