@@ -12,7 +12,12 @@ export default async function handler(req) {
   const range = req.headers.get('range');
   if (range) reqHeaders['Range'] = range;
 
-  const driveRes = await fetch(driveUrl, { method: req.method, headers: reqHeaders });
+  let driveRes;
+  try {
+    driveRes = await fetch(driveUrl, { method: req.method, headers: reqHeaders });
+  } catch (err) {
+    return new Response('upstream fetch failed', { status: 502 });
+  }
 
   const resHeaders = new Headers({ 'Accept-Ranges': 'bytes' });
   for (const h of ['content-type', 'content-length', 'content-range']) {
