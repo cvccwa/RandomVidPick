@@ -41,8 +41,8 @@ function signIn() {
 function signOut() {
   accessToken = null;
   lastPicked  = null;
-  sessionStorage.removeItem('rvp_token');
-  sessionStorage.removeItem('rvp_token_expiry');
+  localStorage.removeItem('rvp_token');
+  localStorage.removeItem('rvp_token_expiry');
   updateUI(false);
 }
 
@@ -52,24 +52,82 @@ function handleAuthCallback() {
   const params = new URLSearchParams(hash.substring(1));
   const token     = params.get('access_token');
   const expiresIn = params.get('expires_in');
-  if (token) {
-    accessToken = token;
-    const expiry = Date.now() + (parseInt(expiresIn) * 1000);
-    sessionStorage.setItem('rvp_token', token);
-    sessionStorage.setItem('rvp_token_expiry', expiry.toString());
-    history.replaceState(null, '', window.location.pathname);
-    updateUI(true);
+  if (!token) return;
+
+  if (window.parent !== window) {
+    // Running inside silent-refresh iframe — send token to parent
+    window.parent.postMessage({ type: 'rvp_token', token }, window.location.origin);
+    return;
   }
+
+  accessToken = token;
+  const expiry = Date.now() + (parseInt(expiresIn) * 1000);
+  localStorage.setItem('rvp_token', token);
+  localStorage.setItem('rvp_token_expiry', expiry.toString());
+  history.replaceState(null, '', window.location.pathname);
+  updateUI(true);
+  scheduleRefresh();
 }
 
 function restoreSession() {
-  const token  = sessionStorage.getItem('rvp_token');
-  const expiry = sessionStorage.getItem('rvp_token_expiry');
+  const token  = localStorage.getItem('rvp_token');
+  const expiry = localStorage.getItem('rvp_token_expiry');
   if (token && expiry && Date.now() < parseInt(expiry)) {
     accessToken = token;
     return true;
   }
   return false;
+}
+
+function silentRefresh() {
+  return new Promise((resolve, reject) => {
+    const redirectUri = window.location.href.split('?')[0].split('#')[0];
+    const authUrl = `https://accounts.google.com/o/oauth2/v2/auth`
+      + `?client_id=${encodeURIComponent(CLIENT_ID)}`
+      + `&redirect_uri=${encodeURIComponent(redirectUri)}`
+      + `&response_type=token`
+      + `&scope=${encodeURIComponent(SCOPES)}`
+      + `&prompt=none`;
+
+    const iframe = document.createElement('iframe');
+    iframe.style.cssText = 'position:absolute;width:1px;height:1px;opacity:0;pointer-events:none';
+    iframe.src = authUrl;
+
+    const timer = setTimeout(() => {
+      iframe.remove();
+      reject(new Error('silent refresh timeout'));
+    }, 10000);
+
+    window.addEventListener('message', function handler(e) {
+      if (e.origin !== window.location.origin) return;
+      if (e.data && e.data.type === 'rvp_token') {
+        clearTimeout(timer);
+        window.removeEventListener('message', handler);
+        iframe.remove();
+        if (e.data.token) resolve(e.data.token);
+        else reject(new Error('no token in message'));
+      }
+    });
+
+    document.body.appendChild(iframe);
+  });
+}
+
+function scheduleRefresh() {
+  const expiry = parseInt(localStorage.getItem('rvp_token_expiry') || '0');
+  const msLeft = expiry - Date.now() - 5 * 60 * 1000;
+  if (msLeft <= 0) return;
+  setTimeout(() => {
+    silentRefresh()
+      .then(token => {
+        accessToken = token;
+        const newExpiry = Date.now() + 3500 * 1000;
+        localStorage.setItem('rvp_token', token);
+        localStorage.setItem('rvp_token_expiry', newExpiry.toString());
+        scheduleRefresh();
+      })
+      .catch(() => {});
+  }, msLeft);
 }
 
 // ─── UI ───────────────────────────────────────────────────────────────────────
@@ -211,8 +269,19 @@ handleAuthCallback();
 if (!accessToken) {
   if (restoreSession()) {
     updateUI(true);
+    scheduleRefresh();
   } else {
-    updateUI(false);
+    setStatus('Checking session...', 'loading');
+    silentRefresh()
+      .then(token => {
+        accessToken = token;
+        const expiry = Date.now() + 3500 * 1000;
+        localStorage.setItem('rvp_token', token);
+        localStorage.setItem('rvp_token_expiry', expiry.toString());
+        updateUI(true);
+        scheduleRefresh();
+      })
+      .catch(() => updateUI(false));
   }
 } else {
   updateUI(true);
