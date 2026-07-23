@@ -8,6 +8,7 @@ const VIDEO_MIME_TYPES = [
   'video/3gpp', 'video/x-flv', 'video/x-ms-wmv'
 ];
 const FILTER_KEYWORDS = /pixel|censor|blur/i;
+const APP_VERSION = 'v7';
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
 let accessToken = null;
@@ -25,6 +26,7 @@ const videoPath       = document.getElementById('videoPath');
 const openVlcBtn       = document.getElementById('openVlcBtn');
 const pickFilteredBtn  = document.getElementById('pickFilteredBtn');
 const pickingOverlay   = document.getElementById('pickingOverlay');
+const appVersion       = document.getElementById('appVersion');
 
 // ─── AUTH ─────────────────────────────────────────────────────────────────────
 function signIn() {
@@ -210,7 +212,7 @@ async function collectVideos(folderId, pathSoFar = '') {
 
 // ─── VLC LAUNCH ───────────────────────────────────────────────────────────────
 function prewarmStream(fileId) {
-  fetch(`https://random-vid-pick.vercel.app/api/stream?id=${encodeURIComponent(fileId)}`, {
+  return fetch(`https://random-vid-pick.vercel.app/api/stream?id=${encodeURIComponent(fileId)}`, {
     method: 'HEAD',
   }).catch(() => {});
 }
@@ -248,7 +250,6 @@ async function pickRandom(filter = null) {
 
     const picked = videos[Math.floor(Math.random() * videos.length)];
     lastPicked = picked;
-    prewarmStream(picked.id);
 
     pickingOverlay.classList.remove('visible');
 
@@ -259,6 +260,11 @@ async function pickRandom(filter = null) {
     pickFilteredBtn.disabled = false;
 
     openVlcBtn.style.display = '';
+    openVlcBtn.disabled = true;
+    setStatus('Warming stream…', 'loading');
+
+    await prewarmStream(picked.id);
+
     openVlcBtn.disabled = false;
     setStatus('Picked · tap OPEN IN VLC to play', 'ready');
 
@@ -271,6 +277,7 @@ async function pickRandom(filter = null) {
 }
 
 // ─── INIT ─────────────────────────────────────────────────────────────────────
+appVersion.textContent = APP_VERSION;
 handleAuthCallback();
 if (!accessToken) {
   if (restoreSession()) {
