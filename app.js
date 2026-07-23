@@ -209,6 +209,12 @@ async function collectVideos(folderId, pathSoFar = '') {
 }
 
 // ─── VLC LAUNCH ───────────────────────────────────────────────────────────────
+function prewarmStream(fileId) {
+  fetch(`https://random-vid-pick.vercel.app/api/stream?id=${encodeURIComponent(fileId)}`, {
+    method: 'HEAD',
+  }).catch(() => {});
+}
+
 function openInVlc() {
   if (!lastPicked) return;
   const title = encodeURIComponent(lastPicked.name);
@@ -242,6 +248,7 @@ async function pickRandom(filter = null) {
 
     const picked = videos[Math.floor(Math.random() * videos.length)];
     lastPicked = picked;
+    prewarmStream(picked.id);
 
     pickingOverlay.classList.remove('visible');
 
