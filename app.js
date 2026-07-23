@@ -213,8 +213,7 @@ function openInVlc() {
   if (!lastPicked) return;
   const title = encodeURIComponent(lastPicked.name);
   const id    = encodeURIComponent(lastPicked.id);
-  const token = encodeURIComponent(accessToken);
-  const host  = `random-vid-pick.vercel.app/api/stream?id=${id}&token=${token}`;
+  const host  = `random-vid-pick.vercel.app/api/stream?id=${id}`;
   window.location.href =
     `intent://${host}` +
     `#Intent;scheme=https;package=org.videolan.vlc;type=video%2F*` +
