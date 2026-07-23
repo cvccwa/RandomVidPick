@@ -2,16 +2,37 @@ export const config = { runtime: 'edge' };
 
 const ALLOWED_ORIGIN = 'https://cvccwa.github.io';
 
-// Module-level token cache — survives across requests within the same Edge instance
-let cachedToken = null;
-let tokenExpiry = 0;
+// Shared token cache in Vercel KV (Upstash Redis) — readable in low-single-digit ms
+// from ANY Edge instance/region, unlike a module-level variable which only lives
+// inside one isolate. This is what actually eliminates the cold-isolate JWT+OAuth
+// round trip that was causing VLC to hang on first playback attempts.
+const KV_URL    = process.env.KV_REST_API_URL   || process.env.UPSTASH_REDIS_REST_URL;
+const KV_TOKEN  = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
+const TOKEN_KEY = 'rvp_drive_token';
+
+async function kvCommand(command) {
+  const res = await fetch(KV_URL, {
+    method:  'POST',
+    headers: { Authorization: `Bearer ${KV_TOKEN}`, 'Content-Type': 'application/json' },
+    body:    JSON.stringify(command),
+  });
+  if (!res.ok) throw new Error(`kv error ${res.status}`);
+  return (await res.json()).result;
+}
 
 function b64url(binaryStr) {
   return btoa(binaryStr).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
 }
 
 async function getServiceAccountToken() {
-  if (cachedToken && Date.now() < tokenExpiry) return cachedToken;
+  if (KV_URL && KV_TOKEN) {
+    try {
+      const cached = await kvCommand(['GET', TOKEN_KEY]);
+      if (cached) return cached;
+    } catch (err) {
+      // KV unreachable/misconfigured — fall through and mint a fresh token directly
+    }
+  }
 
   const email  = process.env.GOOGLE_CLIENT_EMAIL;
   const rawKey = (process.env.GOOGLE_PRIVATE_KEY || '').replace(/\\n/g, '\n');
@@ -69,9 +90,13 @@ async function getServiceAccountToken() {
   }
 
   const { access_token, expires_in } = await tokenRes.json();
-  cachedToken  = access_token;
-  tokenExpiry  = Date.now() + (expires_in - 60) * 1000; // refresh 60 s early
-  return cachedToken;
+
+  if (KV_URL && KV_TOKEN) {
+    // Fire-and-forget — don't let a slow/failed KV write delay this response
+    kvCommand(['SET', TOKEN_KEY, access_token, 'EX', expires_in - 60]).catch(() => {});
+  }
+
+  return access_token;
 }
 
 export default async function handler(req) {
