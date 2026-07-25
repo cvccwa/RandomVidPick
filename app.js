@@ -8,7 +8,7 @@ const VIDEO_MIME_TYPES = [
   'video/3gpp', 'video/x-flv', 'video/x-ms-wmv'
 ];
 const FILTER_KEYWORDS = /pixel|censor|blur/i;
-const APP_VERSION = 'v9';
+const APP_VERSION = 'v10';
 const BROWSE_BATCH = 50;
 const THUMBNAIL_HOST = 'https://random-vid-pick.vercel.app';
 
@@ -308,17 +308,21 @@ function buildCard(video) {
   card.className = 'browse-card';
   card.onclick = () => playVideo(video);
 
+  const thumb = document.createElement('div');
+  thumb.className = 'browse-thumb';
+
   const img = document.createElement('img');
   img.loading  = 'lazy';
   img.decoding = 'async';
   img.src      = `${THUMBNAIL_HOST}/api/thumbnail?id=${encodeURIComponent(video.id)}`;
   img.onerror  = () => img.classList.add('thumb-fallback');
+  thumb.appendChild(img);
 
   const caption = document.createElement('div');
   caption.className = 'browse-caption';
   caption.textContent = video.name;
 
-  card.append(img, caption);
+  card.append(thumb, caption);
   return card;
 }
 
@@ -351,9 +355,12 @@ function resetBrowseGrid(list) {
 
   if (browseObserver) browseObserver.disconnect();
   if (browseRendered < browseFiltered.length) {
+    // root must be the grid itself, not the default (page viewport) — the
+    // grid is its own scroll container, so "near the bottom" means near the
+    // bottom of ITS scroll area, not the page's.
     browseObserver = new IntersectionObserver(entries => {
       if (entries[0].isIntersecting) renderNextBatch();
-    });
+    }, { root: browseGrid, rootMargin: '300px' });
     browseObserver.observe(browseSentinel);
   } else {
     browseObserver = null;
