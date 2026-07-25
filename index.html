@@ -321,7 +321,18 @@
       padding: 0 1rem 1rem;
     }
 
+    /* Explicit height on the card itself, not just the thumbnail inside it.
+       CSS Grid has a documented quirk: a grid item with non-visible overflow
+       can contribute a ZERO automatic size to its row's sizing, instead of
+       a content-based one — meaning the row can size far smaller than this
+       card's content wants, and overflow:hidden then crops everything down
+       to fit. An explicit height is a definite size, not subject to that
+       "automatic minimum" ambiguity, so the row is forced to fit it exactly.
+       Nothing in this card relies on auto/content-based sizing anymore. */
     .browse-card {
+      height: 145px;
+      display: flex;
+      flex-direction: column;
       background: var(--surface);
       border: 1px solid var(--border);
       border-radius: 4px;
@@ -332,12 +343,10 @@
 
     .browse-card:active { transform: scale(0.97); }
 
-    /* Fixed height, independent of aspect-ratio CSS support or whether the
-       image has loaded yet — guarantees every card reserves the same space
-       immediately, so nothing can collapse to a sliver while loading. */
     .browse-thumb {
       width: 100%;
       height: 100px;
+      flex-shrink: 0;
       background: var(--border);
       overflow: hidden;
     }
@@ -355,6 +364,8 @@
     }
 
     .browse-caption {
+      flex: 1;
+      min-height: 0;
       padding: 0.4rem 0.5rem;
       font-size: 0.7rem;
       color: var(--text);
