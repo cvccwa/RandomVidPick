@@ -13,6 +13,7 @@ const APP_VERSION = 'v7';
 // ─── STATE ────────────────────────────────────────────────────────────────────
 let accessToken = null;
 let lastPicked  = null;
+let videoCache  = null; // full unfiltered list, scanned once per page load
 
 // ─── DOM REFS ─────────────────────────────────────────────────────────────────
 const statusBar       = document.getElementById('statusBar');
@@ -43,6 +44,7 @@ function signIn() {
 function signOut() {
   accessToken = null;
   lastPicked  = null;
+  videoCache  = null;
   localStorage.removeItem('rvp_token');
   localStorage.removeItem('rvp_token_expiry');
   updateUI(false);
@@ -233,12 +235,11 @@ async function pickRandom(filter = null) {
   pickBtn.disabled         = true;
   pickFilteredBtn.disabled = true;
   pickingOverlay.classList.add('visible');
-  setStatus('Scanning library...', 'loading');
+  if (!videoCache) setStatus('Scanning library...', 'loading');
 
   try {
-    let videos = await collectVideos(ROOT_FOLDER);
-
-    if (filter) videos = videos.filter(v => filter.test(v.name));
+    if (!videoCache) videoCache = await collectVideos(ROOT_FOLDER);
+    let videos = filter ? videoCache.filter(v => filter.test(v.name)) : videoCache;
 
     if (videos.length === 0) {
       setStatus(filter ? 'No matching videos found' : 'No videos found in folder', 'error');
