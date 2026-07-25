@@ -8,7 +8,7 @@ const VIDEO_MIME_TYPES = [
   'video/3gpp', 'video/x-flv', 'video/x-ms-wmv'
 ];
 const FILTER_KEYWORDS = /pixel|censor|blur/i;
-const APP_VERSION = 'v7';
+const APP_VERSION = 'v8';
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
 let accessToken = null;
