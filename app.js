@@ -8,12 +8,20 @@ const VIDEO_MIME_TYPES = [
   'video/3gpp', 'video/x-flv', 'video/x-ms-wmv'
 ];
 const FILTER_KEYWORDS = /pixel|censor|blur/i;
-const APP_VERSION = 'v8';
+const APP_VERSION = 'v9';
+const BROWSE_BATCH = 50;
+const THUMBNAIL_HOST = 'https://random-vid-pick.vercel.app';
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
 let accessToken = null;
 let lastPicked  = null;
 let videoCache  = null; // full unfiltered list, scanned once per page load
+
+// Browse view: current filtered list and how many of it are rendered so far.
+let browseFiltered = [];
+let browseRendered = 0;
+let browseObserver = null;
+let browseSearchDebounce = null;
 
 // ─── DOM REFS ─────────────────────────────────────────────────────────────────
 const statusBar       = document.getElementById('statusBar');
@@ -28,6 +36,12 @@ const openVlcBtn       = document.getElementById('openVlcBtn');
 const pickFilteredBtn  = document.getElementById('pickFilteredBtn');
 const pickingOverlay   = document.getElementById('pickingOverlay');
 const appVersion       = document.getElementById('appVersion');
+const browseBtn        = document.getElementById('browseBtn');
+const browseView       = document.getElementById('browseView');
+const browseSearch     = document.getElementById('browseSearch');
+const browseCount      = document.getElementById('browseCount');
+const browseGrid       = document.getElementById('browseGrid');
+const browseSentinel   = document.getElementById('browseSentinel');
 
 // ─── AUTH ─────────────────────────────────────────────────────────────────────
 function signIn() {
@@ -147,14 +161,17 @@ function updateUI(signedIn) {
     signOutBtn.style.display = '';
     pickBtn.disabled          = false;
     pickFilteredBtn.disabled  = false;
+    browseBtn.disabled        = false;
   } else {
     setStatus('Not signed in');
     signInBtn.style.display  = '';
     signOutBtn.style.display = 'none';
     pickBtn.disabled         = true;
     pickFilteredBtn.disabled = true;
+    browseBtn.disabled       = true;
     videoInfo.classList.remove('visible');
     openVlcBtn.style.display = 'none';
+    closeBrowseView();
   }
 }
 
@@ -275,6 +292,127 @@ async function pickRandom(filter = null) {
     pickBtn.disabled         = false;
     pickFilteredBtn.disabled = false;
   }
+}
+
+// ─── BROWSE ───────────────────────────────────────────────────────────────────
+function filterVideos(query) {
+  if (!query) return videoCache || [];
+  const q = query.toLowerCase();
+  return (videoCache || []).filter(v =>
+    v.name.toLowerCase().includes(q) || (v.path && v.path.toLowerCase().includes(q))
+  );
+}
+
+function buildCard(video) {
+  const card = document.createElement('div');
+  card.className = 'browse-card';
+  card.onclick = () => playVideo(video);
+
+  const img = document.createElement('img');
+  img.loading  = 'lazy';
+  img.decoding = 'async';
+  img.src      = `${THUMBNAIL_HOST}/api/thumbnail?id=${encodeURIComponent(video.id)}`;
+  img.onerror  = () => img.classList.add('thumb-fallback');
+
+  const caption = document.createElement('div');
+  caption.className = 'browse-caption';
+  caption.textContent = video.name;
+
+  card.append(img, caption);
+  return card;
+}
+
+function renderNextBatch() {
+  const slice = browseFiltered.slice(browseRendered, browseRendered + BROWSE_BATCH);
+  const frag = document.createDocumentFragment();
+  for (const v of slice) frag.appendChild(buildCard(v));
+  browseGrid.insertBefore(frag, browseSentinel);
+
+  browseRendered += slice.length;
+  browseCount.textContent = `Showing ${browseRendered} of ${browseFiltered.length}`;
+
+  if (browseRendered >= browseFiltered.length && browseObserver) {
+    browseObserver.disconnect();
+    browseObserver = null;
+  }
+}
+
+function resetBrowseGrid(list) {
+  browseFiltered = list;
+  browseRendered = 0;
+
+  // Clear rendered cards but keep the sentinel node itself (it's a fixed
+  // element referenced by browseSentinel, not recreated) so the observer
+  // below can keep watching the same node across resets.
+  browseGrid.innerHTML = '';
+  browseGrid.appendChild(browseSentinel);
+
+  renderNextBatch();
+
+  if (browseObserver) browseObserver.disconnect();
+  if (browseRendered < browseFiltered.length) {
+    browseObserver = new IntersectionObserver(entries => {
+      if (entries[0].isIntersecting) renderNextBatch();
+    });
+    browseObserver.observe(browseSentinel);
+  } else {
+    browseObserver = null;
+  }
+}
+
+async function openBrowseView() {
+  browseBtn.disabled = true;
+  try {
+    if (!videoCache) {
+      pickingOverlay.classList.add('visible');
+      setStatus('Scanning library...', 'loading');
+      videoCache = await collectVideos(ROOT_FOLDER);
+      pickingOverlay.classList.remove('visible');
+      setStatus('Signed in · Ready to pick', 'ready');
+    }
+    browseSearch.value = '';
+    resetBrowseGrid(videoCache);
+    browseView.classList.add('visible');
+  } catch (err) {
+    pickingOverlay.classList.remove('visible');
+    setStatus(err.message || 'Something went wrong', 'error');
+  } finally {
+    browseBtn.disabled = false;
+  }
+}
+
+function closeBrowseView() {
+  browseView.classList.remove('visible');
+  if (browseObserver) {
+    browseObserver.disconnect();
+    browseObserver = null;
+  }
+}
+
+browseSearch.addEventListener('input', () => {
+  clearTimeout(browseSearchDebounce);
+  browseSearchDebounce = setTimeout(() => {
+    resetBrowseGrid(filterVideos(browseSearch.value.trim()));
+  }, 150);
+});
+
+async function playVideo(video) {
+  lastPicked = video;
+  closeBrowseView();
+
+  videoFilename.textContent = video.name;
+  videoPath.textContent     = video.path || '(root folder)';
+  videoInfo.classList.add('visible');
+
+  openVlcBtn.style.display = '';
+  openVlcBtn.disabled = true;
+  setStatus('Warming stream…', 'loading');
+
+  await prewarmStream(video.id);
+
+  openInVlc();
+  openVlcBtn.disabled = false;
+  setStatus('Picked · tap OPEN IN VLC to play', 'ready');
 }
 
 // ─── INIT ─────────────────────────────────────────────────────────────────────

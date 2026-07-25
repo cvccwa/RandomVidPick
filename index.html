@@ -260,6 +260,99 @@
       color: var(--muted);
       letter-spacing: 0.2em;
     }
+
+    /* Browse view */
+    .browse-view {
+      position: fixed;
+      inset: 0;
+      background: var(--bg);
+      display: none;
+      flex-direction: column;
+      z-index: 200;
+    }
+
+    .browse-view.visible { display: flex; }
+
+    .browse-header {
+      display: flex;
+      gap: 0.5rem;
+      padding: 1rem;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+
+    .browse-back {
+      width: auto;
+      flex-shrink: 0;
+    }
+
+    .browse-search {
+      flex: 1;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 0.75rem;
+      color: var(--text);
+      font-family: 'DM Mono', monospace;
+      font-size: 0.8rem;
+    }
+
+    .browse-search:focus { outline: none; border-color: var(--muted); }
+
+    .browse-count {
+      padding: 0.5rem 1rem;
+      font-size: 0.6rem;
+      color: var(--muted);
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      flex-shrink: 0;
+    }
+
+    .browse-grid {
+      flex: 1;
+      overflow-y: auto;
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+      gap: 0.5rem;
+      padding: 0 1rem 1rem;
+    }
+
+    .browse-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      overflow: hidden;
+      cursor: pointer;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    .browse-card:active { transform: scale(0.97); }
+
+    .browse-card img {
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      object-fit: cover;
+      background: var(--border);
+      display: block;
+    }
+
+    .browse-card img.thumb-fallback {
+      object-fit: none;
+      background: var(--border) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23555' stroke-width='1.5'%3E%3Crect x='2' y='4' width='20' height='16' rx='2'/%3E%3Cpath d='M10 9l5 3-5 3z' fill='%23555'/%3E%3C/svg%3E") center/2rem no-repeat;
+    }
+
+    .browse-caption {
+      padding: 0.4rem 0.5rem;
+      font-size: 0.65rem;
+      color: var(--text);
+      word-break: break-all;
+      line-height: 1.3;
+    }
+
+    .browse-sentinel {
+      height: 1px;
+      grid-column: 1 / -1;
+    }
   </style>
 </head>
 <body>
@@ -291,6 +384,9 @@
     <button class="btn btn-secondary" id="openVlcBtn" style="display:none" onclick="openInVlc()">
       &#9654; OPEN IN VLC
     </button>
+    <button class="btn btn-secondary" id="browseBtn" disabled onclick="openBrowseView()">
+      BROWSE LIBRARY
+    </button>
   </div>
 
   <div class="auth-section">
@@ -305,6 +401,18 @@
 <div class="picking-overlay" id="pickingOverlay">
   <div class="picking-text">PICKING...</div>
   <div class="picking-sub">Scanning your library</div>
+</div>
+
+<!-- Browse view -->
+<div class="browse-view" id="browseView">
+  <div class="browse-header">
+    <button class="btn btn-secondary browse-back" id="browseBackBtn" onclick="closeBrowseView()">&larr; BACK</button>
+    <input type="text" class="browse-search" id="browseSearch" placeholder="Search filename or folder..." />
+  </div>
+  <div class="browse-count" id="browseCount"></div>
+  <div class="browse-grid" id="browseGrid">
+    <div class="browse-sentinel" id="browseSentinel"></div>
+  </div>
 </div>
 
 <script src="app.js"></script>
