@@ -8,7 +8,7 @@ const VIDEO_MIME_TYPES = [
   'video/3gpp', 'video/x-flv', 'video/x-ms-wmv'
 ];
 const FILTER_KEYWORDS = /pixel|censor|blur/i;
-const APP_VERSION = 'v12';
+const APP_VERSION = 'v13';
 const BROWSE_BATCH = 50;
 const THUMBNAIL_HOST = 'https://random-vid-pick.vercel.app';
 
@@ -315,7 +315,10 @@ function buildCard(video) {
   img.loading  = 'lazy';
   img.decoding = 'async';
   img.src      = `${THUMBNAIL_HOST}/api/thumbnail?id=${encodeURIComponent(video.id)}`;
-  img.onerror  = () => img.classList.add('thumb-fallback');
+  img.onerror  = () => {
+    img.classList.add('thumb-fallback');
+    queueFrameThumb(video.id, img);
+  };
   thumb.appendChild(img);
 
   const caption = document.createElement('div');
@@ -324,6 +327,126 @@ function buildCard(video) {
 
   card.append(thumb, caption);
   return card;
+}
+
+// ─── FRAME THUMBNAILS ─────────────────────────────────────────────────────────
+// Drive never generates thumbnails for some files (common for multi-GB
+// uploads), so /api/thumbnail 404s for them. For those, grab a frame from
+// the video itself via /api/stream (which already sends CORS headers, so
+// the canvas isn't tainted) and cache the JPEG in IndexedDB so each video
+// is only decoded once, ever.
+const FRAME_THUMB_CONCURRENCY = 2;
+const FRAME_THUMB_TIMEOUT_MS  = 20000;
+const FRAME_THUMB_WIDTH       = 320;
+
+let thumbDbPromise = null;
+const frameThumbQueue  = [];
+const frameThumbFailed = new Set(); // undecodable this session - don't retry
+let frameThumbActive = 0;
+
+function openThumbDb() {
+  if (!thumbDbPromise) {
+    thumbDbPromise = new Promise((resolve, reject) => {
+      const req = indexedDB.open('rvp-thumbs', 1);
+      req.onupgradeneeded = () => req.result.createObjectStore('thumbs');
+      req.onsuccess = () => resolve(req.result);
+      req.onerror   = () => reject(req.error);
+    }).catch(() => null); // private mode etc. - just skip caching
+  }
+  return thumbDbPromise;
+}
+
+async function thumbDbGet(id) {
+  const db = await openThumbDb();
+  if (!db) return null;
+  return new Promise(resolve => {
+    const req = db.transaction('thumbs').objectStore('thumbs').get(id);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror   = () => resolve(null);
+  });
+}
+
+async function thumbDbPut(id, blob) {
+  const db = await openThumbDb();
+  if (!db) return;
+  db.transaction('thumbs', 'readwrite').objectStore('thumbs').put(blob, id);
+}
+
+function showThumbBlob(img, blob) {
+  img.onerror = null;
+  img.classList.remove('thumb-fallback');
+  img.src = URL.createObjectURL(blob);
+  img.onload = () => URL.revokeObjectURL(img.src);
+}
+
+async function queueFrameThumb(id, img) {
+  const cached = await thumbDbGet(id);
+  if (cached) return showThumbBlob(img, cached);
+  if (frameThumbFailed.has(id)) return;
+  frameThumbQueue.push({ id, img });
+  pumpFrameThumbQueue();
+}
+
+function pumpFrameThumbQueue() {
+  while (frameThumbActive < FRAME_THUMB_CONCURRENCY && frameThumbQueue.length) {
+    const job = frameThumbQueue.shift();
+    // Grid was reset/filtered since this was queued - card is gone, skip it.
+    if (!job.img.isConnected) continue;
+    frameThumbActive++;
+    captureFrame(job.id)
+      .then(blob => {
+        thumbDbPut(job.id, blob);
+        if (job.img.isConnected) showThumbBlob(job.img, blob);
+      })
+      .catch(() => frameThumbFailed.add(job.id))
+      .finally(() => {
+        frameThumbActive--;
+        pumpFrameThumbQueue();
+      });
+  }
+}
+
+function captureFrame(id) {
+  return new Promise((resolve, reject) => {
+    const video = document.createElement('video');
+    video.crossOrigin = 'anonymous';
+    video.muted       = true;
+    video.playsInline = true;
+    video.preload     = 'metadata';
+
+    const cleanup = () => {
+      clearTimeout(timer);
+      video.removeAttribute('src');
+      video.load(); // releases the network connection
+    };
+    const fail = () => { cleanup(); reject(new Error('frame capture failed')); };
+    const timer = setTimeout(fail, FRAME_THUMB_TIMEOUT_MS);
+
+    video.onerror = fail; // e.g. a codec this browser can't decode
+    video.onloadedmetadata = () => {
+      // 10% in (capped at 30s) skips black intro frames without seeking
+      // deep into a multi-GB file.
+      const d = isFinite(video.duration) ? video.duration : 0;
+      video.currentTime = Math.min(d * 0.1, 30);
+    };
+    video.onseeked = () => {
+      try {
+        const scale  = FRAME_THUMB_WIDTH / (video.videoWidth || FRAME_THUMB_WIDTH);
+        const canvas = document.createElement('canvas');
+        canvas.width  = FRAME_THUMB_WIDTH;
+        canvas.height = Math.round((video.videoHeight || 180) * scale);
+        canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+        canvas.toBlob(blob => {
+          cleanup();
+          blob ? resolve(blob) : reject(new Error('empty frame'));
+        }, 'image/jpeg', 0.7);
+      } catch (err) {
+        fail();
+      }
+    };
+
+    video.src = `${THUMBNAIL_HOST}/api/stream?id=${encodeURIComponent(id)}`;
+  });
 }
 
 function renderNextBatch() {
