@@ -4,6 +4,22 @@ export const config = { runtime: 'edge' };
 
 const ALLOWED_ORIGIN = 'https://cvccwa.github.io';
 
+// Tags which branch a thumbnail miss came from (Drive had no thumbnailLink
+// vs. the thumbnail CDN refusing it) - both are 404s, and runtime logs only
+// record the status, so the console.log lines alongside these are what
+// actually tell them apart when diagnosing.
+function thumbMiss(reason, status, extraHeaders = {}) {
+  return new Response('no thumbnail', {
+    status,
+    headers: {
+      'X-Thumb-Miss':                  reason,
+      'Access-Control-Allow-Origin':   ALLOWED_ORIGIN,
+      'Access-Control-Expose-Headers': 'X-Thumb-Miss',
+      ...extraHeaders,
+    },
+  });
+}
+
 export default async function handler(req) {
   const origin = req.headers.get('origin');
   if (origin && origin !== ALLOWED_ORIGIN) {
@@ -38,10 +54,8 @@ export default async function handler(req) {
   // types). Short cache so a miss doesn't stick around once Drive generates
   // one, unlike the 7-day cache on an actual hit below.
   if (!thumbnailLink) {
-    return new Response('no thumbnail', {
-      status:  404,
-      headers: { 'Cache-Control': 'max-age=300' },
-    });
+    console.log(`thumb-miss no-link id=${id}`);
+    return thumbMiss('no-link', 404, { 'Cache-Control': 'max-age=300' });
   }
 
   let thumbRes;
@@ -58,7 +72,10 @@ export default async function handler(req) {
   // Pass through the real status instead of collapsing every failure to a
   // flat 502, so a genuine upstream problem is distinguishable from this
   // proxy's own errors if it ever needs diagnosing again.
-  if (!thumbRes.ok) return new Response('upstream fetch failed', { status: thumbRes.status });
+  if (!thumbRes.ok) {
+    console.log(`thumb-miss cdn-${thumbRes.status} id=${id}`);
+    return thumbMiss(`cdn-${thumbRes.status}`, thumbRes.status);
+  }
 
   const resHeaders = new Headers({
     'Cache-Control':                'public, max-age=604800, immutable',
