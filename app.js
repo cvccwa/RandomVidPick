@@ -8,7 +8,7 @@ const VIDEO_MIME_TYPES = [
   'video/3gpp', 'video/x-flv', 'video/x-ms-wmv'
 ];
 const FILTER_KEYWORDS = /pixel|censor|blur/i;
-const APP_VERSION = 'v22';
+const APP_VERSION = 'v23';
 const BROWSE_BATCH = 50;
 const THUMBNAIL_HOST = 'https://random-vid-pick.vercel.app';
 const META_URL       = `${THUMBNAIL_HOST}/api/meta`;
@@ -552,7 +552,7 @@ async function pickRandom(filter = null) {
 // ─── BROWSE ───────────────────────────────────────────────────────────────────
 // Sort/filter choices, remembered between visits.
 const SORT_DEFAULT_DIR = { name: 'asc', created: 'desc', duration: 'desc', size: 'desc', watched: 'desc', random: 'asc' };
-let browsePrefs = { sort: 'name', dir: 'asc', filter: 'all', creators: [], tags: [], tagMode: 'all' };
+let browsePrefs = { sort: 'name', dir: 'asc', filter: 'all', creators: [], tags: [], excluded: [], tagMode: 'all' };
 let randomRank  = new Map(); // fileId -> position, reshuffled on demand
 
 try {
@@ -614,6 +614,10 @@ function filterVideos(query) {
   // Creators: a video matches if it has any of the chosen creators.
   const creators = browsePrefs.creators;
   if (creators.length) list = list.filter(v => creators.some(c => c in tagsOf(v.id)));
+
+  // Exclusions (creators or tags): hide any video carrying one.
+  const excluded = browsePrefs.excluded || [];
+  if (excluded.length) list = list.filter(v => !excluded.some(t => t in tagsOf(v.id)));
 
   // Tags: videos must carry all chosen tags (or any, if toggled).
   const wanted = browsePrefs.tags;
@@ -721,6 +725,47 @@ browseFilter.addEventListener('change', () => {
   refreshBrowse();
 });
 
+// Calls onLong after a ~0.5s press that doesn't move (a scroll cancels
+// it), with a short vibration; the click that follows is swallowed so the
+// card doesn't also play. Right-click does the same on desktop.
+const LONG_PRESS_MS = 500;
+
+function attachLongPress(target, onLong) {
+  let timer = null;
+  let fired = false;
+  let startX = 0;
+  let startY = 0;
+  const cancel = () => { clearTimeout(timer); timer = null; };
+  const fire = () => {
+    cancel();
+    fired = true;
+    if (navigator.vibrate) navigator.vibrate(15);
+    onLong();
+  };
+  target.addEventListener('pointerdown', e => {
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    fired = false;
+    startX = e.clientX;
+    startY = e.clientY;
+    cancel();
+    timer = setTimeout(fire, LONG_PRESS_MS);
+  });
+  target.addEventListener('pointermove', e => {
+    if (timer && Math.hypot(e.clientX - startX, e.clientY - startY) > 10) cancel();
+  });
+  for (const type of ['pointerup', 'pointercancel', 'pointerleave']) target.addEventListener(type, cancel);
+  target.addEventListener('contextmenu', e => {
+    e.preventDefault(); // no browser menu on long-press / right-click
+    if (!fired) fire();
+  });
+  target.addEventListener('click', e => {
+    if (!fired) return;
+    fired = false;
+    e.stopPropagation();
+    e.preventDefault();
+  }, true);
+}
+
 function buildCard(video) {
   const card = document.createElement('div');
   card.className = 'browse-card';
@@ -736,6 +781,7 @@ function buildCard(video) {
   const img = document.createElement('img');
   img.loading  = 'lazy';
   img.decoding = 'async';
+  img.draggable = false; // no image drag/save menu getting in the way of long-press
   img.src      = `${THUMBNAIL_HOST}/api/thumbnail?id=${encodeURIComponent(video.id)}`;
   img.onerror  = () => {
     img.classList.add('thumb-fallback');
@@ -751,14 +797,10 @@ function buildCard(video) {
   const watchedBadge = document.createElement('span');
   watchedBadge.className = 'browse-badge browse-watched';
   watchedBadge.textContent = 'Watched';
-  const tagBtn = document.createElement('button');
-  tagBtn.type = 'button';
+  // Display-only tag count; tagging is a long-press on the card.
+  const tagBtn = document.createElement('span');
   tagBtn.className = 'browse-tagbtn';
-  tagBtn.setAttribute('aria-label', 'Edit tags');
-  tagBtn.onclick = e => {
-    e.stopPropagation(); // don't also play the video
-    openTagEditor([video.id]);
-  };
+  attachLongPress(card, () => openTagEditor([video.id]));
   const check = document.createElement('span');
   check.className = 'browse-check';
   check.textContent = '✓';
@@ -1030,7 +1072,8 @@ function updateCardBadges(video) {
   b.dur.hidden      = !video.durationMs;
   b.watched.hidden  = !isRecentlyWatched(video.id);
   const n = tagNames(video.id).length;
-  b.tag.textContent = n ? `🏷 ${n}` : '🏷';
+  b.tag.textContent = n ? `🏷 ${n}` : '';
+  b.tag.hidden = n === 0;
   b.tag.classList.toggle('has-tags', n > 0);
   b.tag.title = n
     ? tagNames(video.id).sort((x, y) => isCreatorTag(y) - isCreatorTag(x)).map(tagLabel).join(', ')
@@ -1044,7 +1087,7 @@ function renderNextBatch() {
   browseGrid.insertBefore(frag, browseSentinel);
 
   browseRendered += slice.length;
-  browseCount.textContent = `Showing ${browseRendered} of ${browseFiltered.length}`;
+  browseCount.textContent = `Showing ${browseRendered} of ${browseFiltered.length} · Long-press a video to tag it`;
 
   if (browseRendered >= browseFiltered.length && browseObserver) {
     browseObserver.disconnect();
@@ -1097,6 +1140,7 @@ async function openBrowseView() {
     const known = tagCounts();
     browsePrefs.creators = (browsePrefs.creators || []).filter(t => known.has(t) && isCreatorTag(t));
     browsePrefs.tags     = (browsePrefs.tags || []).filter(t => known.has(t) && !isCreatorTag(t));
+    browsePrefs.excluded = (browsePrefs.excluded || []).filter(t => known.has(t));
     syncBrowseControls();
     refreshTagBar();
     refreshBrowse();
@@ -1146,24 +1190,34 @@ function chipButton(text, className, onclick, title) {
 // removable chips so it's clear what's narrowing the grid.
 function refreshTagBar() {
   const { creators, tags } = browsePrefs;
+  const excluded = browsePrefs.excluded || [];
+  const creatorCount = creators.length + excluded.filter(isCreatorTag).length;
+  const tagCount     = tags.length + excluded.filter(t => !isCreatorTag(t)).length;
   browseTagBar.innerHTML = '';
   browseTagBar.append(
     chipButton(selectMode ? '✕ Cancel' : '☑ Select',
       'tag-chip-action' + (selectMode ? ' active' : ''), () => setSelectMode(!selectMode)),
-    chipButton(creators.length ? `👤 Creator · ${creators.length}` : '👤 Creator ▾',
-      'tag-chip-action' + (creators.length ? ' filtering' : ''), () => openFilterPicker('creator')),
-    chipButton(tags.length ? `🏷 Tags · ${tags.length}` : '🏷 Tags ▾',
-      'tag-chip-action' + (tags.length ? ' filtering' : ''), () => openFilterPicker('tag')),
+    chipButton(creatorCount ? `👤 Creator · ${creatorCount}` : '👤 Creator ▾',
+      'tag-chip-action' + (creatorCount ? ' filtering' : ''), () => openFilterPicker('creator')),
+    chipButton(tagCount ? `🏷 Tags · ${tagCount}` : '🏷 Tags ▾',
+      'tag-chip-action' + (tagCount ? ' filtering' : ''), () => openFilterPicker('tag')),
     chipButton('⚙', 'tag-chip-action', () => openTagManager(), 'Manage creators and tags')
   );
+  const removeFilter = name => () => {
+    browsePrefs.creators = browsePrefs.creators.filter(t => t !== name);
+    browsePrefs.tags     = browsePrefs.tags.filter(t => t !== name);
+    browsePrefs.excluded = excluded.filter(t => t !== name);
+    saveBrowsePrefs();
+    refreshTagBar();
+    refreshBrowse();
+  };
   for (const name of [...creators, ...tags]) {
-    browseTagBar.append(chipButton(`${isCreatorTag(name) ? '👤 ' : ''}${tagLabel(name)} ✕`, 'active', () => {
-      browsePrefs.creators = browsePrefs.creators.filter(t => t !== name);
-      browsePrefs.tags     = browsePrefs.tags.filter(t => t !== name);
-      saveBrowsePrefs();
-      refreshTagBar();
-      refreshBrowse();
-    }, 'Remove this filter'));
+    browseTagBar.append(chipButton(`${isCreatorTag(name) ? '👤 ' : ''}${tagLabel(name)} ✕`, 'active',
+      removeFilter(name), 'Remove this filter'));
+  }
+  for (const name of excluded) {
+    browseTagBar.append(chipButton(`− ${isCreatorTag(name) ? '👤 ' : ''}${tagLabel(name)} ✕`, 'excluded',
+      removeFilter(name), 'Excluded - tap to remove this filter'));
   }
 }
 
@@ -1227,11 +1281,15 @@ function matchesQuery(name, query) {
 
 // Searchable multi-select picker for the creator or tag filter. Changes
 // apply on DONE.
+// Searchable picker for the creator or tag filter. Tapping a row cycles
+// off -> include (✓) -> exclude (✕) -> off. Changes apply on Done.
 function openFilterPicker(kind) {
   const isCreator = kind === 'creator';
   const prefKey   = isCreator ? 'creators' : 'tags';
-  const chosen    = new Set(browsePrefs[prefKey]);
   const counts    = tagCounts(kind);
+  const state     = new Map(); // name -> 'include' | 'exclude'
+  for (const n of browsePrefs[prefKey]) state.set(n, 'include');
+  for (const n of browsePrefs.excluded || []) if (tagKind(n) === kind) state.set(n, 'exclude');
   let query  = '';
   let byName = isCreator; // creators default to A-Z, tags to most-used
   let mode   = browsePrefs.tagMode;
@@ -1246,19 +1304,25 @@ function openFilterPicker(kind) {
     list.innerHTML = '';
     let names = [...counts.keys()].filter(n => matchesQuery(n, query));
     if (byName) names.sort((a, b) => tagLabel(a).localeCompare(tagLabel(b), undefined, { numeric: true }));
-    // Keep chosen ones on top so they're easy to untick.
-    names.sort((a, b) => chosen.has(b) - chosen.has(a));
+    // Keep included/excluded ones on top so they're easy to change.
+    names.sort((a, b) => state.has(b) - state.has(a));
     if (!names.length) {
       list.append(el('div', { className: 'sheet-note',
         textContent: counts.size ? 'No matches.' : `No ${isCreator ? 'creators' : 'tags'} yet.` }));
     }
     for (const name of names) {
-      const box = el('input', { type: 'checkbox', checked: chosen.has(name) });
-      box.addEventListener('change', () => {
-        if (box.checked) chosen.add(name); else chosen.delete(name);
-      });
-      list.append(el('label', { className: 'sheet-list-row' },
-        box,
+      const st = state.get(name);
+      list.append(el('button', {
+        type: 'button',
+        className: `sheet-list-row tri-row ${st || ''}`,
+        onclick: () => {
+          if (!st) state.set(name, 'include');
+          else if (st === 'include') state.set(name, 'exclude');
+          else state.delete(name);
+          render();
+        },
+      },
+        el('span', { className: 'tri-box', textContent: st === 'include' ? '✓' : st === 'exclude' ? '✕' : '' }),
         el('span', { className: 'sheet-list-name', textContent: tagLabel(name) }),
         el('span', { className: 'sheet-list-count', textContent: String(counts.get(name)) })));
     }
@@ -1267,7 +1331,11 @@ function openFilterPicker(kind) {
   modeBtn.onclick = () => { mode = mode === 'any' ? 'all' : 'any'; render(); };
 
   const done = () => {
-    browsePrefs[prefKey] = [...chosen];
+    browsePrefs[prefKey] = [...state].filter(([, st]) => st === 'include').map(([n]) => n);
+    browsePrefs.excluded = [
+      ...(browsePrefs.excluded || []).filter(n => tagKind(n) !== kind),
+      ...[...state].filter(([, st]) => st === 'exclude').map(([n]) => n),
+    ];
     if (!isCreator) browsePrefs.tagMode = mode;
     saveBrowsePrefs();
     closeSheet();
@@ -1278,14 +1346,15 @@ function openFilterPicker(kind) {
   render();
   openSheet(
     el('div', { className: 'sheet-title', textContent: isCreator ? 'Filter by creator' : 'Filter by tag' }),
-    el('div', { className: 'sheet-note', textContent: isCreator
-      ? 'Shows videos by any of the chosen creators.'
-      : 'Match all: videos with every chosen tag. Match any: videos with at least one.' }),
+    el('div', { className: 'sheet-note', textContent: (isCreator
+      ? 'Shows videos by any of the ✓ creators. '
+      : 'Match all: videos with every ✓ tag. Match any: videos with at least one. ')
+      + 'Tap once to include (✓), twice to exclude (✕), again to clear.' }),
     searchInput(isCreator ? 'Search creators…' : 'Search tags…', e => { query = e.target.value.trim().toLowerCase(); render(); }),
     el('div', { className: 'sheet-row' }, sortBtn, isCreator ? null : modeBtn),
     list,
     el('div', { className: 'sheet-row sheet-actions' },
-      el('button', { type: 'button', className: 'sheet-btn', textContent: 'Clear', onclick: () => { chosen.clear(); render(); } }),
+      el('button', { type: 'button', className: 'sheet-btn', textContent: 'Clear', onclick: () => { state.clear(); render(); } }),
       el('button', { type: 'button', className: 'sheet-btn primary', textContent: 'Done', onclick: done }))
   );
 }
@@ -1453,6 +1522,7 @@ async function moveTag(oldName, target) {
   const swap = arr => [...new Set(arr.map(t => (t === oldName ? target : t)))];
   browsePrefs.creators = swap(browsePrefs.creators).filter(isCreatorTag);
   browsePrefs.tags     = swap(browsePrefs.tags).filter(t => !isCreatorTag(t));
+  browsePrefs.excluded = swap(browsePrefs.excluded || []);
   saveBrowsePrefs();
   await saveTags(updates);
   refreshBrowse();
@@ -1491,6 +1561,7 @@ async function deleteTag(name, count) {
   }
   browsePrefs.creators = browsePrefs.creators.filter(t => t !== name);
   browsePrefs.tags     = browsePrefs.tags.filter(t => t !== name);
+  browsePrefs.excluded = (browsePrefs.excluded || []).filter(t => t !== name);
   saveBrowsePrefs();
   await saveTags(updates);
   refreshBrowse();
