@@ -629,8 +629,8 @@ function refreshBrowse() {
 function syncBrowseControls() {
   browseSort.value = browsePrefs.sort;
   browseDir.textContent = browsePrefs.sort === 'random'
-    ? '⟳ SHUFFLE'
-    : browsePrefs.dir === 'asc' ? '↑ ASC' : '↓ DESC';
+    ? '⟳ Shuffle'
+    : browsePrefs.dir === 'asc' ? '↑ Asc' : '↓ Desc';
 }
 
 function populateFolderFilter() {
@@ -712,7 +712,7 @@ function buildCard(video) {
   durBadge.className = 'browse-badge browse-duration';
   const watchedBadge = document.createElement('span');
   watchedBadge.className = 'browse-badge browse-watched';
-  watchedBadge.textContent = 'WATCHED';
+  watchedBadge.textContent = 'Watched';
   const tagBtn = document.createElement('button');
   tagBtn.type = 'button';
   tagBtn.className = 'browse-tagbtn';
@@ -1070,11 +1070,11 @@ function refreshTagBar() {
   const { creators, tags } = browsePrefs;
   browseTagBar.innerHTML = '';
   browseTagBar.append(
-    chipButton(selectMode ? '✕ CANCEL SELECT' : '☑ SELECT',
+    chipButton(selectMode ? '✕ Cancel' : '☑ Select',
       'tag-chip-action' + (selectMode ? ' active' : ''), () => setSelectMode(!selectMode)),
-    chipButton(creators.length ? `👤 CREATOR · ${creators.length}` : '👤 CREATOR ▾',
+    chipButton(creators.length ? `👤 Creator · ${creators.length}` : '👤 Creator ▾',
       'tag-chip-action' + (creators.length ? ' filtering' : ''), () => openFilterPicker('creator')),
-    chipButton(tags.length ? `🏷 TAGS · ${tags.length}` : '🏷 TAGS ▾',
+    chipButton(tags.length ? `🏷 Tags · ${tags.length}` : '🏷 Tags ▾',
       'tag-chip-action' + (tags.length ? ' filtering' : ''), () => openFilterPicker('tag')),
     chipButton('⚙', 'tag-chip-action', () => openTagManager(), 'Manage creators and tags')
   );
@@ -1163,8 +1163,8 @@ function openFilterPicker(kind) {
   const modeBtn = el('button', { type: 'button', className: 'sheet-btn small' });
 
   const render = () => {
-    sortBtn.textContent = byName ? 'SORT: A–Z' : 'SORT: MOST VIDEOS';
-    modeBtn.textContent = mode === 'any' ? 'MATCH ANY' : 'MATCH ALL';
+    sortBtn.textContent = byName ? 'Sort: A–Z' : 'Sort: Most videos';
+    modeBtn.textContent = mode === 'any' ? 'Match any' : 'Match all';
     list.innerHTML = '';
     let names = [...counts.keys()].filter(n => matchesQuery(n, query));
     if (byName) names.sort((a, b) => tagLabel(a).localeCompare(tagLabel(b), undefined, { numeric: true }));
@@ -1202,13 +1202,13 @@ function openFilterPicker(kind) {
     el('div', { className: 'sheet-title', textContent: isCreator ? 'Filter by creator' : 'Filter by tag' }),
     el('div', { className: 'sheet-note', textContent: isCreator
       ? 'Shows videos by any of the chosen creators.'
-      : 'MATCH ALL: videos with every chosen tag. MATCH ANY: videos with at least one.' }),
+      : 'Match all: videos with every chosen tag. Match any: videos with at least one.' }),
     searchInput(isCreator ? 'Search creators…' : 'Search tags…', e => { query = e.target.value.trim().toLowerCase(); render(); }),
     el('div', { className: 'sheet-row' }, sortBtn, isCreator ? null : modeBtn),
     list,
     el('div', { className: 'sheet-row sheet-actions' },
-      el('button', { type: 'button', className: 'sheet-btn', textContent: 'CLEAR', onclick: () => { chosen.clear(); render(); } }),
-      el('button', { type: 'button', className: 'sheet-btn primary', textContent: 'DONE', onclick: done }))
+      el('button', { type: 'button', className: 'sheet-btn', textContent: 'Clear', onclick: () => { chosen.clear(); render(); } }),
+      el('button', { type: 'button', className: 'sheet-btn primary', textContent: 'Done', onclick: done }))
   );
 }
 
@@ -1285,7 +1285,7 @@ function openTagEditor(ids) {
       chips,
       el('div', { className: 'sheet-row' },
         input,
-        el('button', { type: 'button', className: 'sheet-btn', textContent: 'ADD', onclick: add })));
+        el('button', { type: 'button', className: 'sheet-btn', textContent: 'Add', onclick: add })));
   };
 
   const save = async () => {
@@ -1312,8 +1312,8 @@ function openTagEditor(ids) {
     section('creator'),
     section('tag'),
     el('div', { className: 'sheet-row sheet-actions' },
-      el('button', { type: 'button', className: 'sheet-btn', textContent: 'CANCEL', onclick: closeSheet }),
-      el('button', { type: 'button', className: 'sheet-btn primary', textContent: 'SAVE', onclick: save }))
+      el('button', { type: 'button', className: 'sheet-btn', textContent: 'Cancel', onclick: closeSheet }),
+      el('button', { type: 'button', className: 'sheet-btn primary', textContent: 'Save', onclick: save }))
   );
 }
 
@@ -1332,12 +1332,12 @@ function openTagManager(kind = 'creator') {
       list.append(el('div', { className: 'sheet-list-row' },
         el('span', { className: 'sheet-list-name', textContent: tagLabel(name) }),
         el('span', { className: 'sheet-list-count', textContent: String(counts.get(name)) }),
-        el('button', { type: 'button', className: 'sheet-btn small', textContent: 'RENAME', onclick: () => renameTag(name) }),
+        el('button', { type: 'button', className: 'sheet-btn small', textContent: 'Rename', onclick: () => renameTag(name) }),
         el('button', { type: 'button', className: 'sheet-btn small',
-          textContent: kind === 'creator' ? '→ TAG' : '→ CREATOR',
+          textContent: kind === 'creator' ? '→ Tag' : '→ Creator',
           title: kind === 'creator' ? 'Make this an ordinary tag' : 'Make this a creator',
           onclick: () => convertTag(name) }),
-        el('button', { type: 'button', className: 'sheet-btn small danger', textContent: 'DELETE', onclick: () => deleteTag(name, counts.get(name)) })));
+        el('button', { type: 'button', className: 'sheet-btn small danger', textContent: 'Delete', onclick: () => deleteTag(name, counts.get(name)) })));
     }
   };
   const tab = (k, label) => el('button', {
@@ -1354,9 +1354,9 @@ function openTagManager(kind = 'creator') {
     searchInput('Search…', e => { query = e.target.value.trim().toLowerCase(); render(); }),
     list,
     el('div', { className: 'sheet-row sheet-actions' },
-      el('button', { type: 'button', className: 'sheet-btn', textContent: 'SUGGEST CREATORS', onclick: openCreatorSuggestions }),
-      el('button', { type: 'button', className: 'sheet-btn', textContent: 'DOWNLOAD BACKUP', onclick: downloadTagBackup }),
-      el('button', { type: 'button', className: 'sheet-btn', textContent: 'CLOSE', onclick: closeSheet }))
+      el('button', { type: 'button', className: 'sheet-btn', textContent: 'Suggest creators', onclick: openCreatorSuggestions }),
+      el('button', { type: 'button', className: 'sheet-btn', textContent: 'Download backup', onclick: downloadTagBackup }),
+      el('button', { type: 'button', className: 'sheet-btn', textContent: 'Close', onclick: closeSheet }))
   );
 }
 
@@ -1475,8 +1475,8 @@ function openCreatorSuggestions() {
     el('div', { className: 'sheet-note', textContent: 'From the start of each filename. Untick any that look wrong.' }),
     list,
     el('div', { className: 'sheet-row sheet-actions' },
-      el('button', { type: 'button', className: 'sheet-btn', textContent: 'BACK', onclick: () => openTagManager('creator') }),
-      el('button', { type: 'button', className: 'sheet-btn primary', textContent: 'APPLY', onclick: apply }))
+      el('button', { type: 'button', className: 'sheet-btn', textContent: 'Back', onclick: () => openTagManager('creator') }),
+      el('button', { type: 'button', className: 'sheet-btn primary', textContent: 'Apply', onclick: apply }))
   );
 }
 

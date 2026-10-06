@@ -5,31 +5,32 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Random Video Picker</title>
   <link rel="manifest" href="manifest.json" />
-  <meta name="theme-color" content="#0a0a0a" />
+  <meta name="theme-color" content="#0f1115" />
   <meta name="mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-out" />
   <link rel="apple-touch-icon" href="icon-192.png" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Mono:wght@300;400&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
     :root {
-      --bg: #0a0a0a;
-      --surface: #111111;
-      --border: #222222;
-      --accent: #e8ff00;
-      --accent-dim: #b8cc00;
-      --text: #f0f0f0;
-      --muted: #555555;
-      --danger: #ff4444;
+      --bg: #0f1115;
+      --surface: #181b21;
+      --border: #2a2f38;
+      --accent: #7aa2ff;
+      --accent-dim: #5b86f0;
+      --on-accent: #0b1220;
+      --text: #e8eaed;
+      --muted: #9aa0a6;
+      --danger: #ff6b6b;
     }
 
     body {
       background: var(--bg);
       color: var(--text);
-      font-family: 'DM Mono', monospace;
+      font-family: inherit;
       min-height: 100dvh;
       display: flex;
       flex-direction: column;
@@ -39,16 +40,6 @@
       overflow: hidden;
     }
 
-    /* Grain overlay */
-    body::before {
-      content: '';
-      position: fixed;
-      inset: 0;
-      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)' opacity='0.04'/%3E%3C/svg%3E");
-      pointer-events: none;
-      z-index: 0;
-      opacity: 0.4;
-    }
 
     .container {
       position: relative;
@@ -67,7 +58,7 @@
     }
 
     .title {
-      font-family: 'Bebas Neue', sans-serif;
+      font-family: inherit;
       font-size: clamp(3rem, 15vw, 5rem);
       letter-spacing: 0.04em;
       line-height: 0.9;
@@ -171,7 +162,7 @@
       padding: 1rem;
       border: none;
       border-radius: 4px;
-      font-family: 'Bebas Neue', sans-serif;
+      font-family: inherit;
       font-size: 1.4rem;
       letter-spacing: 0.1em;
       cursor: pointer;
@@ -184,7 +175,7 @@
 
     .btn-primary {
       background: var(--accent);
-      color: #0a0a0a;
+      color: var(--on-accent);
     }
 
     .btn-primary:hover:not(:disabled) { background: var(--accent-dim); }
@@ -193,7 +184,7 @@
       background: transparent;
       color: var(--muted);
       border: 1px solid var(--border);
-      font-family: 'DM Mono', monospace;
+      font-family: inherit;
       font-size: 0.7rem;
       letter-spacing: 0.1em;
       padding: 0.75rem;
@@ -205,11 +196,11 @@
       background: transparent;
       color: var(--accent);
       border: 2px solid var(--accent);
-      font-family: 'Bebas Neue', sans-serif;
+      font-family: inherit;
       font-size: 1.4rem;
       letter-spacing: 0.1em;
     }
-    .btn-filtered:hover:not(:disabled) { background: rgba(232,255,0,0.08); }
+    .btn-filtered:hover:not(:disabled) { background: rgba(122,162,255,0.08); }
 
     /* Auth section */
     .auth-section {
@@ -243,7 +234,7 @@
     .picking-overlay.visible { display: flex; }
 
     .picking-text {
-      font-family: 'Bebas Neue', sans-serif;
+      font-family: inherit;
       font-size: 2rem;
       color: var(--accent);
       letter-spacing: 0.1em;
@@ -293,7 +284,7 @@
       border-radius: 4px;
       padding: 0.75rem;
       color: var(--text);
-      font-family: 'DM Mono', monospace;
+      font-family: inherit;
       font-size: 0.8rem;
     }
 
@@ -311,7 +302,7 @@
       border: 1px solid var(--border);
       border-radius: 4px;
       color: var(--text);
-      font-family: 'DM Mono', monospace;
+      font-family: inherit;
       font-size: 0.7rem;
       padding: 0.5rem;
       min-width: 0;
@@ -345,14 +336,14 @@
       border: 1px solid var(--border);
       border-radius: 999px;
       color: var(--text);
-      font-family: 'DM Mono', monospace;
+      font-family: inherit;
       font-size: 0.65rem;
       padding: 0.35rem 0.7rem;
       white-space: nowrap;
       cursor: pointer;
       -webkit-tap-highlight-color: transparent;
     }
-    .tag-chip.active, .tag-chip.state-all { background: var(--accent); color: #0a0a0a; border-color: var(--accent); }
+    .tag-chip.active, .tag-chip.state-all { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
     .tag-chip.state-some { border-color: var(--accent); border-style: dashed; color: var(--accent); }
     .tag-chip.state-none { color: var(--muted); }
     .tag-chip-action { color: var(--muted); letter-spacing: 0.05em; }
@@ -374,7 +365,7 @@
       border: none;
       border-bottom: 2px solid var(--border);
       color: var(--muted);
-      font-family: 'DM Mono', monospace;
+      font-family: inherit;
       font-size: 0.7rem;
       padding: 0.5rem;
       cursor: pointer;
@@ -412,7 +403,7 @@
        "automatic minimum" ambiguity, so the row is forced to fit it exactly.
        Nothing in this card relies on auto/content-based sizing anymore. */
     .browse-card {
-      height: 194px; /* creator line + 100px thumb + up to 4 caption lines */
+      height: 210px; /* creator line + 100px thumb + up to 4 caption lines */
       display: flex;
       flex-direction: column;
       background: var(--surface);
@@ -465,7 +456,7 @@
       cursor: pointer;
       -webkit-tap-highlight-color: transparent;
     }
-    .browse-tagbtn.has-tags { background: rgba(232, 255, 0, 0.9); color: #0a0a0a; }
+    .browse-tagbtn.has-tags { background: rgba(122, 162, 255, 0.9); color: var(--on-accent); }
 
     .browse-check {
       position: absolute;
@@ -474,8 +465,8 @@
       align-items: center;
       justify-content: center;
       font-size: 2rem;
-      color: #0a0a0a;
-      background: rgba(232, 255, 0, 0.55);
+      color: var(--on-accent);
+      background: rgba(122, 162, 255, 0.55);
       pointer-events: none;
     }
     .browse-card.selected { border-color: var(--accent); }
@@ -529,7 +520,7 @@
       border-radius: 4px;
       padding: 0.6rem;
       color: var(--text);
-      font-family: 'DM Mono', monospace;
+      font-family: inherit;
       font-size: 0.75rem;
     }
     .sheet-input:focus { outline: none; border-color: var(--muted); }
@@ -538,14 +529,14 @@
       border: 1px solid var(--border);
       border-radius: 4px;
       color: var(--text);
-      font-family: 'DM Mono', monospace;
+      font-family: inherit;
       font-size: 0.65rem;
       letter-spacing: 0.05em;
       padding: 0.55rem 0.8rem;
       cursor: pointer;
       white-space: nowrap;
     }
-    .sheet-btn.primary { background: var(--accent); border-color: var(--accent); color: #0a0a0a; }
+    .sheet-btn.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
     .sheet-btn.danger { color: var(--danger); }
     .sheet-btn.small { padding: 0.35rem 0.5rem; font-size: 0.6rem; }
     .sheet-list { display: flex; flex-direction: column; gap: 0.4rem; }
@@ -563,7 +554,7 @@
       left: 0.3rem;
       top: 0.3rem;
       background: var(--accent);
-      color: #0a0a0a;
+      color: var(--on-accent);
       letter-spacing: 0.05em;
     }
 
@@ -610,13 +601,54 @@
       height: 1px;
       grid-column: 1 / -1;
     }
+
+    /* ── Modern theme ─────────────────────────────────────────────────────── */
+    body {
+      font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+    button, input, select { font-family: inherit; }
+    input[type=checkbox] { accent-color: var(--accent); width: 1rem; height: 1rem; }
+
+    .title { font-weight: 800; letter-spacing: -0.03em; line-height: 0.95; }
+    .subtitle, .label, .browse-count, .sheet-section-title {
+      text-transform: none; letter-spacing: 0.01em; font-weight: 500;
+    }
+    .footer { letter-spacing: 0.01em; }
+    .picking-text { font-weight: 700; letter-spacing: -0.02em; animation: none; }
+
+    .btn { font-weight: 600; font-size: 1rem; letter-spacing: 0; border-radius: 12px; }
+    .btn-secondary { font-size: 0.875rem; font-weight: 500; }
+    .btn-filtered { font-size: 1rem; font-weight: 600; }
+
+    .status-bar, .video-info, .browse-search, .browse-select, .browse-dir,
+    .sheet-input, .sheet-btn { border-radius: 10px; }
+    .browse-card { border-radius: 12px; }
+    .browse-search, .browse-select, .browse-dir, .sheet-input { font-size: 0.85rem; }
+
+    .browse-creator { color: var(--muted); font-weight: 500; font-size: 0.75rem; padding: 0 0.6rem; }
+    .browse-caption { font-size: 0.82rem; font-weight: 500; line-height: 1.35; padding: 0.4rem 0.6rem; }
+    .browse-badge { font-size: 0.68rem; font-weight: 600; border-radius: 6px; }
+    .browse-watched { letter-spacing: 0; }
+    .browse-tagbtn { font-size: 0.7rem; font-weight: 600; border-radius: 6px; }
+
+    .tag-chip { font-size: 0.78rem; font-weight: 500; letter-spacing: 0; padding: 0.4rem 0.8rem; }
+    .tag-chip-action { letter-spacing: 0; }
+    .sheet-title { font-size: 1rem; font-weight: 600; }
+    .sheet-note { font-size: 0.78rem; }
+    .sheet-btn { font-size: 0.82rem; font-weight: 600; letter-spacing: 0; }
+    .sheet-btn.small { font-size: 0.72rem; }
+    .sheet-list-row { font-size: 0.875rem; }
+    .sheet-list-count { font-size: 0.75rem; }
+    .sheet-tab { font-size: 0.82rem; font-weight: 600; }
+    .select-count { font-size: 0.85rem; font-weight: 500; }
   </style>
 </head>
 <body>
 
 <div class="container">
   <div class="header">
-    <div class="title">RANDOM<br /><span>VIDEO</span></div>
+    <div class="title">Random<br /><span>Video</span></div>
     <div class="subtitle">Google Drive Picker</div>
   </div>
 
@@ -633,16 +665,16 @@
 
   <div class="btn-group">
     <button class="btn btn-primary" id="pickBtn" disabled onclick="pickRandom()">
-      PICK RANDOM VIDEO
+      Pick random video
     </button>
     <button class="btn btn-filtered" id="pickFilteredBtn" disabled onclick="pickRandom(FILTER_KEYWORDS)">
-      PICK FILTERED VIDEO
+      Pick filtered video
     </button>
     <button class="btn btn-secondary" id="openVlcBtn" style="display:none" onclick="openInVlc()">
-      &#9654; OPEN IN VLC
+      &#9654; Open in VLC
     </button>
     <button class="btn btn-secondary" id="browseBtn" disabled onclick="openBrowseView()">
-      BROWSE LIBRARY
+      Browse library
     </button>
   </div>
 
@@ -651,19 +683,19 @@
     <button class="btn btn-secondary" id="signOutBtn" style="display:none" onclick="signOut()">Sign out</button>
   </div>
 
-  <div class="footer">PRIVATE &middot; YOUR EYES ONLY &middot; <span id="appVersion"></span></div>
+  <div class="footer">Private &middot; Your eyes only &middot; <span id="appVersion"></span></div>
 </div>
 
 <!-- Picking overlay -->
 <div class="picking-overlay" id="pickingOverlay">
-  <div class="picking-text">PICKING...</div>
+  <div class="picking-text">Picking…</div>
   <div class="picking-sub">Scanning your library</div>
 </div>
 
 <!-- Browse view -->
 <div class="browse-view" id="browseView">
   <div class="browse-header">
-    <button class="btn btn-secondary browse-back" id="browseBackBtn" onclick="closeBrowseView()">&larr; BACK</button>
+    <button class="btn btn-secondary browse-back" id="browseBackBtn" onclick="closeBrowseView()">&larr; Back</button>
     <input type="text" class="browse-search" id="browseSearch" placeholder="Search filename or folder..." />
     <button class="browse-dir browse-random" id="browseRandomBtn" type="button" aria-label="Play a random video from this view" title="Random from this view">🎲</button>
   </div>
@@ -676,7 +708,7 @@
       <option value="watched">Last watched</option>
       <option value="random">Random</option>
     </select>
-    <button class="browse-dir" id="browseDir" type="button" aria-label="Sort direction">↑ ASC</button>
+    <button class="browse-dir" id="browseDir" type="button" aria-label="Sort direction">↑ Asc</button>
     <select class="browse-select" id="browseFilter" aria-label="Filter"></select>
   </div>
   <div class="browse-tagbar" id="browseTagBar"></div>
@@ -686,8 +718,8 @@
   </div>
   <div class="select-bar" id="selectBar" hidden>
     <span class="select-count" id="selectCount">0 selected</span>
-    <button class="sheet-btn" type="button" onclick="selectAllInView()">ALL IN VIEW</button>
-    <button class="sheet-btn primary" type="button" onclick="tagSelected()">TAG</button>
+    <button class="sheet-btn" type="button" onclick="selectAllInView()">All in view</button>
+    <button class="sheet-btn primary" type="button" onclick="tagSelected()">Tag</button>
   </div>
   <div class="sheet-backdrop" id="sheetBackdrop" hidden>
     <div class="sheet" id="sheet" role="dialog" aria-modal="true"></div>
