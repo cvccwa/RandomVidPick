@@ -30,6 +30,17 @@ export default async function handler(req) {
   const id = searchParams.get('id');
   if (!id) return new Response('missing id', { status: 400 });
 
+  // Client-side frame-grab failure report (see reportFrameThumbMiss in
+  // app.js) - log-only, never touches Drive.
+  const report = searchParams.get('report');
+  if (report) {
+    console.log(`frame-miss ${report.slice(0, 80)} id=${id}`);
+    return new Response(null, {
+      status:  204,
+      headers: { 'Access-Control-Allow-Origin': ALLOWED_ORIGIN },
+    });
+  }
+
   let token;
   try {
     token = await getServiceAccountToken();
