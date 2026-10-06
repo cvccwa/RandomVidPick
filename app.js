@@ -8,9 +8,11 @@ const VIDEO_MIME_TYPES = [
   'video/3gpp', 'video/x-flv', 'video/x-ms-wmv'
 ];
 const FILTER_KEYWORDS = /pixel|censor|blur/i;
-const APP_VERSION = 'v15';
+const APP_VERSION = 'v16';
 const BROWSE_BATCH = 50;
 const THUMBNAIL_HOST = 'https://random-vid-pick.vercel.app';
+const META_URL       = `${THUMBNAIL_HOST}/api/meta`;
+const RECENT_MS      = 30 * 24 * 3600 * 1000; // "recently watched" = past month
 
 // Strips trailing video extensions for display, including doubled ones
 // like "name.mp4.mp4" that some files in the library have.
@@ -49,6 +51,9 @@ const browseSearch     = document.getElementById('browseSearch');
 const browseCount      = document.getElementById('browseCount');
 const browseGrid       = document.getElementById('browseGrid');
 const browseSentinel   = document.getElementById('browseSentinel');
+const browseSort       = document.getElementById('browseSort');
+const browseDir        = document.getElementById('browseDir');
+const browseFilter     = document.getElementById('browseFilter');
 
 // ─── AUTH ─────────────────────────────────────────────────────────────────────
 function signIn() {
@@ -203,13 +208,23 @@ async function collectVideos(folderId, pathSoFar = '') {
     const mimeQuery = VIDEO_MIME_TYPES.map(m => `mimeType='${m}'`).join(' or ');
     let url = `https://www.googleapis.com/drive/v3/files`
       + `?q=(${mimeQuery}) and '${folderId}' in parents and trashed=false`
-      + `&fields=nextPageToken,files(id,name)`
+      + `&fields=nextPageToken,files(id,name,createdTime,size,videoMediaMetadata(durationMillis))`
       + `&pageSize=1000`;
     if (pageToken) url += `&pageToken=${pageToken}`;
     const data = await driveRequest(url);
     if (data.files) {
       for (const f of data.files) {
-        videos.push({ id: f.id, name: f.name, path: pathSoFar });
+        const driveMs = Number(f.videoMediaMetadata && f.videoMediaMetadata.durationMillis);
+        videos.push({
+          id:         f.id,
+          name:       f.name,
+          path:       pathSoFar,
+          created:    Date.parse(f.createdTime) || 0,
+          size:       Number(f.size) || 0,
+          // Drive only knows duration for videos it finished processing;
+          // the rest get filled in from KV (loadMeta) or measured in-browser.
+          durationMs: driveMs > 0 ? driveMs : null,
+        });
       }
     }
     pageToken = data.nextPageToken || null;
@@ -236,6 +251,101 @@ async function collectVideos(folderId, pathSoFar = '') {
   return videos;
 }
 
+// ─── META (durations + watched history, stored in KV via /api/meta) ──────────
+let metaWatched  = {};   // fileId -> last-watched epoch ms
+let metaPromise  = null; // load once per page
+const pendingDurations = {};
+const pendingWatched   = new Set();
+let metaFlushTimer = null;
+
+function metaHeaders(extra = {}) {
+  return { Authorization: `Bearer ${accessToken}`, ...extra };
+}
+
+// Fills in durations Drive didn't have and loads watched history. Optional:
+// if KV or the endpoint is unavailable the library still works, just without
+// those extras.
+function ensureMeta() {
+  if (!metaPromise) {
+    metaPromise = fetch(META_URL, { headers: metaHeaders() })
+      .then(res => (res.ok ? res.json() : { durations: {}, watched: {} }))
+      .then(meta => {
+        // Merge, don't replace: a watch marked before this load finished wins.
+        metaWatched = { ...(meta.watched || {}), ...metaWatched };
+        for (const v of videoCache || []) {
+          if (!v.durationMs && meta.durations && meta.durations[v.id]) {
+            v.durationMs = meta.durations[v.id];
+          }
+        }
+      })
+      .catch(() => {});
+  }
+  return metaPromise;
+}
+
+function scheduleMetaFlush(delay = 3000) {
+  clearTimeout(metaFlushTimer);
+  metaFlushTimer = setTimeout(flushMeta, delay);
+}
+
+function flushMeta() {
+  clearTimeout(metaFlushTimer);
+  const ids = Object.keys(pendingDurations);
+  if (!ids.length && !pendingWatched.size) return;
+  const body = { durations: {}, watched: [...pendingWatched] };
+  for (const id of ids) {
+    body.durations[id] = pendingDurations[id];
+    delete pendingDurations[id];
+  }
+  pendingWatched.clear();
+  // keepalive lets this finish even if the page is backgrounded right after
+  // (e.g. the VLC intent taking over the screen).
+  fetch(META_URL, {
+    method:    'POST',
+    keepalive: true,
+    headers:   metaHeaders({ 'Content-Type': 'application/json' }),
+    body:      JSON.stringify(body),
+  }).catch(() => {});
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') flushMeta();
+});
+
+function findVideo(id) {
+  return (videoCache || []).find(v => v.id === id);
+}
+
+function recordDuration(id, seconds) {
+  if (!isFinite(seconds) || seconds <= 0) return;
+  const video = findVideo(id);
+  if (!video || video.durationMs) return;
+  video.durationMs = Math.round(seconds * 1000);
+  pendingDurations[id] = video.durationMs;
+  updateCardBadges(video);
+  scheduleMetaFlush();
+}
+
+function markWatched(id) {
+  metaWatched[id] = Date.now();
+  pendingWatched.add(id);
+  const video = findVideo(id);
+  if (video) updateCardBadges(video);
+  flushMeta();
+}
+
+function isRecentlyWatched(id) {
+  return metaWatched[id] && Date.now() - metaWatched[id] < RECENT_MS;
+}
+
+function formatDuration(ms) {
+  const total = Math.round(ms / 1000);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = String(total % 60).padStart(2, '0');
+  return h ? `${h}:${String(m).padStart(2, '0')}:${s}` : `${m}:${s}`;
+}
+
 // ─── VLC LAUNCH ───────────────────────────────────────────────────────────────
 function prewarmStream(fileId) {
   return fetch(`https://random-vid-pick.vercel.app/api/stream?id=${encodeURIComponent(fileId)}`, {
@@ -245,6 +355,7 @@ function prewarmStream(fileId) {
 
 function openInVlc() {
   if (!lastPicked) return;
+  markWatched(lastPicked.id);
   const title = encodeURIComponent(displayName(lastPicked.name));
   const id    = encodeURIComponent(lastPicked.id);
   const host  = `random-vid-pick.vercel.app/api/stream?id=${id}`;
@@ -302,13 +413,135 @@ async function pickRandom(filter = null) {
 }
 
 // ─── BROWSE ───────────────────────────────────────────────────────────────────
-function filterVideos(query) {
-  if (!query) return videoCache || [];
-  const q = query.toLowerCase();
-  return (videoCache || []).filter(v =>
-    v.name.toLowerCase().includes(q) || (v.path && v.path.toLowerCase().includes(q))
-  );
+// Sort/filter choices, remembered between visits.
+const SORT_DEFAULT_DIR = { name: 'asc', created: 'desc', duration: 'desc', size: 'desc', watched: 'desc', random: 'asc' };
+let browsePrefs = { sort: 'name', dir: 'asc', filter: 'all' };
+let randomRank  = new Map(); // fileId -> position, reshuffled on demand
+
+try {
+  Object.assign(browsePrefs, JSON.parse(localStorage.getItem('rvp_browse_prefs') || '{}'));
+} catch (err) { /* private mode or corrupt value - keep defaults */ }
+
+function saveBrowsePrefs() {
+  try { localStorage.setItem('rvp_browse_prefs', JSON.stringify(browsePrefs)); } catch (err) {}
 }
+
+function reshuffle() {
+  const ids = (videoCache || []).map(v => v.id);
+  for (let i = ids.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [ids[i], ids[j]] = [ids[j], ids[i]];
+  }
+  randomRank = new Map(ids.map((id, i) => [id, i]));
+}
+
+// Sort value for a video, or null when unknown (no duration measured yet,
+// never watched). Unknowns always go last, whichever direction is chosen.
+function sortValue(v, sort) {
+  switch (sort) {
+    case 'created':  return v.created || null;
+    case 'duration': return v.durationMs || null;
+    case 'size':     return v.size || null;
+    case 'watched':  return metaWatched[v.id] || null;
+    case 'random':   return randomRank.get(v.id) ?? null;
+    default:         return displayName(v.name).toLowerCase();
+  }
+}
+
+function sortVideos(list) {
+  const { sort, dir } = browsePrefs;
+  const sign = dir === 'desc' && sort !== 'random' ? -1 : 1;
+  const keyed = list.map(v => [sortValue(v, sort), v]);
+  keyed.sort(([a], [b]) => {
+    if (a === null || b === null) return a === null ? (b === null ? 0 : 1) : -1;
+    const cmp = typeof a === 'string'
+      ? a.localeCompare(b, undefined, { numeric: true })
+      : a - b;
+    return cmp * sign;
+  });
+  return keyed.map(([, v]) => v);
+}
+
+function filterVideos(query) {
+  const { filter } = browsePrefs;
+  let list = videoCache || [];
+
+  if (filter === 'recent')        list = list.filter(v => isRecentlyWatched(v.id));
+  else if (filter === 'unwatched') list = list.filter(v => !isRecentlyWatched(v.id));
+  else if (filter.startsWith('folder:')) {
+    const folder = filter.slice('folder:'.length);
+    list = list.filter(v => v.path === folder);
+  }
+
+  if (query) {
+    const q = query.toLowerCase();
+    list = list.filter(v =>
+      v.name.toLowerCase().includes(q) || (v.path && v.path.toLowerCase().includes(q))
+    );
+  }
+  return sortVideos(list);
+}
+
+function refreshBrowse() {
+  resetBrowseGrid(filterVideos(browseSearch.value.trim()));
+  browseGrid.scrollTop = 0;
+}
+
+function syncBrowseControls() {
+  browseSort.value = browsePrefs.sort;
+  browseDir.textContent = browsePrefs.sort === 'random'
+    ? '⟳ SHUFFLE'
+    : browsePrefs.dir === 'asc' ? '↑ ASC' : '↓ DESC';
+}
+
+function populateFolderFilter() {
+  const folders = [...new Set((videoCache || []).map(v => v.path))]
+    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  browseFilter.innerHTML = '';
+  const add = (parent, value, label) => {
+    const o = document.createElement('option');
+    o.value = value;
+    o.textContent = label;
+    parent.appendChild(o);
+  };
+  add(browseFilter, 'all', 'All videos');
+  add(browseFilter, 'recent', 'Watched in last 30 days');
+  add(browseFilter, 'unwatched', 'Not watched in last 30 days');
+  if (folders.length > 1) {
+    const group = document.createElement('optgroup');
+    group.label = 'Folder';
+    for (const f of folders) add(group, `folder:${f}`, f || '(root folder)');
+    browseFilter.appendChild(group);
+  }
+  // A remembered folder that no longer exists falls back to everything.
+  if (![...browseFilter.options].some(o => o.value === browsePrefs.filter)) {
+    browsePrefs.filter = 'all';
+  }
+  browseFilter.value = browsePrefs.filter;
+}
+
+browseSort.addEventListener('change', () => {
+  browsePrefs.sort = browseSort.value;
+  browsePrefs.dir  = SORT_DEFAULT_DIR[browsePrefs.sort] || 'asc';
+  if (browsePrefs.sort === 'random') reshuffle();
+  saveBrowsePrefs();
+  syncBrowseControls();
+  refreshBrowse();
+});
+
+browseDir.addEventListener('click', () => {
+  if (browsePrefs.sort === 'random') reshuffle();
+  else browsePrefs.dir = browsePrefs.dir === 'asc' ? 'desc' : 'asc';
+  saveBrowsePrefs();
+  syncBrowseControls();
+  refreshBrowse();
+});
+
+browseFilter.addEventListener('change', () => {
+  browsePrefs.filter = browseFilter.value;
+  saveBrowsePrefs();
+  refreshBrowse();
+});
 
 function buildCard(video) {
   const card = document.createElement('div');
@@ -326,7 +559,19 @@ function buildCard(video) {
     img.classList.add('thumb-fallback');
     queueFrameThumb(video.id, img);
   };
+  img.onload = () => {
+    if (!video.durationMs) queueDurationProbe(video, card);
+  };
   thumb.appendChild(img);
+
+  const durBadge = document.createElement('span');
+  durBadge.className = 'browse-badge browse-duration';
+  const watchedBadge = document.createElement('span');
+  watchedBadge.className = 'browse-badge browse-watched';
+  watchedBadge.textContent = 'WATCHED';
+  thumb.append(durBadge, watchedBadge);
+  cardBadges.set(video.id, { dur: durBadge, watched: watchedBadge });
+  updateCardBadges(video);
 
   const caption = document.createElement('div');
   caption.className = 'browse-caption';
@@ -391,7 +636,14 @@ function showThumbBlob(img, blob) {
 
 async function queueFrameThumb(id, img) {
   const cached = await thumbDbGet(id);
-  if (cached) return showThumbBlob(img, cached);
+  if (cached) {
+    showThumbBlob(img, cached);
+    // Thumbnails cached before durations were tracked never recorded one.
+    const video = findVideo(id);
+    const card  = img.closest('.browse-card');
+    if (video && card && !video.durationMs) queueDurationProbe(video, card);
+    return;
+  }
   if (frameThumbFailed.has(id)) return;
   frameThumbQueue.push({ id, img });
   pumpFrameThumbQueue();
@@ -448,6 +700,7 @@ function captureFrame(id) {
     // MediaError codes: 2 network, 3 decode, 4 unsupported codec/container.
     video.onerror = () => fail(`media-err-${video.error ? video.error.code : '?'}`);
     video.onloadedmetadata = () => {
+      recordDuration(id, video.duration);
       // 10% in (capped at 30s) skips black intro frames without seeking
       // deep into a multi-GB file.
       const d = isFinite(video.duration) ? video.duration : 0;
@@ -471,6 +724,53 @@ function captureFrame(id) {
 
     video.src = `${THUMBNAIL_HOST}/api/stream?id=${encodeURIComponent(id)}`;
   });
+}
+
+// For cards whose Drive thumbnail loaded fine but Drive has no duration:
+// load only the video's metadata (a few MB at most through the proxy, once
+// ever - the result is saved to KV) to learn its length.
+const durationProbeQueue = [];
+let durationProbeActive = false;
+
+function queueDurationProbe(video, card) {
+  if (video.durationMs || durationProbeQueue.some(j => j.video === video)) return;
+  durationProbeQueue.push({ video, card });
+  pumpDurationProbes();
+}
+
+function pumpDurationProbes() {
+  if (durationProbeActive) return;
+  const job = durationProbeQueue.shift();
+  if (!job) return;
+  if (job.video.durationMs || !job.card.isConnected) return pumpDurationProbes();
+  durationProbeActive = true;
+
+  const el = document.createElement('video');
+  el.muted   = true;
+  el.preload = 'metadata';
+  const done = () => {
+    clearTimeout(timer);
+    el.removeAttribute('src');
+    el.load();
+    durationProbeActive = false;
+    pumpDurationProbes();
+  };
+  const timer = setTimeout(done, 20000);
+  el.onloadedmetadata = () => { recordDuration(job.video.id, el.duration); done(); };
+  el.onerror = done;
+  el.src = `${THUMBNAIL_HOST}/api/stream?id=${encodeURIComponent(job.video.id)}`;
+}
+
+// id -> badge elements of the currently rendered card, so a duration learned
+// later (probe/frame grab) or a new watch can update the card in place.
+const cardBadges = new Map();
+
+function updateCardBadges(video) {
+  const b = cardBadges.get(video.id);
+  if (!b) return;
+  b.dur.textContent = video.durationMs ? formatDuration(video.durationMs) : '';
+  b.dur.hidden      = !video.durationMs;
+  b.watched.hidden  = !isRecentlyWatched(video.id);
 }
 
 function renderNextBatch() {
@@ -524,8 +824,12 @@ async function openBrowseView() {
       pickingOverlay.classList.remove('visible');
       setStatus('Signed in · Ready to pick', 'ready');
     }
+    await ensureMeta();
+    if (!randomRank.size) reshuffle();
     browseSearch.value = '';
-    resetBrowseGrid(videoCache);
+    populateFolderFilter();
+    syncBrowseControls();
+    refreshBrowse();
     browseView.classList.add('visible');
   } catch (err) {
     pickingOverlay.classList.remove('visible');
@@ -546,7 +850,7 @@ function closeBrowseView() {
 browseSearch.addEventListener('input', () => {
   clearTimeout(browseSearchDebounce);
   browseSearchDebounce = setTimeout(() => {
-    resetBrowseGrid(filterVideos(browseSearch.value.trim()));
+    refreshBrowse();
   }, 150);
 });
 
