@@ -8,7 +8,7 @@ const VIDEO_MIME_TYPES = [
   'video/3gpp', 'video/x-flv', 'video/x-ms-wmv'
 ];
 const FILTER_KEYWORDS = /pixel|censor|blur/i;
-const APP_VERSION = 'v18';
+const APP_VERSION = 'v19';
 const BROWSE_BATCH = 50;
 const THUMBNAIL_HOST = 'https://random-vid-pick.vercel.app';
 const META_URL       = `${THUMBNAIL_HOST}/api/meta`;
@@ -78,7 +78,10 @@ function signIn() {
     + `&redirect_uri=${redirectUri}`
     + `&response_type=token`
     + `&scope=${encodeURIComponent(SCOPES)}`
-    + `&prompt=consent`;
+    // No prompt=consent: once access is granted, Google skips the consent
+    // screen (and the "unverified app" warning shown with it) on later
+    // sign-ins instead of forcing it every time.
+    + `&prompt=select_account`;
   window.location.href = authUrl;
 }
 
