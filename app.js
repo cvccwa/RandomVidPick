@@ -8,9 +8,16 @@ const VIDEO_MIME_TYPES = [
   'video/3gpp', 'video/x-flv', 'video/x-ms-wmv'
 ];
 const FILTER_KEYWORDS = /pixel|censor|blur/i;
-const APP_VERSION = 'v14';
+const APP_VERSION = 'v15';
 const BROWSE_BATCH = 50;
 const THUMBNAIL_HOST = 'https://random-vid-pick.vercel.app';
+
+// Strips trailing video extensions for display, including doubled ones
+// like "name.mp4.mp4" that some files in the library have.
+const VIDEO_EXT_RE = /(\.(mp4|m4v|mkv|webm|mov|avi|mpe?g|3gp|flv|wmv))+$/i;
+function displayName(name) {
+  return name.replace(VIDEO_EXT_RE, '') || name;
+}
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
 let accessToken = null;
@@ -238,7 +245,7 @@ function prewarmStream(fileId) {
 
 function openInVlc() {
   if (!lastPicked) return;
-  const title = encodeURIComponent(lastPicked.name);
+  const title = encodeURIComponent(displayName(lastPicked.name));
   const id    = encodeURIComponent(lastPicked.id);
   const host  = `random-vid-pick.vercel.app/api/stream?id=${id}`;
   window.location.href =
@@ -271,7 +278,7 @@ async function pickRandom(filter = null) {
 
     pickingOverlay.classList.remove('visible');
 
-    videoFilename.textContent = picked.name;
+    videoFilename.textContent = displayName(picked.name);
     videoPath.textContent     = picked.path || '(root folder)';
     videoInfo.classList.add('visible');
     pickBtn.disabled         = false;
@@ -323,7 +330,8 @@ function buildCard(video) {
 
   const caption = document.createElement('div');
   caption.className = 'browse-caption';
-  caption.textContent = video.name;
+  caption.textContent = displayName(video.name);
+  card.title = displayName(video.name); // full name on long-press/hover if still clamped
 
   card.append(thumb, caption);
   return card;
@@ -546,7 +554,7 @@ async function playVideo(video) {
   lastPicked = video;
   closeBrowseView();
 
-  videoFilename.textContent = video.name;
+  videoFilename.textContent = displayName(video.name);
   videoPath.textContent     = video.path || '(root folder)';
   videoInfo.classList.add('visible');
 

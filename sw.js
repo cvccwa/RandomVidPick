@@ -1,4 +1,4 @@
-const CACHE = 'rvp-v14';
+const CACHE = 'rvp-v15';
 const ASSETS = [
   '/RandomVidPick/',
   '/RandomVidPick/index.html',
