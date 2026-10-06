@@ -8,7 +8,7 @@ const VIDEO_MIME_TYPES = [
   'video/3gpp', 'video/x-flv', 'video/x-ms-wmv'
 ];
 const FILTER_KEYWORDS = /pixel|censor|blur/i;
-const APP_VERSION = 'v13';
+const APP_VERSION = 'v14';
 const BROWSE_BATCH = 50;
 const THUMBNAIL_HOST = 'https://random-vid-pick.vercel.app';
 
@@ -336,7 +336,9 @@ function buildCard(video) {
 // the canvas isn't tainted) and cache the JPEG in IndexedDB so each video
 // is only decoded once, ever.
 const FRAME_THUMB_CONCURRENCY = 2;
-const FRAME_THUMB_TIMEOUT_MS  = 20000;
+// Generous: a file whose index (moov) sits at the end needs a few extra
+// Range round trips through the proxy before the first frame decodes.
+const FRAME_THUMB_TIMEOUT_MS  = 45000;
 const FRAME_THUMB_WIDTH       = 320;
 
 let thumbDbPromise = null;
@@ -398,12 +400,22 @@ function pumpFrameThumbQueue() {
         thumbDbPut(job.id, blob);
         if (job.img.isConnected) showThumbBlob(job.img, blob);
       })
-      .catch(() => frameThumbFailed.add(job.id))
+      .catch(err => {
+        frameThumbFailed.add(job.id);
+        reportFrameThumbMiss(job.id, err.message);
+      })
       .finally(() => {
         frameThumbActive--;
         pumpFrameThumbQueue();
       });
   }
+}
+
+// The grab runs on the phone with no devtools, so send the failure reason
+// to the server where it shows up in Vercel runtime logs.
+function reportFrameThumbMiss(id, reason) {
+  fetch(`${THUMBNAIL_HOST}/api/thumbnail?id=${encodeURIComponent(id)}`
+    + `&report=${encodeURIComponent(reason)}`).catch(() => {});
 }
 
 function captureFrame(id) {
@@ -419,10 +431,14 @@ function captureFrame(id) {
       video.removeAttribute('src');
       video.load(); // releases the network connection
     };
-    const fail = () => { cleanup(); reject(new Error('frame capture failed')); };
-    const timer = setTimeout(fail, FRAME_THUMB_TIMEOUT_MS);
+    const fail = reason => { cleanup(); reject(new Error(reason)); };
+    const timer = setTimeout(
+      () => fail(`timeout-rs${video.readyState}-t${Math.round(video.currentTime)}`),
+      FRAME_THUMB_TIMEOUT_MS
+    );
 
-    video.onerror = fail; // e.g. a codec this browser can't decode
+    // MediaError codes: 2 network, 3 decode, 4 unsupported codec/container.
+    video.onerror = () => fail(`media-err-${video.error ? video.error.code : '?'}`);
     video.onloadedmetadata = () => {
       // 10% in (capped at 30s) skips black intro frames without seeking
       // deep into a multi-GB file.
@@ -438,10 +454,10 @@ function captureFrame(id) {
         canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
         canvas.toBlob(blob => {
           cleanup();
-          blob ? resolve(blob) : reject(new Error('empty frame'));
+          blob ? resolve(blob) : reject(new Error('empty-frame'));
         }, 'image/jpeg', 0.7);
       } catch (err) {
-        fail();
+        fail(`draw-${err.name}`); // SecurityError here = tainted canvas (CORS)
       }
     };
 
