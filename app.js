@@ -8,17 +8,26 @@ const VIDEO_MIME_TYPES = [
   'video/3gpp', 'video/x-flv', 'video/x-ms-wmv'
 ];
 const FILTER_KEYWORDS = /pixel|censor|blur/i;
-const APP_VERSION = 'v16';
+const APP_VERSION = 'v17';
 const BROWSE_BATCH = 50;
 const THUMBNAIL_HOST = 'https://random-vid-pick.vercel.app';
 const META_URL       = `${THUMBNAIL_HOST}/api/meta`;
 const RECENT_MS      = 30 * 24 * 3600 * 1000; // "recently watched" = past month
 
-// Strips trailing video extensions for display, including doubled ones
-// like "name.mp4.mp4" that some files in the library have.
-const VIDEO_EXT_RE = /(\.(mp4|m4v|mkv|webm|mov|avi|mpe?g|3gp|flv|wmv))+$/i;
+// Display-only cleanup of filenames (Drive names and search are untouched):
+// - trailing video extensions, including doubled ones like "name.mp4.mp4"
+// - a "_Downloaded_YYYY_MM_DD_HH_MM_SS" stamp some download tools append
+// - underscores used as word separators
+const VIDEO_EXT_RE      = /(\.(mp4|m4v|mkv|webm|mov|avi|mpe?g|3gp|flv|wmv))+$/i;
+const DOWNLOAD_STAMP_RE = /[_\s]*downloaded(?:_\d{1,4}){6}$/i;
 function displayName(name) {
-  return name.replace(VIDEO_EXT_RE, '') || name;
+  const cleaned = name
+    .replace(VIDEO_EXT_RE, '')
+    .replace(DOWNLOAD_STAMP_RE, '')
+    .replace(/_+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return cleaned || name;
 }
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
