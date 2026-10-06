@@ -8,7 +8,7 @@ const VIDEO_MIME_TYPES = [
   'video/3gpp', 'video/x-flv', 'video/x-ms-wmv'
 ];
 const FILTER_KEYWORDS = /pixel|censor|blur/i;
-const APP_VERSION = 'v17';
+const APP_VERSION = 'v18';
 const BROWSE_BATCH = 50;
 const THUMBNAIL_HOST = 'https://random-vid-pick.vercel.app';
 const META_URL       = `${THUMBNAIL_HOST}/api/meta`;
@@ -63,6 +63,12 @@ const browseSentinel   = document.getElementById('browseSentinel');
 const browseSort       = document.getElementById('browseSort');
 const browseDir        = document.getElementById('browseDir');
 const browseFilter     = document.getElementById('browseFilter');
+const browseTagBar     = document.getElementById('browseTagBar');
+const browseRandomBtn  = document.getElementById('browseRandomBtn');
+const selectBar        = document.getElementById('selectBar');
+const selectCount      = document.getElementById('selectCount');
+const sheetBackdrop    = document.getElementById('sheetBackdrop');
+const sheet            = document.getElementById('sheet');
 
 // ─── AUTH ─────────────────────────────────────────────────────────────────────
 function signIn() {
@@ -262,6 +268,7 @@ async function collectVideos(folderId, pathSoFar = '') {
 
 // ─── META (durations + watched history, stored in KV via /api/meta) ──────────
 let metaWatched  = {};   // fileId -> last-watched epoch ms
+let metaTags     = {};   // fileId -> {tagName: source}  (m manual, f filename, i imported)
 let metaPromise  = null; // load once per page
 const pendingDurations = {};
 const pendingWatched   = new Set();
@@ -281,6 +288,8 @@ function ensureMeta() {
       .then(meta => {
         // Merge, don't replace: a watch marked before this load finished wins.
         metaWatched = { ...(meta.watched || {}), ...metaWatched };
+        // Same for tags edited before the load returned.
+        metaTags = { ...(meta.tags || {}), ...metaTags };
         for (const v of videoCache || []) {
           if (!v.durationMs && meta.durations && meta.durations[v.id]) {
             v.durationMs = meta.durations[v.id];
@@ -355,6 +364,68 @@ function formatDuration(ms) {
   return h ? `${h}:${String(m).padStart(2, '0')}:${s}` : `${m}:${s}`;
 }
 
+// ─── TAGS ─────────────────────────────────────────────────────────────────────
+const TAG_SAVE_CHUNK = 150; // ids per POST (server caps at 200)
+
+function tagsOf(id) {
+  return metaTags[id] || {};
+}
+
+function tagNames(id) {
+  return Object.keys(tagsOf(id));
+}
+
+// name -> number of videos carrying it, most-used first.
+function tagCounts() {
+  const counts = new Map();
+  for (const tags of Object.values(metaTags)) {
+    for (const name of Object.keys(tags)) counts.set(name, (counts.get(name) || 0) + 1);
+  }
+  return new Map([...counts].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])));
+}
+
+// Tidies a typed tag and reuses an existing tag's spelling when it matches
+// case-insensitively, so "Creator" and "creator" don't become two tags.
+function canonicalTag(raw) {
+  const name = raw.replace(/\s+/g, ' ').trim().slice(0, 40);
+  if (!name) return '';
+  const lower = name.toLowerCase();
+  for (const existing of tagCounts().keys()) {
+    if (existing.toLowerCase() === lower) return existing;
+  }
+  return name;
+}
+
+// updates: {fileId: {tag: source}} - each map fully replaces that video's
+// tags (an empty map clears them). Applied locally right away, then saved.
+async function saveTags(updates) {
+  const ids = Object.keys(updates);
+  for (const id of ids) {
+    if (Object.keys(updates[id]).length) metaTags[id] = updates[id];
+    else delete metaTags[id];
+    const video = findVideo(id);
+    if (video) updateCardBadges(video);
+  }
+  refreshTagBar();
+
+  let failed = 0;
+  for (let i = 0; i < ids.length; i += TAG_SAVE_CHUNK) {
+    const chunk = {};
+    for (const id of ids.slice(i, i + TAG_SAVE_CHUNK)) chunk[id] = updates[id];
+    try {
+      const res = await fetch(META_URL, {
+        method:  'POST',
+        headers: metaHeaders({ 'Content-Type': 'application/json' }),
+        body:    JSON.stringify({ tags: chunk }),
+      });
+      if (!res.ok) failed += Object.keys(chunk).length;
+    } catch (err) {
+      failed += Object.keys(chunk).length;
+    }
+  }
+  if (failed) alert(`Couldn't save tags for ${failed} video(s). Check your connection and try again.`);
+}
+
 // ─── VLC LAUNCH ───────────────────────────────────────────────────────────────
 function prewarmStream(fileId) {
   return fetch(`https://random-vid-pick.vercel.app/api/stream?id=${encodeURIComponent(fileId)}`, {
@@ -424,7 +495,7 @@ async function pickRandom(filter = null) {
 // ─── BROWSE ───────────────────────────────────────────────────────────────────
 // Sort/filter choices, remembered between visits.
 const SORT_DEFAULT_DIR = { name: 'asc', created: 'desc', duration: 'desc', size: 'desc', watched: 'desc', random: 'asc' };
-let browsePrefs = { sort: 'name', dir: 'asc', filter: 'all' };
+let browsePrefs = { sort: 'name', dir: 'asc', filter: 'all', tags: [], tagMode: 'all' };
 let randomRank  = new Map(); // fileId -> position, reshuffled on demand
 
 try {
@@ -477,9 +548,21 @@ function filterVideos(query) {
 
   if (filter === 'recent')        list = list.filter(v => isRecentlyWatched(v.id));
   else if (filter === 'unwatched') list = list.filter(v => !isRecentlyWatched(v.id));
+  else if (filter === 'untagged') list = list.filter(v => !tagNames(v.id).length);
   else if (filter.startsWith('folder:')) {
     const folder = filter.slice('folder:'.length);
     list = list.filter(v => v.path === folder);
+  }
+
+  // Tag chips: videos must carry all selected tags (or any, if toggled).
+  const wanted = browsePrefs.tags;
+  if (wanted.length) {
+    list = list.filter(v => {
+      const tags = tagsOf(v.id);
+      return browsePrefs.tagMode === 'any'
+        ? wanted.some(t => t in tags)
+        : wanted.every(t => t in tags);
+    });
   }
 
   if (query) {
@@ -516,6 +599,7 @@ function populateFolderFilter() {
   add(browseFilter, 'all', 'All videos');
   add(browseFilter, 'recent', 'Watched in last 30 days');
   add(browseFilter, 'unwatched', 'Not watched in last 30 days');
+  add(browseFilter, 'untagged', 'Untagged');
   if (folders.length > 1) {
     const group = document.createElement('optgroup');
     group.label = 'Folder';
@@ -555,7 +639,11 @@ browseFilter.addEventListener('change', () => {
 function buildCard(video) {
   const card = document.createElement('div');
   card.className = 'browse-card';
-  card.onclick = () => playVideo(video);
+  card.classList.toggle('selected', selectedIds.has(video.id));
+  card.onclick = () => {
+    if (selectMode) toggleSelected(video.id, card);
+    else playVideo(video);
+  };
 
   const thumb = document.createElement('div');
   thumb.className = 'browse-thumb';
@@ -578,8 +666,19 @@ function buildCard(video) {
   const watchedBadge = document.createElement('span');
   watchedBadge.className = 'browse-badge browse-watched';
   watchedBadge.textContent = 'WATCHED';
-  thumb.append(durBadge, watchedBadge);
-  cardBadges.set(video.id, { dur: durBadge, watched: watchedBadge });
+  const tagBtn = document.createElement('button');
+  tagBtn.type = 'button';
+  tagBtn.className = 'browse-tagbtn';
+  tagBtn.setAttribute('aria-label', 'Edit tags');
+  tagBtn.onclick = e => {
+    e.stopPropagation(); // don't also play the video
+    openTagEditor([video.id]);
+  };
+  const check = document.createElement('span');
+  check.className = 'browse-check';
+  check.textContent = '✓';
+  thumb.append(durBadge, watchedBadge, tagBtn, check);
+  cardBadges.set(video.id, { dur: durBadge, watched: watchedBadge, tag: tagBtn });
   updateCardBadges(video);
 
   const caption = document.createElement('div');
@@ -780,6 +879,10 @@ function updateCardBadges(video) {
   b.dur.textContent = video.durationMs ? formatDuration(video.durationMs) : '';
   b.dur.hidden      = !video.durationMs;
   b.watched.hidden  = !isRecentlyWatched(video.id);
+  const n = tagNames(video.id).length;
+  b.tag.textContent = n ? `🏷 ${n}` : '🏷';
+  b.tag.classList.toggle('has-tags', n > 0);
+  b.tag.title = n ? tagNames(video.id).join(', ') : 'Add tags';
 }
 
 function renderNextBatch() {
@@ -837,7 +940,11 @@ async function openBrowseView() {
     if (!randomRank.size) reshuffle();
     browseSearch.value = '';
     populateFolderFilter();
+    // Drop remembered tag chips that no longer exist.
+    const known = tagCounts();
+    browsePrefs.tags = browsePrefs.tags.filter(t => known.has(t));
     syncBrowseControls();
+    refreshTagBar();
     refreshBrowse();
     browseView.classList.add('visible');
   } catch (err) {
@@ -849,6 +956,8 @@ async function openBrowseView() {
 }
 
 function closeBrowseView() {
+  setSelectMode(false);
+  closeSheet();
   browseView.classList.remove('visible');
   if (browseObserver) {
     browseObserver.disconnect();
@@ -861,6 +970,344 @@ browseSearch.addEventListener('input', () => {
   browseSearchDebounce = setTimeout(() => {
     refreshBrowse();
   }, 150);
+});
+
+// ─── TAG BAR, SELECT MODE, TAG SHEETS ─────────────────────────────────────────
+let selectMode = false;
+const selectedIds = new Set();
+
+// Small DOM helper: el('button', { className: 'x', onclick }, 'text', child)
+function el(tag, props = {}, ...children) {
+  const node = Object.assign(document.createElement(tag), props);
+  for (const c of children) if (c != null) node.append(c);
+  return node;
+}
+
+function refreshTagBar() {
+  browseTagBar.innerHTML = '';
+  browseTagBar.append(
+    el('button', {
+      type: 'button',
+      className: 'tag-chip tag-chip-action' + (selectMode ? ' active' : ''),
+      textContent: selectMode ? '✕ CANCEL SELECT' : '☑ SELECT',
+      onclick: () => setSelectMode(!selectMode),
+    }),
+    el('button', {
+      type: 'button',
+      className: 'tag-chip tag-chip-action',
+      textContent: '⚙ TAGS',
+      onclick: openTagManager,
+    })
+  );
+  if (browsePrefs.tags.length > 1) {
+    browseTagBar.append(el('button', {
+      type: 'button',
+      className: 'tag-chip tag-chip-action',
+      textContent: browsePrefs.tagMode === 'any' ? 'MATCH ANY' : 'MATCH ALL',
+      title: 'Videos must have all selected tags, or any of them',
+      onclick: () => {
+        browsePrefs.tagMode = browsePrefs.tagMode === 'any' ? 'all' : 'any';
+        saveBrowsePrefs();
+        refreshTagBar();
+        refreshBrowse();
+      },
+    }));
+  }
+  for (const [name, count] of tagCounts()) {
+    const active = browsePrefs.tags.includes(name);
+    browseTagBar.append(el('button', {
+      type: 'button',
+      className: 'tag-chip' + (active ? ' active' : ''),
+      textContent: `${name} ${count}`,
+      onclick: () => {
+        browsePrefs.tags = active
+          ? browsePrefs.tags.filter(t => t !== name)
+          : [...browsePrefs.tags, name];
+        saveBrowsePrefs();
+        refreshTagBar();
+        refreshBrowse();
+      },
+    }));
+  }
+}
+
+function setSelectMode(on) {
+  selectMode = on;
+  if (!on) {
+    selectedIds.clear();
+    browseGrid.querySelectorAll('.browse-card.selected').forEach(c => c.classList.remove('selected'));
+  }
+  browseView.classList.toggle('selecting', on);
+  updateSelectBar();
+  if (browseView.classList.contains('visible')) refreshTagBar();
+}
+
+function toggleSelected(id, card) {
+  if (selectedIds.has(id)) selectedIds.delete(id);
+  else selectedIds.add(id);
+  card.classList.toggle('selected', selectedIds.has(id));
+  updateSelectBar();
+}
+
+function updateSelectBar() {
+  selectBar.hidden = !selectMode;
+  selectCount.textContent = `${selectedIds.size} selected`;
+}
+
+function selectAllInView() {
+  for (const v of browseFiltered) selectedIds.add(v.id);
+  browseGrid.querySelectorAll('.browse-card').forEach(c => c.classList.add('selected'));
+  updateSelectBar();
+}
+
+function tagSelected() {
+  if (selectedIds.size) openTagEditor([...selectedIds]);
+}
+
+function openSheet(...content) {
+  sheet.innerHTML = '';
+  sheet.append(...content);
+  sheetBackdrop.hidden = false;
+}
+
+function closeSheet() {
+  sheetBackdrop.hidden = true;
+  sheet.innerHTML = '';
+}
+
+sheetBackdrop.addEventListener('click', e => {
+  if (e.target === sheetBackdrop) closeSheet();
+});
+
+// Tag editor for one or many videos. Each tag is in one of three states:
+//   'all'  - every chosen video has it (or will, once saved)
+//   'none' - no chosen video has it (or will lose it)
+//   'some' - mixed; left exactly as-is on save unless changed
+// Tapping cycles all <-> none (and a mixed tag goes some -> all -> none -> some).
+function openTagEditor(ids) {
+  const counts = new Map();
+  for (const id of ids) for (const t of tagNames(id)) counts.set(t, (counts.get(t) || 0) + 1);
+  const state = new Map();
+  for (const name of tagCounts().keys()) {
+    const c = counts.get(name) || 0;
+    state.set(name, c === ids.length ? 'all' : c === 0 ? 'none' : 'some');
+  }
+  const original = new Map(state);
+
+  const chips = el('div', { className: 'sheet-chips' });
+  const renderChips = () => {
+    chips.innerHTML = '';
+    // Tags already on the video(s) first, then everything else by usage.
+    const order = [...state.keys()].sort((a, b) =>
+      (state.get(a) === 'none') - (state.get(b) === 'none'));
+    for (const name of order) {
+      const st = state.get(name);
+      chips.append(el('button', {
+        type: 'button',
+        className: `tag-chip state-${st}`,
+        textContent: st === 'some' ? `${name} (${counts.get(name)}/${ids.length})` : name,
+        onclick: () => {
+          const next = st === 'all' ? 'none'
+            : st === 'none' ? (original.get(name) === 'some' ? 'some' : 'all')
+            : 'all';
+          state.set(name, next);
+          renderChips();
+        },
+      }));
+    }
+    if (!state.size) chips.append(el('div', { className: 'sheet-note', textContent: 'No tags yet. Type one below.' }));
+  };
+
+  const input = el('input', {
+    type: 'text',
+    className: 'sheet-input',
+    placeholder: 'New tag…',
+    maxLength: 40,
+  });
+  const addTyped = () => {
+    const name = canonicalTag(input.value);
+    if (!name) return;
+    state.set(name, 'all');
+    input.value = '';
+    renderChips();
+  };
+  input.addEventListener('keydown', e => { if (e.key === 'Enter') addTyped(); });
+
+  const save = async () => {
+    const updates = {};
+    for (const id of ids) {
+      const next = { ...tagsOf(id) };
+      for (const [name, st] of state) {
+        if (st === 'all' && !(name in next)) next[name] = 'm';
+        if (st === 'none') delete next[name];
+      }
+      const before = JSON.stringify(Object.keys(tagsOf(id)).sort());
+      if (JSON.stringify(Object.keys(next).sort()) !== before) updates[id] = next;
+    }
+    closeSheet();
+    if (Object.keys(updates).length) {
+      await saveTags(updates);
+      refreshBrowse();
+    }
+  };
+
+  renderChips();
+  const title = ids.length === 1
+    ? displayName(findVideo(ids[0]).name)
+    : `${ids.length} videos`;
+  openSheet(
+    el('div', { className: 'sheet-title', textContent: `Tags · ${title}` }),
+    chips,
+    el('div', { className: 'sheet-row' },
+      input,
+      el('button', { type: 'button', className: 'sheet-btn', textContent: 'ADD', onclick: addTyped })),
+    el('div', { className: 'sheet-row sheet-actions' },
+      el('button', { type: 'button', className: 'sheet-btn', textContent: 'CANCEL', onclick: closeSheet }),
+      el('button', { type: 'button', className: 'sheet-btn primary', textContent: 'SAVE', onclick: save }))
+  );
+}
+
+function openTagManager() {
+  const list = el('div', { className: 'sheet-list' });
+  const counts = tagCounts();
+  if (!counts.size) list.append(el('div', { className: 'sheet-note', textContent: 'No tags yet.' }));
+
+  for (const [name, count] of counts) {
+    list.append(el('div', { className: 'sheet-list-row' },
+      el('span', { className: 'sheet-list-name', textContent: `${name}` }),
+      el('span', { className: 'sheet-list-count', textContent: String(count) }),
+      el('button', { type: 'button', className: 'sheet-btn small', textContent: 'RENAME', onclick: () => renameTag(name) }),
+      el('button', { type: 'button', className: 'sheet-btn small danger', textContent: 'DELETE', onclick: () => deleteTag(name, count) })));
+  }
+
+  openSheet(
+    el('div', { className: 'sheet-title', textContent: 'Manage tags' }),
+    list,
+    el('div', { className: 'sheet-row sheet-actions' },
+      el('button', { type: 'button', className: 'sheet-btn', textContent: 'SUGGEST CREATOR TAGS', onclick: openCreatorSuggestions }),
+      el('button', { type: 'button', className: 'sheet-btn', textContent: 'DOWNLOAD BACKUP', onclick: downloadTagBackup })),
+    el('div', { className: 'sheet-row sheet-actions' },
+      el('button', { type: 'button', className: 'sheet-btn', textContent: 'CLOSE', onclick: closeSheet }))
+  );
+}
+
+async function renameTag(oldName) {
+  const typed = prompt(`Rename tag "${oldName}" to:`, oldName);
+  if (typed == null) return;
+  const newName = typed.replace(/\s+/g, ' ').trim().slice(0, 40);
+  if (!newName || newName === oldName) return;
+  // Renaming onto an existing tag (any case) merges the two.
+  const target = canonicalTag(newName) === oldName ? newName : canonicalTag(newName);
+  const updates = {};
+  for (const [id, tags] of Object.entries(metaTags)) {
+    if (!(oldName in tags)) continue;
+    const next = { ...tags };
+    const src = next[oldName];
+    delete next[oldName];
+    if (!(target in next)) next[target] = src;
+    updates[id] = next;
+  }
+  browsePrefs.tags = browsePrefs.tags.map(t => (t === oldName ? target : t));
+  saveBrowsePrefs();
+  await saveTags(updates);
+  refreshBrowse();
+  openTagManager();
+}
+
+async function deleteTag(name, count) {
+  if (!confirm(`Remove tag "${name}" from ${count} video(s)?`)) return;
+  const updates = {};
+  for (const [id, tags] of Object.entries(metaTags)) {
+    if (!(name in tags)) continue;
+    const next = { ...tags };
+    delete next[name];
+    updates[id] = next;
+  }
+  browsePrefs.tags = browsePrefs.tags.filter(t => t !== name);
+  saveBrowsePrefs();
+  await saveTags(updates);
+  refreshBrowse();
+  openTagManager();
+}
+
+// Most filenames start with the creator: "Creator_Title..." or
+// "Creator - Title...". Proposes those as tags for review - nothing is
+// saved until confirmed, and names without that shape are skipped.
+function creatorFromName(name) {
+  const m = /^([^_]{2,40}?)(?:_| - )/.exec(name);
+  if (!m) return null;
+  const creator = m[1].replace(/\s+/g, ' ').trim();
+  if (!creator || /^\d+$/.test(creator)) return null;
+  return creator;
+}
+
+function openCreatorSuggestions() {
+  const groups = new Map(); // creator -> [video ids lacking that tag]
+  for (const v of videoCache || []) {
+    const raw = creatorFromName(v.name);
+    if (!raw) continue;
+    const creator = canonicalTag(raw);
+    if (creator in tagsOf(v.id)) continue;
+    if (!groups.has(creator)) groups.set(creator, []);
+    groups.get(creator).push(v.id);
+  }
+  const sorted = [...groups].sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]));
+
+  const list = el('div', { className: 'sheet-list' });
+  const boxes = [];
+  if (!sorted.length) list.append(el('div', { className: 'sheet-note', textContent: 'No new creator tags to suggest.' }));
+  for (const [creator, ids] of sorted) {
+    // One-off names are more often a misparse than a real creator.
+    const box = el('input', { type: 'checkbox', checked: ids.length >= 2 });
+    boxes.push([box, creator, ids]);
+    list.append(el('label', { className: 'sheet-list-row' },
+      box,
+      el('span', { className: 'sheet-list-name', textContent: creator }),
+      el('span', { className: 'sheet-list-count', textContent: String(ids.length) })));
+  }
+
+  const apply = async () => {
+    const updates = {};
+    for (const [box, creator, ids] of boxes) {
+      if (!box.checked) continue;
+      for (const id of ids) {
+        updates[id] = { ...(updates[id] || tagsOf(id)), [creator]: 'f' };
+      }
+    }
+    closeSheet();
+    if (Object.keys(updates).length) {
+      await saveTags(updates);
+      refreshBrowse();
+    }
+  };
+
+  openSheet(
+    el('div', { className: 'sheet-title', textContent: 'Suggested creator tags' }),
+    el('div', { className: 'sheet-note', textContent: 'From the start of each filename. Untick any that look wrong.' }),
+    list,
+    el('div', { className: 'sheet-row sheet-actions' },
+      el('button', { type: 'button', className: 'sheet-btn', textContent: 'BACK', onclick: openTagManager }),
+      el('button', { type: 'button', className: 'sheet-btn primary', textContent: 'APPLY', onclick: apply }))
+  );
+}
+
+function downloadTagBackup() {
+  const rows = Object.entries(metaTags).map(([id, tags]) => {
+    const v = findVideo(id);
+    return { id, name: v ? v.name : null, tags };
+  });
+  const blob = new Blob([JSON.stringify({ exported: new Date().toISOString(), videos: rows }, null, 2)],
+    { type: 'application/json' });
+  const a = el('a', { href: URL.createObjectURL(blob), download: `rvp-tags-${new Date().toISOString().slice(0, 10)}.json` });
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+browseRandomBtn.addEventListener('click', () => {
+  if (!browseFiltered.length) return;
+  playVideo(browseFiltered[Math.floor(Math.random() * browseFiltered.length)]);
 });
 
 async function playVideo(video) {

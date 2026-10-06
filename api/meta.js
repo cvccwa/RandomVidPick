@@ -6,6 +6,10 @@ const ALLOWED_ORIGIN = 'https://cvccwa.github.io';
 const ROOT_FOLDER    = '1JBAz8KFVSHfnzojWnhECD7gtBRkLBCk9';
 const DUR_KEY        = 'rvp:dur';     // hash: fileId -> duration ms
 const WATCHED_KEY    = 'rvp:watched'; // hash: fileId -> last-watched epoch ms
+const TAGS_KEY       = 'rvp:tags';    // hash: fileId -> JSON {tagName: source}
+const TAG_SOURCES    = new Set(['m', 'f', 'i']); // manual, filename-derived, imported
+const MAX_TAGS       = 50;
+const MAX_TAG_LEN    = 40;
 const AUTH_TTL_S     = 3000;          // re-verify a user token at most every ~50 min
 const ID_RE          = /^[\w-]{10,100}$/;
 
@@ -56,6 +60,21 @@ async function isAuthorized(req) {
   return true;
 }
 
+// Returns a cleaned {tag: source} map, or null if anything is malformed.
+function cleanTags(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const entries = Object.entries(raw);
+  if (entries.length > MAX_TAGS) return null;
+  const out = {};
+  for (const [tag, src] of entries) {
+    const name = tag.replace(/\s+/g, ' ').trim();
+    if (!name || name.length > MAX_TAG_LEN || /[\u0000-\u001f]/.test(name)) return null;
+    if (!TAG_SOURCES.has(src)) return null;
+    out[name] = src;
+  }
+  return out;
+}
+
 // HGETALL comes back from Upstash REST as a flat [field, value, ...] array.
 function pairsToObject(arr) {
   const out = {};
@@ -73,11 +92,16 @@ export default async function handler(req) {
   if (!(await isAuthorized(req))) return json({ error: 'unauthorized' }, 401);
 
   if (req.method === 'GET') {
-    const [dur, watched] = await Promise.all([
+    const [dur, watched, tagPairs] = await Promise.all([
       kvCommand(['HGETALL', DUR_KEY]),
       kvCommand(['HGETALL', WATCHED_KEY]),
+      kvCommand(['HGETALL', TAGS_KEY]),
     ]);
-    return json({ durations: pairsToObject(dur), watched: pairsToObject(watched) });
+    const tags = {};
+    for (let i = 0; i + 1 < (tagPairs || []).length; i += 2) {
+      try { tags[tagPairs[i]] = JSON.parse(tagPairs[i + 1]); } catch (err) { /* skip corrupt row */ }
+    }
+    return json({ durations: pairsToObject(dur), watched: pairsToObject(watched), tags });
   }
 
   if (req.method === 'POST') {
@@ -102,11 +126,34 @@ export default async function handler(req) {
       if (typeof id === 'string' && ID_RE.test(id)) watchedArgs.push(id, now);
     }
 
+    // Tags: each entry fully replaces that video's tag map; an empty map
+    // (or null) clears it. Any malformed entry rejects the whole request so
+    // a buggy client can't half-apply a bulk edit.
+    const tagSetArgs = [];
+    const tagDelIds  = [];
+    const tagEntries = Object.entries(body.tags || {});
+    if (tagEntries.length > 200) return json({ error: 'too many tag updates' }, 400);
+    for (const [id, raw] of tagEntries) {
+      if (!ID_RE.test(id)) return json({ error: 'bad id' }, 400);
+      if (raw === null) { tagDelIds.push(id); continue; }
+      const cleaned = cleanTags(raw);
+      if (!cleaned) return json({ error: 'bad tags' }, 400);
+      if (Object.keys(cleaned).length) tagSetArgs.push(id, JSON.stringify(cleaned));
+      else tagDelIds.push(id);
+    }
+
     const writes = [];
+    if (tagSetArgs.length) writes.push(kvCommand(['HSET', TAGS_KEY, ...tagSetArgs]));
+    if (tagDelIds.length)  writes.push(kvCommand(['HDEL', TAGS_KEY, ...tagDelIds]));
     if (durArgs.length)     writes.push(kvCommand(['HSET', DUR_KEY, ...durArgs]));
     if (watchedArgs.length) writes.push(kvCommand(['HSET', WATCHED_KEY, ...watchedArgs]));
     await Promise.all(writes);
-    return json({ ok: true, durations: durArgs.length / 2, watched: watchedArgs.length / 2 });
+    return json({
+      ok:        true,
+      durations: durArgs.length / 2,
+      watched:   watchedArgs.length / 2,
+      tags:      tagSetArgs.length / 2 + tagDelIds.length,
+    });
   }
 
   return json({ error: 'method not allowed' }, 405);
