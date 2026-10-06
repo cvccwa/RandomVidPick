@@ -412,7 +412,7 @@
        "automatic minimum" ambiguity, so the row is forced to fit it exactly.
        Nothing in this card relies on auto/content-based sizing anymore. */
     .browse-card {
-      height: 172px; /* 100px thumb + up to 4 caption lines */
+      height: 194px; /* creator line + 100px thumb + up to 4 caption lines */
       display: flex;
       flex-direction: column;
       background: var(--surface);
@@ -577,6 +577,18 @@
     .browse-thumb img.thumb-fallback {
       object-fit: none;
       background: var(--border) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23555' stroke-width='1.5'%3E%3Crect x='2' y='4' width='20' height='16' rx='2'/%3E%3Cpath d='M10 9l5 3-5 3z' fill='%23555'/%3E%3C/svg%3E") center/2rem no-repeat;
+    }
+
+    .browse-creator {
+      flex-shrink: 0;
+      height: 1.4rem;
+      line-height: 1.4rem;
+      padding: 0 0.5rem;
+      font-size: 0.65rem;
+      color: var(--accent);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
 
     .browse-caption {

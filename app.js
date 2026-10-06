@@ -725,15 +725,16 @@ function buildCard(video) {
   check.className = 'browse-check';
   check.textContent = '✓';
   thumb.append(durBadge, watchedBadge, tagBtn, check);
-  cardBadges.set(video.id, { dur: durBadge, watched: watchedBadge, tag: tagBtn });
-  updateCardBadges(video);
+  const creatorRow = document.createElement('div');
+  creatorRow.className = 'browse-creator';
 
   const caption = document.createElement('div');
   caption.className = 'browse-caption';
-  caption.textContent = displayName(video.name);
   card.title = displayName(video.name); // full name on long-press/hover if still clamped
 
-  card.append(thumb, caption);
+  card.append(creatorRow, thumb, caption);
+  cardBadges.set(video.id, { dur: durBadge, watched: watchedBadge, tag: tagBtn, creator: creatorRow, caption });
+  updateCardBadges(video);
   return card;
 }
 
@@ -920,9 +921,33 @@ function pumpDurationProbes() {
 // later (probe/frame grab) or a new watch can update the card in place.
 const cardBadges = new Map();
 
+function creatorsOf(id) {
+  return tagNames(id).filter(isCreatorTag).map(tagLabel)
+    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+}
+
+// Card title with a leading creator name removed, since the creator is
+// shown on its own line above the thumbnail. Only strips when the name is
+// followed by a separator (or is the whole title), so a creator called
+// "Ann" doesn't eat the start of "Annual ...".
+function titleWithoutCreator(video) {
+  const name = displayName(video.name);
+  const creators = creatorsOf(video.id).sort((a, b) => b.length - a.length);
+  for (const c of creators) {
+    if (!name.toLowerCase().startsWith(c.toLowerCase())) continue;
+    const rest = name.slice(c.length);
+    if (rest && !/^[\s\-\u2013\u2014_:|.,]/.test(rest)) continue;
+    return rest.replace(/^[\s\-\u2013\u2014_:|.,]+/, '') || name;
+  }
+  return name;
+}
+
 function updateCardBadges(video) {
   const b = cardBadges.get(video.id);
   if (!b) return;
+  const creators = creatorsOf(video.id);
+  b.creator.textContent = creators.join(', ');
+  b.caption.textContent = titleWithoutCreator(video);
   b.dur.textContent = video.durationMs ? formatDuration(video.durationMs) : '';
   b.dur.hidden      = !video.durationMs;
   b.watched.hidden  = !isRecentlyWatched(video.id);
