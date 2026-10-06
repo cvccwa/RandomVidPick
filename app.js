@@ -8,7 +8,7 @@ const VIDEO_MIME_TYPES = [
   'video/3gpp', 'video/x-flv', 'video/x-ms-wmv'
 ];
 const FILTER_KEYWORDS = /pixel|censor|blur/i;
-const APP_VERSION = 'v20';
+const APP_VERSION = 'v21';
 const BROWSE_BATCH = 50;
 const THUMBNAIL_HOST = 'https://random-vid-pick.vercel.app';
 const META_URL       = `${THUMBNAIL_HOST}/api/meta`;
@@ -612,13 +612,37 @@ function filterVideos(query) {
     });
   }
 
-  if (query) {
-    const q = query.toLowerCase();
-    list = list.filter(v =>
-      v.name.toLowerCase().includes(q) || (v.path && v.path.toLowerCase().includes(q))
-    );
-  }
+  if (query) list = list.filter(searchMatcher(query));
   return sortVideos(list);
+}
+
+// Lowercase, with underscores/dashes/dots/punctuation all treated as spaces,
+// so a search typed the way names are displayed ("Creator Some Title")
+// matches the raw filename ("Creator_Some_Title.mp4").
+// A dot between digits ("2.1") is kept, so "Part2.1" and "Part2.2" stay
+// distinct instead of both becoming "part2" plus a lone digit.
+function searchNormalize(text) {
+  return text.toLowerCase()
+    .replace(/(\d)\.(?=\d)/g, '$1\u0001')
+    .replace(/[\s_\-\u2013\u2014.,:;|()[\]'"!?&+]+/g, ' ')
+    .replace(/\u0001/g, '.')
+    .trim();
+}
+
+// Every word of the query must appear somewhere in the video's filename,
+// display name, folder, creators or tags - checked both with spaces and
+// with spaces removed, so "jane all day" finds "JaneAllDay" and vice versa.
+function searchMatcher(query) {
+  const words   = searchNormalize(query).split(' ').filter(Boolean);
+  const compact = words.join('');
+  return v => {
+    const hay = searchNormalize([
+      v.name, displayName(v.name), v.path || '', ...tagNames(v.id).map(tagLabel),
+    ].join(' '));
+    const hayCompact = hay.replace(/ /g, '');
+    return hayCompact.includes(compact)
+      || words.every(w => hay.includes(w) || hayCompact.includes(w));
+  };
 }
 
 function refreshBrowse() {
@@ -753,6 +777,9 @@ const FRAME_THUMB_WIDTH       = 320;
 let thumbDbPromise = null;
 const frameThumbQueue  = [];
 const frameThumbFailed = new Set(); // undecodable this session - don't retry
+const frameThumbAttempts = new Map(); // id -> failed attempts that looked transient
+const FRAME_THUMB_RETRIES = 2;
+const FRAME_THUMB_RETRY_DELAY_MS = 20000; // x attempt number: 20s, then 40s
 let frameThumbActive = 0;
 
 function openThumbDb() {
@@ -816,9 +843,26 @@ function pumpFrameThumbQueue() {
         thumbDbPut(job.id, blob);
         if (job.img.isConnected) showThumbBlob(job.img, blob);
       })
-      .catch(err => {
-        frameThumbFailed.add(job.id);
-        reportFrameThumbMiss(job.id, err.message);
+      .catch(async err => {
+        // A grab can fail because the video truly can't be decoded here, or
+        // because the stream itself didn't answer (Drive slow/throttling, the
+        // proxy's 25s first-byte limit) - which the browser also reports as
+        // "can't play". Retry the second kind later; give up on the first.
+        const transient = err.message.startsWith('timeout')
+          || (err.message.startsWith('media-err') && await streamLooksDown(job.id));
+        const attempt = (frameThumbAttempts.get(job.id) || 0) + 1;
+        frameThumbAttempts.set(job.id, attempt);
+        if (transient && attempt <= FRAME_THUMB_RETRIES) {
+          reportFrameThumbMiss(job.id, `${err.message}-retry${attempt}`);
+          setTimeout(() => {
+            if (!job.img.isConnected) return;
+            frameThumbQueue.push(job);
+            pumpFrameThumbQueue();
+          }, FRAME_THUMB_RETRY_DELAY_MS * attempt);
+        } else {
+          frameThumbFailed.add(job.id);
+          reportFrameThumbMiss(job.id, transient ? `${err.message}-gaveup` : err.message);
+        }
       })
       .finally(() => {
         frameThumbActive--;
@@ -829,6 +873,26 @@ function pumpFrameThumbQueue() {
 
 // The grab runs on the phone with no devtools, so send the failure reason
 // to the server where it shows up in Vercel runtime logs.
+// Asks the stream for its first byte. A healthy response means the earlier
+// failure was the video itself; an error status or no answer means the
+// stream was the problem and a retry may succeed.
+async function streamLooksDown(id) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 15000);
+  try {
+    const res = await fetch(`${THUMBNAIL_HOST}/api/stream?id=${encodeURIComponent(id)}`, {
+      headers: { Range: 'bytes=0-0' },
+      signal:  ctrl.signal,
+    });
+    if (res.body) res.body.cancel().catch(() => {});
+    return !res.ok;
+  } catch (err) {
+    return true;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function reportFrameThumbMiss(id, reason) {
   fetch(`${THUMBNAIL_HOST}/api/thumbnail?id=${encodeURIComponent(id)}`
     + `&report=${encodeURIComponent(reason)}`).catch(() => {});
