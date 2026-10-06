@@ -357,6 +357,29 @@
     .tag-chip.state-none { color: var(--muted); }
     .tag-chip-action { color: var(--muted); letter-spacing: 0.05em; }
     .tag-chip-action.active { background: var(--danger); border-color: var(--danger); color: #fff; }
+    .tag-chip-action.filtering { border-color: var(--accent); color: var(--accent); }
+
+    .sheet-section {
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      padding-top: 0.5rem;
+      border-top: 1px solid var(--border);
+    }
+    .sheet-section-title { font-size: 0.7rem; color: var(--muted); letter-spacing: 0.08em; text-transform: uppercase; }
+    .picker-list { max-height: 45dvh; overflow-y: auto; }
+    .sheet-tab {
+      flex: 1;
+      background: transparent;
+      border: none;
+      border-bottom: 2px solid var(--border);
+      color: var(--muted);
+      font-family: 'DM Mono', monospace;
+      font-size: 0.7rem;
+      padding: 0.5rem;
+      cursor: pointer;
+    }
+    .sheet-tab.active { color: var(--text); border-bottom-color: var(--accent); }
 
     .browse-count {
       padding: 0.5rem 1rem;
