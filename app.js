@@ -8,7 +8,7 @@ const VIDEO_MIME_TYPES = [
   'video/3gpp', 'video/x-flv', 'video/x-ms-wmv'
 ];
 const FILTER_KEYWORDS = /pixel|censor|blur/i;
-const APP_VERSION = 'v19';
+const APP_VERSION = 'v20';
 const BROWSE_BATCH = 50;
 const THUMBNAIL_HOST = 'https://random-vid-pick.vercel.app';
 const META_URL       = `${THUMBNAIL_HOST}/api/meta`;
@@ -378,25 +378,65 @@ function tagNames(id) {
   return Object.keys(tagsOf(id));
 }
 
-// name -> number of videos carrying it, most-used first.
-function tagCounts() {
+// Creator tags are stored as "creator:<name>" so they can be filtered and
+// managed separately from ordinary tags; the prefix is never shown.
+const CREATOR_PREFIX = 'creator:';
+const TAG_NAME_MAX   = 40;
+
+function isCreatorTag(name) {
+  return name.startsWith(CREATOR_PREFIX);
+}
+
+function tagLabel(name) {
+  return isCreatorTag(name) ? name.slice(CREATOR_PREFIX.length) : name;
+}
+
+function tagKind(name) {
+  return isCreatorTag(name) ? 'creator' : 'tag';
+}
+
+// name -> number of videos carrying it, most-used first. kind narrows it to
+// 'creator' or 'tag'; omitted means both.
+function tagCounts(kind) {
   const counts = new Map();
   for (const tags of Object.values(metaTags)) {
-    for (const name of Object.keys(tags)) counts.set(name, (counts.get(name) || 0) + 1);
+    for (const name of Object.keys(tags)) {
+      if (kind && tagKind(name) !== kind) continue;
+      counts.set(name, (counts.get(name) || 0) + 1);
+    }
   }
   return new Map([...counts].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])));
 }
 
-// Tidies a typed tag and reuses an existing tag's spelling when it matches
-// case-insensitively, so "Creator" and "creator" don't become two tags.
-function canonicalTag(raw) {
-  const name = raw.replace(/\s+/g, ' ').trim().slice(0, 40);
-  if (!name) return '';
-  const lower = name.toLowerCase();
+// Tidies a typed name into a full tag (adding the creator prefix if asked)
+// and reuses an existing tag's spelling when it matches case-insensitively,
+// so "Jane" and "jane" don't become two tags.
+function canonicalTag(raw, creator = false) {
+  const label = raw.replace(/\s+/g, ' ').trim().slice(0, TAG_NAME_MAX);
+  if (!label) return '';
+  const full  = (creator ? CREATOR_PREFIX : '') + label;
+  const lower = full.toLowerCase();
   for (const existing of tagCounts().keys()) {
     if (existing.toLowerCase() === lower) return existing;
   }
-  return name;
+  return full;
+}
+
+// Creator tags from before creators had their own category were saved with
+// source 'f' (filename suggestions) and no prefix. Convert them once.
+async function migrateCreatorTags() {
+  const updates = {};
+  for (const [id, tags] of Object.entries(metaTags)) {
+    let changed = false;
+    const next = {};
+    for (const [name, src] of Object.entries(tags)) {
+      const target = src === 'f' && !isCreatorTag(name) ? CREATOR_PREFIX + name : name;
+      if (target !== name) changed = true;
+      if (!(target in next)) next[target] = src;
+    }
+    if (changed) updates[id] = next;
+  }
+  if (Object.keys(updates).length) await saveTags(updates);
 }
 
 // updates: {fileId: {tag: source}} - each map fully replaces that video's
@@ -498,7 +538,7 @@ async function pickRandom(filter = null) {
 // ─── BROWSE ───────────────────────────────────────────────────────────────────
 // Sort/filter choices, remembered between visits.
 const SORT_DEFAULT_DIR = { name: 'asc', created: 'desc', duration: 'desc', size: 'desc', watched: 'desc', random: 'asc' };
-let browsePrefs = { sort: 'name', dir: 'asc', filter: 'all', tags: [], tagMode: 'all' };
+let browsePrefs = { sort: 'name', dir: 'asc', filter: 'all', creators: [], tags: [], tagMode: 'all' };
 let randomRank  = new Map(); // fileId -> position, reshuffled on demand
 
 try {
@@ -557,7 +597,11 @@ function filterVideos(query) {
     list = list.filter(v => v.path === folder);
   }
 
-  // Tag chips: videos must carry all selected tags (or any, if toggled).
+  // Creators: a video matches if it has any of the chosen creators.
+  const creators = browsePrefs.creators;
+  if (creators.length) list = list.filter(v => creators.some(c => c in tagsOf(v.id)));
+
+  // Tags: videos must carry all chosen tags (or any, if toggled).
   const wanted = browsePrefs.tags;
   if (wanted.length) {
     list = list.filter(v => {
@@ -585,8 +629,8 @@ function refreshBrowse() {
 function syncBrowseControls() {
   browseSort.value = browsePrefs.sort;
   browseDir.textContent = browsePrefs.sort === 'random'
-    ? '⟳ SHUFFLE'
-    : browsePrefs.dir === 'asc' ? '↑ ASC' : '↓ DESC';
+    ? '⟳ Shuffle'
+    : browsePrefs.dir === 'asc' ? '↑ Asc' : '↓ Desc';
 }
 
 function populateFolderFilter() {
@@ -668,7 +712,7 @@ function buildCard(video) {
   durBadge.className = 'browse-badge browse-duration';
   const watchedBadge = document.createElement('span');
   watchedBadge.className = 'browse-badge browse-watched';
-  watchedBadge.textContent = 'WATCHED';
+  watchedBadge.textContent = 'Watched';
   const tagBtn = document.createElement('button');
   tagBtn.type = 'button';
   tagBtn.className = 'browse-tagbtn';
@@ -681,15 +725,16 @@ function buildCard(video) {
   check.className = 'browse-check';
   check.textContent = '✓';
   thumb.append(durBadge, watchedBadge, tagBtn, check);
-  cardBadges.set(video.id, { dur: durBadge, watched: watchedBadge, tag: tagBtn });
-  updateCardBadges(video);
+  const creatorRow = document.createElement('div');
+  creatorRow.className = 'browse-creator';
 
   const caption = document.createElement('div');
   caption.className = 'browse-caption';
-  caption.textContent = displayName(video.name);
   card.title = displayName(video.name); // full name on long-press/hover if still clamped
 
-  card.append(thumb, caption);
+  card.append(creatorRow, thumb, caption);
+  cardBadges.set(video.id, { dur: durBadge, watched: watchedBadge, tag: tagBtn, creator: creatorRow, caption });
+  updateCardBadges(video);
   return card;
 }
 
@@ -876,16 +921,42 @@ function pumpDurationProbes() {
 // later (probe/frame grab) or a new watch can update the card in place.
 const cardBadges = new Map();
 
+function creatorsOf(id) {
+  return tagNames(id).filter(isCreatorTag).map(tagLabel)
+    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+}
+
+// Card title with a leading creator name removed, since the creator is
+// shown on its own line above the thumbnail. Only strips when the name is
+// followed by a separator (or is the whole title), so a creator called
+// "Ann" doesn't eat the start of "Annual ...".
+function titleWithoutCreator(video) {
+  const name = displayName(video.name);
+  const creators = creatorsOf(video.id).sort((a, b) => b.length - a.length);
+  for (const c of creators) {
+    if (!name.toLowerCase().startsWith(c.toLowerCase())) continue;
+    const rest = name.slice(c.length);
+    if (rest && !/^[\s\-\u2013\u2014_:|.,]/.test(rest)) continue;
+    return rest.replace(/^[\s\-\u2013\u2014_:|.,]+/, '') || name;
+  }
+  return name;
+}
+
 function updateCardBadges(video) {
   const b = cardBadges.get(video.id);
   if (!b) return;
+  const creators = creatorsOf(video.id);
+  b.creator.textContent = creators.join(', ');
+  b.caption.textContent = titleWithoutCreator(video);
   b.dur.textContent = video.durationMs ? formatDuration(video.durationMs) : '';
   b.dur.hidden      = !video.durationMs;
   b.watched.hidden  = !isRecentlyWatched(video.id);
   const n = tagNames(video.id).length;
   b.tag.textContent = n ? `🏷 ${n}` : '🏷';
   b.tag.classList.toggle('has-tags', n > 0);
-  b.tag.title = n ? tagNames(video.id).join(', ') : 'Add tags';
+  b.tag.title = n
+    ? tagNames(video.id).sort((x, y) => isCreatorTag(y) - isCreatorTag(x)).map(tagLabel).join(', ')
+    : 'Add creator / tags';
 }
 
 function renderNextBatch() {
@@ -943,9 +1014,11 @@ async function openBrowseView() {
     if (!randomRank.size) reshuffle();
     browseSearch.value = '';
     populateFolderFilter();
-    // Drop remembered tag chips that no longer exist.
+    await migrateCreatorTags();
+    // Drop remembered filters for tags/creators that no longer exist.
     const known = tagCounts();
-    browsePrefs.tags = browsePrefs.tags.filter(t => known.has(t));
+    browsePrefs.creators = (browsePrefs.creators || []).filter(t => known.has(t) && isCreatorTag(t));
+    browsePrefs.tags     = (browsePrefs.tags || []).filter(t => known.has(t) && !isCreatorTag(t));
     syncBrowseControls();
     refreshTagBar();
     refreshBrowse();
@@ -975,7 +1048,7 @@ browseSearch.addEventListener('input', () => {
   }, 150);
 });
 
-// ─── TAG BAR, SELECT MODE, TAG SHEETS ─────────────────────────────────────────
+// ─── FILTER BAR, SELECT MODE, TAG SHEETS ──────────────────────────────────────
 let selectMode = false;
 const selectedIds = new Set();
 
@@ -986,51 +1059,33 @@ function el(tag, props = {}, ...children) {
   return node;
 }
 
+function chipButton(text, className, onclick, title) {
+  return el('button', { type: 'button', className: `tag-chip ${className || ''}`, textContent: text, onclick, title: title || '' });
+}
+
+// Bar under the sort controls: SELECT, a CREATOR and a TAGS filter button
+// (each opens a searchable picker), manage, then the active filters as
+// removable chips so it's clear what's narrowing the grid.
 function refreshTagBar() {
+  const { creators, tags } = browsePrefs;
   browseTagBar.innerHTML = '';
   browseTagBar.append(
-    el('button', {
-      type: 'button',
-      className: 'tag-chip tag-chip-action' + (selectMode ? ' active' : ''),
-      textContent: selectMode ? '✕ CANCEL SELECT' : '☑ SELECT',
-      onclick: () => setSelectMode(!selectMode),
-    }),
-    el('button', {
-      type: 'button',
-      className: 'tag-chip tag-chip-action',
-      textContent: '⚙ TAGS',
-      onclick: openTagManager,
-    })
+    chipButton(selectMode ? '✕ Cancel' : '☑ Select',
+      'tag-chip-action' + (selectMode ? ' active' : ''), () => setSelectMode(!selectMode)),
+    chipButton(creators.length ? `👤 Creator · ${creators.length}` : '👤 Creator ▾',
+      'tag-chip-action' + (creators.length ? ' filtering' : ''), () => openFilterPicker('creator')),
+    chipButton(tags.length ? `🏷 Tags · ${tags.length}` : '🏷 Tags ▾',
+      'tag-chip-action' + (tags.length ? ' filtering' : ''), () => openFilterPicker('tag')),
+    chipButton('⚙', 'tag-chip-action', () => openTagManager(), 'Manage creators and tags')
   );
-  if (browsePrefs.tags.length > 1) {
-    browseTagBar.append(el('button', {
-      type: 'button',
-      className: 'tag-chip tag-chip-action',
-      textContent: browsePrefs.tagMode === 'any' ? 'MATCH ANY' : 'MATCH ALL',
-      title: 'Videos must have all selected tags, or any of them',
-      onclick: () => {
-        browsePrefs.tagMode = browsePrefs.tagMode === 'any' ? 'all' : 'any';
-        saveBrowsePrefs();
-        refreshTagBar();
-        refreshBrowse();
-      },
-    }));
-  }
-  for (const [name, count] of tagCounts()) {
-    const active = browsePrefs.tags.includes(name);
-    browseTagBar.append(el('button', {
-      type: 'button',
-      className: 'tag-chip' + (active ? ' active' : ''),
-      textContent: `${name} ${count}`,
-      onclick: () => {
-        browsePrefs.tags = active
-          ? browsePrefs.tags.filter(t => t !== name)
-          : [...browsePrefs.tags, name];
-        saveBrowsePrefs();
-        refreshTagBar();
-        refreshBrowse();
-      },
-    }));
+  for (const name of [...creators, ...tags]) {
+    browseTagBar.append(chipButton(`${isCreatorTag(name) ? '👤 ' : ''}${tagLabel(name)} ✕`, 'active', () => {
+      browsePrefs.creators = browsePrefs.creators.filter(t => t !== name);
+      browsePrefs.tags     = browsePrefs.tags.filter(t => t !== name);
+      saveBrowsePrefs();
+      refreshTagBar();
+      refreshBrowse();
+    }, 'Remove this filter'));
   }
 }
 
@@ -1082,11 +1137,91 @@ sheetBackdrop.addEventListener('click', e => {
   if (e.target === sheetBackdrop) closeSheet();
 });
 
-// Tag editor for one or many videos. Each tag is in one of three states:
+function searchInput(placeholder, oninput) {
+  const input = el('input', { type: 'search', className: 'sheet-input', placeholder });
+  input.addEventListener('input', oninput);
+  return input;
+}
+
+function matchesQuery(name, query) {
+  return !query || tagLabel(name).toLowerCase().includes(query);
+}
+
+// Searchable multi-select picker for the creator or tag filter. Changes
+// apply on DONE.
+function openFilterPicker(kind) {
+  const isCreator = kind === 'creator';
+  const prefKey   = isCreator ? 'creators' : 'tags';
+  const chosen    = new Set(browsePrefs[prefKey]);
+  const counts    = tagCounts(kind);
+  let query  = '';
+  let byName = isCreator; // creators default to A-Z, tags to most-used
+  let mode   = browsePrefs.tagMode;
+
+  const list = el('div', { className: 'sheet-list picker-list' });
+  const sortBtn = el('button', { type: 'button', className: 'sheet-btn small' });
+  const modeBtn = el('button', { type: 'button', className: 'sheet-btn small' });
+
+  const render = () => {
+    sortBtn.textContent = byName ? 'Sort: A–Z' : 'Sort: Most videos';
+    modeBtn.textContent = mode === 'any' ? 'Match any' : 'Match all';
+    list.innerHTML = '';
+    let names = [...counts.keys()].filter(n => matchesQuery(n, query));
+    if (byName) names.sort((a, b) => tagLabel(a).localeCompare(tagLabel(b), undefined, { numeric: true }));
+    // Keep chosen ones on top so they're easy to untick.
+    names.sort((a, b) => chosen.has(b) - chosen.has(a));
+    if (!names.length) {
+      list.append(el('div', { className: 'sheet-note',
+        textContent: counts.size ? 'No matches.' : `No ${isCreator ? 'creators' : 'tags'} yet.` }));
+    }
+    for (const name of names) {
+      const box = el('input', { type: 'checkbox', checked: chosen.has(name) });
+      box.addEventListener('change', () => {
+        if (box.checked) chosen.add(name); else chosen.delete(name);
+      });
+      list.append(el('label', { className: 'sheet-list-row' },
+        box,
+        el('span', { className: 'sheet-list-name', textContent: tagLabel(name) }),
+        el('span', { className: 'sheet-list-count', textContent: String(counts.get(name)) })));
+    }
+  };
+  sortBtn.onclick = () => { byName = !byName; render(); };
+  modeBtn.onclick = () => { mode = mode === 'any' ? 'all' : 'any'; render(); };
+
+  const done = () => {
+    browsePrefs[prefKey] = [...chosen];
+    if (!isCreator) browsePrefs.tagMode = mode;
+    saveBrowsePrefs();
+    closeSheet();
+    refreshTagBar();
+    refreshBrowse();
+  };
+
+  render();
+  openSheet(
+    el('div', { className: 'sheet-title', textContent: isCreator ? 'Filter by creator' : 'Filter by tag' }),
+    el('div', { className: 'sheet-note', textContent: isCreator
+      ? 'Shows videos by any of the chosen creators.'
+      : 'Match all: videos with every chosen tag. Match any: videos with at least one.' }),
+    searchInput(isCreator ? 'Search creators…' : 'Search tags…', e => { query = e.target.value.trim().toLowerCase(); render(); }),
+    el('div', { className: 'sheet-row' }, sortBtn, isCreator ? null : modeBtn),
+    list,
+    el('div', { className: 'sheet-row sheet-actions' },
+      el('button', { type: 'button', className: 'sheet-btn', textContent: 'Clear', onclick: () => { chosen.clear(); render(); } }),
+      el('button', { type: 'button', className: 'sheet-btn primary', textContent: 'Done', onclick: done }))
+  );
+}
+
+// Tag editor for one or many videos, split into Creator and Tags sections.
+// Each tag is in one of three states:
 //   'all'  - every chosen video has it (or will, once saved)
 //   'none' - no chosen video has it (or will lose it)
 //   'some' - mixed; left exactly as-is on save unless changed
 // Tapping cycles all <-> none (and a mixed tag goes some -> all -> none -> some).
+// With many tags, only the ones already on the video(s) show until you
+// type in the section's box, which then lists matches.
+const EDITOR_SHOW_ALL_MAX = 24;
+
 function openTagEditor(ids) {
   const counts = new Map();
   for (const id of ids) for (const t of tagNames(id)) counts.set(t, (counts.get(t) || 0) + 1);
@@ -1097,44 +1232,61 @@ function openTagEditor(ids) {
   }
   const original = new Map(state);
 
-  const chips = el('div', { className: 'sheet-chips' });
-  const renderChips = () => {
-    chips.innerHTML = '';
-    // Tags already on the video(s) first, then everything else by usage.
-    const order = [...state.keys()].sort((a, b) =>
-      (state.get(a) === 'none') - (state.get(b) === 'none'));
-    for (const name of order) {
-      const st = state.get(name);
-      chips.append(el('button', {
-        type: 'button',
-        className: `tag-chip state-${st}`,
-        textContent: st === 'some' ? `${name} (${counts.get(name)}/${ids.length})` : name,
-        onclick: () => {
-          const next = st === 'all' ? 'none'
-            : st === 'none' ? (original.get(name) === 'some' ? 'some' : 'all')
-            : 'all';
-          state.set(name, next);
-          renderChips();
-        },
-      }));
-    }
-    if (!state.size) chips.append(el('div', { className: 'sheet-note', textContent: 'No tags yet. Type one below.' }));
+  const section = kind => {
+    const isCreator = kind === 'creator';
+    let query = '';
+    const chips = el('div', { className: 'sheet-chips' });
+    const render = () => {
+      chips.innerHTML = '';
+      const names = [...state.keys()].filter(n => tagKind(n) === kind);
+      const showAll = names.length <= EDITOR_SHOW_ALL_MAX;
+      const visible = names.filter(n =>
+        query ? matchesQuery(n, query) : (showAll || state.get(n) !== 'none' || original.get(n) !== 'none'));
+      visible.sort((a, b) => (state.get(a) === 'none') - (state.get(b) === 'none')
+        || tagLabel(a).localeCompare(tagLabel(b), undefined, { numeric: true }));
+      for (const name of visible.slice(0, 60)) {
+        const st = state.get(name);
+        chips.append(chipButton(
+          st === 'some' ? `${tagLabel(name)} (${counts.get(name)}/${ids.length})` : tagLabel(name),
+          `state-${st}`,
+          () => {
+            const next = st === 'all' ? 'none'
+              : st === 'none' ? (original.get(name) === 'some' ? 'some' : 'all')
+              : 'all';
+            state.set(name, next);
+            render();
+          }));
+      }
+      if (!visible.length) {
+        chips.append(el('div', { className: 'sheet-note', textContent: query
+          ? `No match. Press ADD to create "${query}".`
+          : names.length ? 'None yet. Type to search or add.' : `No ${isCreator ? 'creators' : 'tags'} yet. Type one below.` }));
+      }
+    };
+    const input = el('input', {
+      type: 'search',
+      className: 'sheet-input',
+      placeholder: isCreator ? 'Search or add creator…' : 'Search or add tag…',
+      maxLength: TAG_NAME_MAX,
+    });
+    input.addEventListener('input', () => { query = input.value.trim().toLowerCase(); render(); });
+    const add = () => {
+      const name = canonicalTag(input.value, isCreator);
+      if (!name) return;
+      state.set(name, 'all');
+      input.value = '';
+      query = '';
+      render();
+    };
+    input.addEventListener('keydown', e => { if (e.key === 'Enter') add(); });
+    render();
+    return el('div', { className: 'sheet-section' },
+      el('div', { className: 'sheet-section-title', textContent: isCreator ? '👤 Creator' : '🏷 Tags' }),
+      chips,
+      el('div', { className: 'sheet-row' },
+        input,
+        el('button', { type: 'button', className: 'sheet-btn', textContent: 'Add', onclick: add })));
   };
-
-  const input = el('input', {
-    type: 'text',
-    className: 'sheet-input',
-    placeholder: 'New tag…',
-    maxLength: 40,
-  });
-  const addTyped = () => {
-    const name = canonicalTag(input.value);
-    if (!name) return;
-    state.set(name, 'all');
-    input.value = '';
-    renderChips();
-  };
-  input.addEventListener('keydown', e => { if (e.key === 'Enter') addTyped(); });
 
   const save = async () => {
     const updates = {};
@@ -1154,53 +1306,63 @@ function openTagEditor(ids) {
     }
   };
 
-  renderChips();
-  const title = ids.length === 1
-    ? displayName(findVideo(ids[0]).name)
-    : `${ids.length} videos`;
+  const title = ids.length === 1 ? displayName(findVideo(ids[0]).name) : `${ids.length} videos`;
   openSheet(
-    el('div', { className: 'sheet-title', textContent: `Tags · ${title}` }),
-    chips,
-    el('div', { className: 'sheet-row' },
-      input,
-      el('button', { type: 'button', className: 'sheet-btn', textContent: 'ADD', onclick: addTyped })),
+    el('div', { className: 'sheet-title', textContent: title }),
+    section('creator'),
+    section('tag'),
     el('div', { className: 'sheet-row sheet-actions' },
-      el('button', { type: 'button', className: 'sheet-btn', textContent: 'CANCEL', onclick: closeSheet }),
-      el('button', { type: 'button', className: 'sheet-btn primary', textContent: 'SAVE', onclick: save }))
+      el('button', { type: 'button', className: 'sheet-btn', textContent: 'Cancel', onclick: closeSheet }),
+      el('button', { type: 'button', className: 'sheet-btn primary', textContent: 'Save', onclick: save }))
   );
 }
 
-function openTagManager() {
-  const list = el('div', { className: 'sheet-list' });
-  const counts = tagCounts();
-  if (!counts.size) list.append(el('div', { className: 'sheet-note', textContent: 'No tags yet.' }));
+// Manage creators and tags: switch between the two lists, search, rename,
+// move between creator/tag, delete; plus suggestions and backup.
+function openTagManager(kind = 'creator') {
+  let query = '';
+  const list = el('div', { className: 'sheet-list picker-list' });
+  const render = () => {
+    list.innerHTML = '';
+    const counts = tagCounts(kind);
+    const names = [...counts.keys()].filter(n => matchesQuery(n, query))
+      .sort((a, b) => tagLabel(a).localeCompare(tagLabel(b), undefined, { numeric: true }));
+    if (!names.length) list.append(el('div', { className: 'sheet-note', textContent: counts.size ? 'No matches.' : 'None yet.' }));
+    for (const name of names) {
+      list.append(el('div', { className: 'sheet-list-row' },
+        el('span', { className: 'sheet-list-name', textContent: tagLabel(name) }),
+        el('span', { className: 'sheet-list-count', textContent: String(counts.get(name)) }),
+        el('button', { type: 'button', className: 'sheet-btn small', textContent: 'Rename', onclick: () => renameTag(name) }),
+        el('button', { type: 'button', className: 'sheet-btn small',
+          textContent: kind === 'creator' ? '→ Tag' : '→ Creator',
+          title: kind === 'creator' ? 'Make this an ordinary tag' : 'Make this a creator',
+          onclick: () => convertTag(name) }),
+        el('button', { type: 'button', className: 'sheet-btn small danger', textContent: 'Delete', onclick: () => deleteTag(name, counts.get(name)) })));
+    }
+  };
+  const tab = (k, label) => el('button', {
+    type: 'button',
+    className: 'sheet-tab' + (k === kind ? ' active' : ''),
+    textContent: `${label} (${tagCounts(k).size})`,
+    onclick: () => openTagManager(k),
+  });
 
-  for (const [name, count] of counts) {
-    list.append(el('div', { className: 'sheet-list-row' },
-      el('span', { className: 'sheet-list-name', textContent: `${name}` }),
-      el('span', { className: 'sheet-list-count', textContent: String(count) }),
-      el('button', { type: 'button', className: 'sheet-btn small', textContent: 'RENAME', onclick: () => renameTag(name) }),
-      el('button', { type: 'button', className: 'sheet-btn small danger', textContent: 'DELETE', onclick: () => deleteTag(name, count) })));
-  }
-
+  render();
   openSheet(
-    el('div', { className: 'sheet-title', textContent: 'Manage tags' }),
+    el('div', { className: 'sheet-title', textContent: 'Manage creators & tags' }),
+    el('div', { className: 'sheet-row' }, tab('creator', '👤 Creators'), tab('tag', '🏷 Tags')),
+    searchInput('Search…', e => { query = e.target.value.trim().toLowerCase(); render(); }),
     list,
     el('div', { className: 'sheet-row sheet-actions' },
-      el('button', { type: 'button', className: 'sheet-btn', textContent: 'SUGGEST CREATOR TAGS', onclick: openCreatorSuggestions }),
-      el('button', { type: 'button', className: 'sheet-btn', textContent: 'DOWNLOAD BACKUP', onclick: downloadTagBackup })),
-    el('div', { className: 'sheet-row sheet-actions' },
-      el('button', { type: 'button', className: 'sheet-btn', textContent: 'CLOSE', onclick: closeSheet }))
+      el('button', { type: 'button', className: 'sheet-btn', textContent: 'Suggest creators', onclick: openCreatorSuggestions }),
+      el('button', { type: 'button', className: 'sheet-btn', textContent: 'Download backup', onclick: downloadTagBackup }),
+      el('button', { type: 'button', className: 'sheet-btn', textContent: 'Close', onclick: closeSheet }))
   );
 }
 
-async function renameTag(oldName) {
-  const typed = prompt(`Rename tag "${oldName}" to:`, oldName);
-  if (typed == null) return;
-  const newName = typed.replace(/\s+/g, ' ').trim().slice(0, 40);
-  if (!newName || newName === oldName) return;
-  // Renaming onto an existing tag (any case) merges the two.
-  const target = canonicalTag(newName) === oldName ? newName : canonicalTag(newName);
+// Moves every use of oldName to target (merging if target already exists),
+// keeping each video's original source marker, and fixes saved filters.
+async function moveTag(oldName, target) {
   const updates = {};
   for (const [id, tags] of Object.entries(metaTags)) {
     if (!(oldName in tags)) continue;
@@ -1210,15 +1372,38 @@ async function renameTag(oldName) {
     if (!(target in next)) next[target] = src;
     updates[id] = next;
   }
-  browsePrefs.tags = browsePrefs.tags.map(t => (t === oldName ? target : t));
+  const swap = arr => [...new Set(arr.map(t => (t === oldName ? target : t)))];
+  browsePrefs.creators = swap(browsePrefs.creators).filter(isCreatorTag);
+  browsePrefs.tags     = swap(browsePrefs.tags).filter(t => !isCreatorTag(t));
   saveBrowsePrefs();
   await saveTags(updates);
   refreshBrowse();
-  openTagManager();
+}
+
+async function renameTag(oldName) {
+  const creator = isCreatorTag(oldName);
+  const typed = prompt(`Rename ${creator ? 'creator' : 'tag'} "${tagLabel(oldName)}" to:`, tagLabel(oldName));
+  if (typed == null) return;
+  let target = canonicalTag(typed, creator);
+  if (!target) return;
+  if (target === oldName) {
+    // Same name ignoring case: allow a pure capitalization change.
+    const wanted = (creator ? CREATOR_PREFIX : '') + typed.replace(/\s+/g, ' ').trim().slice(0, TAG_NAME_MAX);
+    if (wanted === oldName) return;
+    target = wanted;
+  }
+  await moveTag(oldName, target);
+  openTagManager(tagKind(oldName));
+}
+
+async function convertTag(name) {
+  const toCreator = !isCreatorTag(name);
+  await moveTag(name, canonicalTag(tagLabel(name), toCreator));
+  openTagManager(tagKind(name));
 }
 
 async function deleteTag(name, count) {
-  if (!confirm(`Remove tag "${name}" from ${count} video(s)?`)) return;
+  if (!confirm(`Remove ${isCreatorTag(name) ? 'creator' : 'tag'} "${tagLabel(name)}" from ${count} video(s)?`)) return;
   const updates = {};
   for (const [id, tags] of Object.entries(metaTags)) {
     if (!(name in tags)) continue;
@@ -1226,16 +1411,17 @@ async function deleteTag(name, count) {
     delete next[name];
     updates[id] = next;
   }
-  browsePrefs.tags = browsePrefs.tags.filter(t => t !== name);
+  browsePrefs.creators = browsePrefs.creators.filter(t => t !== name);
+  browsePrefs.tags     = browsePrefs.tags.filter(t => t !== name);
   saveBrowsePrefs();
   await saveTags(updates);
   refreshBrowse();
-  openTagManager();
+  openTagManager(tagKind(name));
 }
 
 // Most filenames start with the creator: "Creator_Title..." or
-// "Creator - Title...". Proposes those as tags for review - nothing is
-// saved until confirmed, and names without that shape are skipped.
+// "Creator - Title...". Proposes those as creator tags for review - nothing
+// is saved until confirmed, and names without that shape are skipped.
 function creatorFromName(name) {
   const m = /^([^_]{2,40}?)(?:_| - )/.exec(name);
   if (!m) return null;
@@ -1245,27 +1431,27 @@ function creatorFromName(name) {
 }
 
 function openCreatorSuggestions() {
-  const groups = new Map(); // creator -> [video ids lacking that tag]
+  const groups = new Map(); // creator tag -> [video ids lacking it]
   for (const v of videoCache || []) {
     const raw = creatorFromName(v.name);
     if (!raw) continue;
-    const creator = canonicalTag(raw);
+    const creator = canonicalTag(raw, true);
     if (creator in tagsOf(v.id)) continue;
     if (!groups.has(creator)) groups.set(creator, []);
     groups.get(creator).push(v.id);
   }
   const sorted = [...groups].sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]));
 
-  const list = el('div', { className: 'sheet-list' });
+  const list = el('div', { className: 'sheet-list picker-list' });
   const boxes = [];
-  if (!sorted.length) list.append(el('div', { className: 'sheet-note', textContent: 'No new creator tags to suggest.' }));
+  if (!sorted.length) list.append(el('div', { className: 'sheet-note', textContent: 'No new creators to suggest.' }));
   for (const [creator, ids] of sorted) {
     // One-off names are more often a misparse than a real creator.
     const box = el('input', { type: 'checkbox', checked: ids.length >= 2 });
     boxes.push([box, creator, ids]);
     list.append(el('label', { className: 'sheet-list-row' },
       box,
-      el('span', { className: 'sheet-list-name', textContent: creator }),
+      el('span', { className: 'sheet-list-name', textContent: tagLabel(creator) }),
       el('span', { className: 'sheet-list-count', textContent: String(ids.length) })));
   }
 
@@ -1285,12 +1471,12 @@ function openCreatorSuggestions() {
   };
 
   openSheet(
-    el('div', { className: 'sheet-title', textContent: 'Suggested creator tags' }),
+    el('div', { className: 'sheet-title', textContent: 'Suggested creators' }),
     el('div', { className: 'sheet-note', textContent: 'From the start of each filename. Untick any that look wrong.' }),
     list,
     el('div', { className: 'sheet-row sheet-actions' },
-      el('button', { type: 'button', className: 'sheet-btn', textContent: 'BACK', onclick: openTagManager }),
-      el('button', { type: 'button', className: 'sheet-btn primary', textContent: 'APPLY', onclick: apply }))
+      el('button', { type: 'button', className: 'sheet-btn', textContent: 'Back', onclick: () => openTagManager('creator') }),
+      el('button', { type: 'button', className: 'sheet-btn primary', textContent: 'Apply', onclick: apply }))
   );
 }
 

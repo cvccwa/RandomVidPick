@@ -9,7 +9,7 @@ const WATCHED_KEY    = 'rvp:watched'; // hash: fileId -> last-watched epoch ms
 const TAGS_KEY       = 'rvp:tags';    // hash: fileId -> JSON {tagName: source}
 const TAG_SOURCES    = new Set(['m', 'f', 'i']); // manual, filename-derived, imported
 const MAX_TAGS       = 50;
-const MAX_TAG_LEN    = 40;
+const MAX_TAG_LEN    = 60;            // 40-char name + 'creator:' prefix, with margin
 const AUTH_TTL_S     = 3000;          // re-verify a user token at most every ~50 min
 const ID_RE          = /^[\w-]{10,100}$/;
 
