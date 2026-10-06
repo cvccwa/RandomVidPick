@@ -349,6 +349,34 @@
     .tag-chip-action { color: var(--muted); letter-spacing: 0.05em; }
     .tag-chip-action.active { background: var(--danger); border-color: var(--danger); color: #fff; }
     .tag-chip-action.filtering { border-color: var(--accent); color: var(--accent); }
+    .tag-chip.excluded { border-color: var(--danger); color: var(--danger); text-decoration: line-through; text-decoration-thickness: 1px; }
+
+    .tri-row {
+      width: 100%;
+      background: transparent;
+      border: none;
+      color: inherit;
+      font: inherit;
+      text-align: left;
+      padding: 0.15rem 0;
+      cursor: pointer;
+    }
+    .tri-box {
+      flex-shrink: 0;
+      width: 1.1rem;
+      height: 1.1rem;
+      border: 1.5px solid var(--muted);
+      border-radius: 4px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 0.75rem;
+      font-weight: 700;
+      line-height: 1;
+    }
+    .tri-row.include .tri-box { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+    .tri-row.exclude .tri-box { background: var(--danger); border-color: var(--danger); color: #fff; }
+    .tri-row.exclude .sheet-list-name { text-decoration: line-through; color: var(--muted); }
 
     .sheet-section {
       display: flex;
@@ -455,6 +483,13 @@
       padding: 0.15rem 0.35rem;
       cursor: pointer;
       -webkit-tap-highlight-color: transparent;
+    }
+    .browse-tagbtn { pointer-events: none; }
+    .browse-tagbtn[hidden] { display: none; }
+    .browse-card {
+      -webkit-touch-callout: none; /* long-press opens the tag editor, not the OS menu */
+      -webkit-user-select: none;
+      user-select: none;
     }
     .browse-tagbtn.has-tags { background: rgba(122, 162, 255, 0.9); color: var(--on-accent); }
 
