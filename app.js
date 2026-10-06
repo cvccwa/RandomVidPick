@@ -7,8 +7,7 @@ const VIDEO_MIME_TYPES = [
   'video/quicktime', 'video/x-msvideo', 'video/mpeg',
   'video/3gpp', 'video/x-flv', 'video/x-ms-wmv'
 ];
-const FILTER_KEYWORDS = /pixel|censor|blur/i;
-const APP_VERSION = 'v25';
+const APP_VERSION = 'v26';
 const BROWSE_BATCH = 50;
 const THUMBNAIL_HOST = 'https://random-vid-pick.vercel.app';
 const META_URL       = `${THUMBNAIL_HOST}/api/meta`;
@@ -44,14 +43,11 @@ let browseSearchDebounce = null;
 // ─── DOM REFS ─────────────────────────────────────────────────────────────────
 const statusBar       = document.getElementById('statusBar');
 const statusText      = document.getElementById('statusText');
-const pickBtn         = document.getElementById('pickBtn');
 const signInBtn       = document.getElementById('signInBtn');
 const signOutBtn      = document.getElementById('signOutBtn');
-const videoInfo       = document.getElementById('videoInfo');
-const videoFilename   = document.getElementById('videoFilename');
-const videoPath       = document.getElementById('videoPath');
-const openVlcBtn       = document.getElementById('openVlcBtn');
-const pickFilteredBtn  = document.getElementById('pickFilteredBtn');
+const nowPlaying      = document.getElementById('nowPlaying');
+const nowPlayingTitle = document.getElementById('nowPlayingTitle');
+const nowPlayingBtn   = document.getElementById('nowPlayingBtn');
 const pickingOverlay   = document.getElementById('pickingOverlay');
 const appVersion       = document.getElementById('appVersion');
 const browseBtn        = document.getElementById('browseBtn');
@@ -83,6 +79,12 @@ function signIn() {
     // sign-ins instead of forcing it every time.
     + `&prompt=select_account`;
   window.location.href = authUrl;
+}
+
+// The library's top-left button sits where BACK used to be, so ask first
+// rather than signing out on a tap from old muscle memory.
+function confirmSignOut() {
+  if (confirm('Sign out?')) signOut();
 }
 
 function signOut() {
@@ -186,21 +188,18 @@ function setStatus(msg, state = '') {
 
 function updateUI(signedIn) {
   if (signedIn) {
-    setStatus('Signed in · Ready to pick', 'ready');
+    setStatus('Signed in', 'ready');
     signInBtn.style.display  = 'none';
     signOutBtn.style.display = '';
-    pickBtn.disabled          = false;
-    pickFilteredBtn.disabled  = false;
-    browseBtn.disabled        = false;
+    browseBtn.style.display  = '';
+    // The library is the app; this page is just the way in.
+    openBrowseView();
   } else {
     setStatus('Not signed in');
     signInBtn.style.display  = '';
     signOutBtn.style.display = 'none';
-    pickBtn.disabled         = true;
-    pickFilteredBtn.disabled = true;
-    browseBtn.disabled       = true;
-    videoInfo.classList.remove('visible');
-    openVlcBtn.style.display = 'none';
+    browseBtn.style.display  = 'none';
+    nowPlaying.hidden = true;
     closeBrowseView();
   }
 }
@@ -500,53 +499,6 @@ function openInVlc() {
     `intent://${host}` +
     `#Intent;scheme=https;package=org.videolan.vlc;type=video%2F*` +
     `;S.title=${title};end`;
-}
-
-// ─── PICK & PLAY ──────────────────────────────────────────────────────────────
-async function pickRandom(filter = null) {
-  pickBtn.disabled         = true;
-  pickFilteredBtn.disabled = true;
-  pickingOverlay.classList.add('visible');
-  if (!videoCache) setStatus('Scanning library...', 'loading');
-
-  try {
-    if (!videoCache) videoCache = await collectVideos(ROOT_FOLDER);
-    let videos = filter ? videoCache.filter(v => filter.test(v.name)) : videoCache;
-
-    if (videos.length === 0) {
-      setStatus(filter ? 'No matching videos found' : 'No videos found in folder', 'error');
-      pickingOverlay.classList.remove('visible');
-      pickBtn.disabled         = false;
-      pickFilteredBtn.disabled = false;
-      return;
-    }
-
-    const picked = videos[Math.floor(Math.random() * videos.length)];
-    lastPicked = picked;
-
-    pickingOverlay.classList.remove('visible');
-
-    videoFilename.textContent = displayName(picked.name);
-    videoPath.textContent     = picked.path || '(root folder)';
-    videoInfo.classList.add('visible');
-    pickBtn.disabled         = false;
-    pickFilteredBtn.disabled = false;
-
-    openVlcBtn.style.display = '';
-    openVlcBtn.disabled = true;
-    setStatus('Warming stream…', 'loading');
-
-    await prewarmStream(picked.id);
-
-    openVlcBtn.disabled = false;
-    setStatus('Picked · tap OPEN IN VLC to play', 'ready');
-
-  } catch (err) {
-    pickingOverlay.classList.remove('visible');
-    setStatus(err.message || 'Something went wrong', 'error');
-    pickBtn.disabled         = false;
-    pickFilteredBtn.disabled = false;
-  }
 }
 
 // ─── BROWSE ───────────────────────────────────────────────────────────────────
@@ -1163,7 +1115,7 @@ async function openBrowseView() {
       setStatus('Scanning library...', 'loading');
       videoCache = await collectVideos(ROOT_FOLDER);
       pickingOverlay.classList.remove('visible');
-      setStatus('Signed in · Ready to pick', 'ready');
+      setStatus('Signed in', 'ready');
     }
     await ensureMeta();
     if (!randomRank.size) reshuffle();
@@ -1761,23 +1713,20 @@ browseRandomBtn.addEventListener('click', () => {
   playVideo(browseFiltered[Math.floor(Math.random() * browseFiltered.length)]);
 });
 
+// Stays in the library: the bar at the bottom shows what was last opened,
+// with a button to send it to VLC again if the first launch didn't take.
 async function playVideo(video) {
   lastPicked = video;
-  closeBrowseView();
-
-  videoFilename.textContent = displayName(video.name);
-  videoPath.textContent     = video.path || '(root folder)';
-  videoInfo.classList.add('visible');
-
-  openVlcBtn.style.display = '';
-  openVlcBtn.disabled = true;
-  setStatus('Warming stream…', 'loading');
+  nowPlayingTitle.textContent = `Warming stream… ${displayName(video.name)}`;
+  nowPlayingBtn.disabled = true;
+  nowPlaying.hidden = false;
 
   await prewarmStream(video.id);
+  if (lastPicked !== video) return; // another video was tapped meanwhile
 
   openInVlc();
-  openVlcBtn.disabled = false;
-  setStatus('Picked · tap OPEN IN VLC to play', 'ready');
+  nowPlayingTitle.textContent = displayName(video.name);
+  nowPlayingBtn.disabled = false;
 }
 
 // ─── INIT ─────────────────────────────────────────────────────────────────────

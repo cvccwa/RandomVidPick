@@ -114,49 +114,7 @@
       50% { opacity: 0.2; }
     }
 
-    /* Video info */
-    .video-info {
-      width: 100%;
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-left: 3px solid var(--accent);
-      border-radius: 4px;
-      padding: 1rem;
-      display: none;
-      flex-direction: column;
-      gap: 0.4rem;
-    }
-
-    .video-info.visible { display: flex; }
-
-    .video-info .label {
-      font-size: 0.6rem;
-      color: var(--muted);
-      letter-spacing: 0.2em;
-      text-transform: uppercase;
-    }
-
-    .video-info .filename {
-      font-size: 0.8rem;
-      color: var(--text);
-      word-break: break-all;
-      line-height: 1.4;
-    }
-
-    .video-info .folder-path {
-      font-size: 0.65rem;
-      color: var(--muted);
-      word-break: break-all;
-    }
-
     /* Buttons */
-    .btn-group {
-      width: 100%;
-      display: flex;
-      flex-direction: column;
-      gap: 0.75rem;
-    }
-
     .btn {
       width: 100%;
       padding: 1rem;
@@ -191,16 +149,6 @@
     }
 
     .btn-secondary:hover:not(:disabled) { border-color: var(--muted); color: var(--text); }
-
-    .btn-filtered {
-      background: transparent;
-      color: var(--accent);
-      border: 2px solid var(--accent);
-      font-family: inherit;
-      font-size: 1.4rem;
-      letter-spacing: 0.1em;
-    }
-    .btn-filtered:hover:not(:disabled) { background: rgba(122,162,255,0.08); }
 
     /* Auth section */
     .auth-section {
@@ -518,6 +466,28 @@
       flex-shrink: 0;
     }
     .select-bar[hidden] { display: none; }
+
+    .now-playing {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      padding: 0.5rem 1rem;
+      border-top: 1px solid var(--border);
+      border-left: 3px solid var(--accent);
+      background: var(--surface);
+      flex-shrink: 0;
+    }
+    .now-playing[hidden] { display: none; }
+    .now-playing-title {
+      flex: 1;
+      min-width: 0;
+      font-size: 0.7rem;
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .now-playing-btn { width: auto; flex-shrink: 0; padding: 0.5rem 0.9rem; }
     .select-count { flex: 1; font-size: 0.7rem; color: var(--text); }
 
     .sheet-backdrop {
@@ -695,29 +665,10 @@
     <span id="statusText">Not signed in</span>
   </div>
 
-  <div class="video-info" id="videoInfo">
-    <div class="label">Last picked</div>
-    <div class="filename" id="videoFilename">&mdash;</div>
-    <div class="folder-path" id="videoPath">&mdash;</div>
-  </div>
-
-  <div class="btn-group">
-    <button class="btn btn-primary" id="pickBtn" disabled onclick="pickRandom()">
-      Pick random video
-    </button>
-    <button class="btn btn-filtered" id="pickFilteredBtn" disabled onclick="pickRandom(FILTER_KEYWORDS)">
-      Pick filtered video
-    </button>
-    <button class="btn btn-secondary" id="openVlcBtn" style="display:none" onclick="openInVlc()">
-      &#9654; Open in VLC
-    </button>
-    <button class="btn btn-secondary" id="browseBtn" disabled onclick="openBrowseView()">
-      Browse library
-    </button>
-  </div>
-
   <div class="auth-section">
-    <button class="btn btn-secondary" id="signInBtn" onclick="signIn()">Sign in with Google</button>
+    <button class="btn btn-primary" id="signInBtn" onclick="signIn()">Sign in with Google</button>
+    <!-- Only seen if the library couldn't load (it opens over this page). -->
+    <button class="btn btn-secondary" id="browseBtn" style="display:none" onclick="openBrowseView()">Open library</button>
     <button class="btn btn-secondary" id="signOutBtn" style="display:none" onclick="signOut()">Sign out</button>
   </div>
 
@@ -733,7 +684,7 @@
 <!-- Browse view -->
 <div class="browse-view" id="browseView">
   <div class="browse-header">
-    <button class="btn btn-secondary browse-back" id="browseBackBtn" onclick="closeBrowseView()">&larr; Back</button>
+    <button class="btn btn-secondary browse-back" id="browseSignOutBtn" onclick="confirmSignOut()">Sign out</button>
     <input type="text" class="browse-search" id="browseSearch" placeholder="Search filename or folder..." />
     <button class="browse-dir browse-random" id="browseRandomBtn" type="button" aria-label="Play a random video from this view" title="Random from this view">🎲</button>
   </div>
@@ -753,6 +704,10 @@
   <div class="browse-count" id="browseCount"></div>
   <div class="browse-grid" id="browseGrid">
     <div class="browse-sentinel" id="browseSentinel"></div>
+  </div>
+  <div class="now-playing" id="nowPlaying" hidden>
+    <span class="now-playing-title" id="nowPlayingTitle"></span>
+    <button class="btn btn-secondary now-playing-btn" id="nowPlayingBtn" type="button" onclick="openInVlc()">&#9654; VLC</button>
   </div>
   <div class="select-bar" id="selectBar" hidden>
     <span class="select-count" id="selectCount">0 selected</span>
