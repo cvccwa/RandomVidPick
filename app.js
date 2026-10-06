@@ -8,7 +8,7 @@ const VIDEO_MIME_TYPES = [
   'video/3gpp', 'video/x-flv', 'video/x-ms-wmv'
 ];
 const FILTER_KEYWORDS = /pixel|censor|blur/i;
-const APP_VERSION = 'v23';
+const APP_VERSION = 'v24';
 const BROWSE_BATCH = 50;
 const THUMBNAIL_HOST = 'https://random-vid-pick.vercel.app';
 const META_URL       = `${THUMBNAIL_HOST}/api/meta`;
@@ -730,15 +730,49 @@ browseFilter.addEventListener('change', () => {
 // card doesn't also play. Right-click does the same on desktop.
 const LONG_PRESS_MS = 500;
 
+// Android sends a tap when the finger lifts after a long-press, aimed at
+// whatever is under it by then - the tag sheet's backdrop, which closes
+// the sheet. So once a long-press fires, swallow taps until the finger
+// is released, then just the one click that release produces (with a
+// short timeout in case none comes), so real taps right after still work.
+const RELEASE_GRACE_MS = 400;
+let swallowTaps = false;
+let swallowTapsUntil = 0;
+
+function swallowTapsUntilRelease() {
+  swallowTaps = true;
+  // Failsafe in case no release event ever arrives.
+  setTimeout(() => { swallowTaps = false; }, 5000);
+}
+
+for (const type of ['pointerup', 'touchend', 'mouseup', 'pointercancel', 'touchcancel']) {
+  document.addEventListener(type, () => {
+    if (!swallowTaps) return;
+    swallowTaps = false;
+    swallowTapsUntil = Date.now() + RELEASE_GRACE_MS;
+  }, true);
+}
+
+document.addEventListener('click', e => {
+  if (swallowTaps || Date.now() < swallowTapsUntil) {
+    e.stopPropagation();
+    e.preventDefault();
+    if (!swallowTaps) swallowTapsUntil = 0; // that was the release click - done
+  }
+}, true);
+
 function attachLongPress(target, onLong) {
   let timer = null;
   let fired = false;
   let startX = 0;
   let startY = 0;
   const cancel = () => { clearTimeout(timer); timer = null; };
-  const fire = () => {
+  // armSwallow: false for a desktop right-click, which produces no stray
+  // release click to swallow.
+  const fire = (armSwallow = true) => {
     cancel();
     fired = true;
+    if (armSwallow) swallowTapsUntilRelease();
     if (navigator.vibrate) navigator.vibrate(15);
     onLong();
   };
@@ -756,7 +790,7 @@ function attachLongPress(target, onLong) {
   for (const type of ['pointerup', 'pointercancel', 'pointerleave']) target.addEventListener(type, cancel);
   target.addEventListener('contextmenu', e => {
     e.preventDefault(); // no browser menu on long-press / right-click
-    if (!fired) fire();
+    if (!fired) fire(e.button !== 2);
   });
   target.addEventListener('click', e => {
     if (!fired) return;
@@ -1254,10 +1288,14 @@ function tagSelected() {
   if (selectedIds.size) openTagEditor([...selectedIds]);
 }
 
+const SHEET_BACKDROP_GRACE_MS = 600;
+let sheetOpenedAt = 0;
+
 function openSheet(...content) {
   sheet.innerHTML = '';
   sheet.append(...content);
   sheetBackdrop.hidden = false;
+  sheetOpenedAt = Date.now();
 }
 
 function closeSheet() {
@@ -1266,7 +1304,9 @@ function closeSheet() {
 }
 
 sheetBackdrop.addEventListener('click', e => {
-  if (e.target === sheetBackdrop) closeSheet();
+  // Ignore a backdrop tap right after opening - it's almost always the
+  // tail of the gesture that opened the sheet, not a deliberate dismiss.
+  if (e.target === sheetBackdrop && Date.now() - sheetOpenedAt > SHEET_BACKDROP_GRACE_MS) closeSheet();
 });
 
 function searchInput(placeholder, oninput) {
