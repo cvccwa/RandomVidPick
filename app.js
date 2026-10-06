@@ -8,7 +8,7 @@ const VIDEO_MIME_TYPES = [
   'video/3gpp', 'video/x-flv', 'video/x-ms-wmv'
 ];
 const FILTER_KEYWORDS = /pixel|censor|blur/i;
-const APP_VERSION = 'v21';
+const APP_VERSION = 'v22';
 const BROWSE_BATCH = 50;
 const THUMBNAIL_HOST = 'https://random-vid-pick.vercel.app';
 const META_URL       = `${THUMBNAIL_HOST}/api/meta`;
@@ -419,7 +419,21 @@ function canonicalTag(raw, creator = false) {
   for (const existing of tagCounts().keys()) {
     if (existing.toLowerCase() === lower) return existing;
   }
+  // Creators also ignore spaces and separators, so "Jane All Day" reuses an
+  // existing "JaneAllDay" instead of becoming a second creator.
+  if (creator) {
+    const key = creatorKey(label);
+    for (const existing of tagCounts('creator').keys()) {
+      if (creatorKey(tagLabel(existing)) === key) return existing;
+    }
+  }
   return full;
+}
+
+// Identity of a creator name for duplicate detection: case, spaces and
+// separators ignored ("Jane All Day" = "JaneAllDay" = "jane_all-day").
+function creatorKey(name) {
+  return name.toLowerCase().replace(/[\s_\-.'\u2019]+/g, '');
 }
 
 // Creator tags from before creators had their own category were saved with
@@ -1494,37 +1508,114 @@ function creatorFromName(name) {
   return creator;
 }
 
+// A filename prefix looks like a title rather than a creator when it only
+// shows up once, or reads like a sentence.
+const CREATOR_MAX_WORDS = 4;
+
+function looksLikeTitle(name, count) {
+  return count < 2 || name.split(' ').length > CREATOR_MAX_WORDS;
+}
+
 function openCreatorSuggestions() {
-  const groups = new Map(); // creator tag -> [video ids lacking it]
+  // Existing creator tags by key, most-used spelling first.
+  const existingByKey = new Map();
+  for (const name of tagCounts('creator').keys()) {
+    const key = creatorKey(tagLabel(name));
+    if (!existingByKey.has(key)) existingByKey.set(key, name);
+  }
+
+  // Group filename prefixes by key so spelling variants become one creator.
+  const groups = new Map(); // key -> { spellings: Map(label -> count), ids: [] }
   for (const v of videoCache || []) {
     const raw = creatorFromName(v.name);
     if (!raw) continue;
-    const creator = canonicalTag(raw, true);
-    if (creator in tagsOf(v.id)) continue;
-    if (!groups.has(creator)) groups.set(creator, []);
-    groups.get(creator).push(v.id);
+    const key = creatorKey(raw);
+    if (!key) continue;
+    const has = tagNames(v.id).some(t => isCreatorTag(t) && creatorKey(tagLabel(t)) === key);
+    if (has) continue;
+    if (!groups.has(key)) groups.set(key, { spellings: new Map(), ids: [] });
+    const g = groups.get(key);
+    g.spellings.set(raw, (g.spellings.get(raw) || 0) + 1);
+    g.ids.push(v.id);
   }
-  const sorted = [...groups].sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]));
 
-  const list = el('div', { className: 'sheet-list picker-list' });
+  const suggestions = [...groups].map(([key, g]) => {
+    const spellings = [...g.spellings].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+    const known = existingByKey.has(key); // already a confirmed creator tag
+    const tag = known ? existingByKey.get(key) : CREATOR_PREFIX + spellings[0][0];
+    return { tag, known, ids: g.ids, variants: spellings.map(([s]) => s).filter(s => s !== tagLabel(tag)) };
+  }).sort((a, b) => b.ids.length - a.ids.length || a.tag.localeCompare(b.tag));
+
+  // A name you've already tagged as a creator is never treated as a title.
+  const isTitle = x => !x.known && looksLikeTitle(tagLabel(x.tag), x.ids.length);
+  const likely = suggestions.filter(x => !isTitle(x));
+  const titles = suggestions.filter(isTitle);
+
   const boxes = [];
-  if (!sorted.length) list.append(el('div', { className: 'sheet-note', textContent: 'No new creators to suggest.' }));
-  for (const [creator, ids] of sorted) {
-    // One-off names are more often a misparse than a real creator.
-    const box = el('input', { type: 'checkbox', checked: ids.length >= 2 });
-    boxes.push([box, creator, ids]);
-    list.append(el('label', { className: 'sheet-list-row' },
+  const row = (x, checked) => {
+    const box = el('input', { type: 'checkbox', checked });
+    boxes.push([box, x]);
+    return el('label', { className: 'sheet-list-row' },
       box,
-      el('span', { className: 'sheet-list-name', textContent: tagLabel(creator) }),
-      el('span', { className: 'sheet-list-count', textContent: String(ids.length) })));
+      el('span', { className: 'sheet-list-name' },
+        tagLabel(x.tag),
+        x.variants.length ? el('span', { className: 'sheet-list-variants', textContent: ` · also: ${x.variants.join(', ')}` }) : null),
+      el('span', { className: 'sheet-list-count', textContent: String(x.ids.length) }));
+  };
+
+  // Creator tags already saved that only differ by case/spaces/separators.
+  const dupGroups = new Map();
+  for (const [name, count] of tagCounts('creator')) {
+    const key = creatorKey(tagLabel(name));
+    if (!dupGroups.has(key)) dupGroups.set(key, []);
+    dupGroups.get(key).push([name, count]);
+  }
+  const dups = [...dupGroups.values()].filter(g => g.length > 1);
+
+  const content = [
+    el('div', { className: 'sheet-title', textContent: 'Suggested creators' }),
+    el('div', { className: 'sheet-note', textContent: 'From the start of each filename. Spellings that differ only by capitals, spaces or separators are combined. Untick any that look wrong.' }),
+  ];
+
+  if (dups.length) {
+    const dupList = el('div', { className: 'sheet-list' });
+    for (const group of dups) {
+      const [keep] = group; // most-used spelling (tagCounts is sorted by count)
+      const others = group.slice(1);
+      dupList.append(el('div', { className: 'sheet-list-row' },
+        el('span', { className: 'sheet-list-name' },
+          tagLabel(keep[0]),
+          el('span', { className: 'sheet-list-variants', textContent: ` ← ${others.map(([n]) => tagLabel(n)).join(', ')}` })),
+        el('button', { type: 'button', className: 'sheet-btn small', textContent: 'Merge', onclick: async () => {
+          for (const [name] of others) await moveTag(name, keep[0]);
+          openCreatorSuggestions();
+        } })));
+    }
+    content.push(
+      el('div', { className: 'sheet-section-title', textContent: `Duplicate creators (${dups.length})` }),
+      dupList);
+  }
+
+  const likelyList = el('div', { className: 'sheet-list picker-list' });
+  if (!likely.length) likelyList.append(el('div', { className: 'sheet-note', textContent: 'No new creators to suggest.' }));
+  for (const x of likely) likelyList.append(row(x, true));
+  content.push(el('div', { className: 'sheet-section-title', textContent: `Likely creators (${likely.length})` }), likelyList);
+
+  if (titles.length) {
+    const titleList = el('div', { className: 'sheet-list picker-list' });
+    for (const x of titles) titleList.append(row(x, false));
+    content.push(el('details', { className: 'sheet-details' },
+      el('summary', { textContent: `Probably titles, not creators (${titles.length})` }),
+      el('div', { className: 'sheet-note', textContent: 'Seen only once or reads like a sentence. Tick any that are real creators.' }),
+      titleList));
   }
 
   const apply = async () => {
     const updates = {};
-    for (const [box, creator, ids] of boxes) {
+    for (const [box, x] of boxes) {
       if (!box.checked) continue;
-      for (const id of ids) {
-        updates[id] = { ...(updates[id] || tagsOf(id)), [creator]: 'f' };
+      for (const id of x.ids) {
+        updates[id] = { ...(updates[id] || tagsOf(id)), [x.tag]: 'f' };
       }
     }
     closeSheet();
@@ -1534,14 +1625,10 @@ function openCreatorSuggestions() {
     }
   };
 
-  openSheet(
-    el('div', { className: 'sheet-title', textContent: 'Suggested creators' }),
-    el('div', { className: 'sheet-note', textContent: 'From the start of each filename. Untick any that look wrong.' }),
-    list,
-    el('div', { className: 'sheet-row sheet-actions' },
-      el('button', { type: 'button', className: 'sheet-btn', textContent: 'Back', onclick: () => openTagManager('creator') }),
-      el('button', { type: 'button', className: 'sheet-btn primary', textContent: 'Apply', onclick: apply }))
-  );
+  content.push(el('div', { className: 'sheet-row sheet-actions' },
+    el('button', { type: 'button', className: 'sheet-btn', textContent: 'Back', onclick: () => openTagManager('creator') }),
+    el('button', { type: 'button', className: 'sheet-btn primary', textContent: 'Apply', onclick: apply })));
+  openSheet(...content);
 }
 
 function downloadTagBackup() {
