@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { getServiceAccountToken, kvCommand } from './_lib/serviceAccount.js';
 import { isAuthorized } from './_lib/auth.js';
-import { FFMPEG, TRANSIENT_RE, driveUrl, authHeader, probeInfo } from './_lib/media.js';
+import { FFMPEG, TRANSIENT_RE, driveUrl, authHeader, probeInfo, driveDiagnosis } from './_lib/media.js';
 import { listLibrary } from './_lib/library.js';
 
 // Highlight analysis for smart compilations. Each video is sampled about
@@ -213,21 +213,6 @@ function scoreSamples(samples) {
   samples.forEach((s, i) => { s.score = useAudio ? (motionRank[i] + loudRank[i]) / 2 : motionRank[i]; });
 }
 
-// ffmpeg only reports "403 Forbidden"; Drive's JSON body says why
-// (userRateLimitExceeded, downloadQuotaExceeded, ...). Asked once per run.
-async function driveRefusalReason(id, token) {
-  try {
-    const res = await fetch(driveUrl(id), { headers: { Authorization: `Bearer ${token}`, Range: 'bytes=0-0' } });
-    if (res.ok) { res.body?.cancel(); return `direct read OK (${res.status})`; }
-    const body = await res.json().catch(() => ({}));
-    const e = body.error || {};
-    const reasons = (e.errors || []).map(x => x.reason).filter(Boolean).join(',');
-    return `HTTP ${res.status} ${reasons || e.status || ''}: ${(e.message || '').slice(0, 160)}`;
-  } catch (err) {
-    return `direct read failed: ${err.message}`;
-  }
-}
-
 async function loadTodo(token) {
   const [raw, listedAt] = await Promise.all([kvCommand(['GET', TODO_KEY]), kvCommand(['GET', LISTED_KEY])]);
   let todo = raw ? JSON.parse(raw) : null;
@@ -278,7 +263,7 @@ async function runBatch() {
           // Not the file's fault: leave it for a later run, and stop early if
           // Drive keeps refusing rather than burning through the list.
           if (++transientStreak >= STOP_AFTER_TRANSIENT && !stopReason) {
-            stopReason = `${err.message} [Drive says: ${await driveRefusalReason(id, token)}]`;
+            stopReason = `${err.message} [Drive says: ${await driveDiagnosis(id, token, { force: true })}]`;
           }
           continue;
         }
@@ -317,7 +302,17 @@ export default async function handler(req) {
   if (!scheduler && !(await isAuthorized(req))) return json({ error: 'unauthorized' }, 401);
 
   if (req.method === 'GET') {
-    return json({ analyzed: Number(await kvCommand(['HLEN', PEAKS_KEY])) || 0 });
+    // Only real results count as ready; stored failures are retried later.
+    const stored = (await kvCommand(['HGETALL', PEAKS_KEY])) || [];
+    let analyzed = 0;
+    let failed = 0;
+    for (let i = 1; i < stored.length; i += 2) {
+      let entry = {};
+      try { entry = JSON.parse(stored[i]); } catch (err) { /* counted as neither */ }
+      if (entry.failed) failed++;
+      else if (entry.v === VERSION) analyzed++;
+    }
+    return json({ analyzed, failed });
   }
   if (req.method !== 'POST') return json({ error: 'method not allowed' }, 405);
 
