@@ -142,6 +142,7 @@ async function createSession(req) {
   const sid = b64url(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))));
   await kvCommand(['SET', `rvp:comp:${sid}`, JSON.stringify(session), 'EX', SESSION_TTL_S]);
   sessions.set(sid, session);
+  if (session.mode === 'smooth' && session.height >= WARM_START_HEIGHT) await warmStart(sid, session);
 
   const base = new URL(req.url);
   const proto = req.headers.get('x-forwarded-proto') || base.protocol.replace(':', '');
@@ -483,6 +484,30 @@ function pruneJobs(sid, n) {
       jobs.delete(key);
     }
   }
+}
+
+// Warm start: for 4K, encode the first clip (with the next ones queued
+// behind it) before handing the compilation to VLC. Otherwise VLC asks for
+// clip 0 the instant it opens and catches the encoder from a standing
+// start, stalling the first few clips. Holding this request open also
+// keeps the CPU at full speed under request-based billing while it runs.
+const WARM_START_HEIGHT    = 2160;
+const WARM_START_TIMEOUT_S = 45;
+
+function warmStart(sid, session) {
+  const first = startJob(sid, session, 0, true);
+  for (let k = 1; k <= ENCODE_AHEAD && k < session.clips.length; k++) startJob(sid, session, k, false);
+  return new Promise(resolve => {
+    const timer = setTimeout(finish, WARM_START_TIMEOUT_S * 1000);
+    function finish() {
+      clearTimeout(timer);
+      first.listeners.delete(check);
+      resolve();
+    }
+    function check() { if (first.done) finish(); }
+    first.listeners.add(check);
+    check();
+  });
 }
 
 function smoothSegment(sid, session, n) {

@@ -7,7 +7,7 @@ const VIDEO_MIME_TYPES = [
   'video/quicktime', 'video/x-msvideo', 'video/mpeg',
   'video/3gpp', 'video/x-flv', 'video/x-ms-wmv'
 ];
-const APP_VERSION = 'v32';
+const APP_VERSION = 'v33';
 const BROWSE_BATCH = 50;
 // Where api/ (stream, thumbnails, tags) is served from.
 const API_BASE = 'https://randomvidpick-139266625585.us-east1.run.app';
@@ -1889,7 +1889,9 @@ browseCompileBtn.addEventListener('click', async () => {
   browseCompileBtn.disabled = true;
   lastPicked = null;
   nowPlayingAction = null;
-  nowPlayingTitle.textContent = `Building compilation from ${browseFiltered.length} videos…`;
+  // 4K compilations wait on the server for their first clip (warm start).
+  const fourK = compilePrefs.mode === 'smooth' && compilePrefs.res === '2160';
+  nowPlayingTitle.textContent = `Building compilation from ${browseFiltered.length} videos…${fourK ? ' (preparing 4K)' : ''}`;
   nowPlayingBtn.disabled = true;
   nowPlaying.hidden = false;
   try {
