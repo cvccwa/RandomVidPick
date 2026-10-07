@@ -7,11 +7,14 @@ const VIDEO_MIME_TYPES = [
   'video/quicktime', 'video/x-msvideo', 'video/mpeg',
   'video/3gpp', 'video/x-flv', 'video/x-ms-wmv'
 ];
-const APP_VERSION = 'v30';
+const APP_VERSION = 'v31';
 const BROWSE_BATCH = 50;
 // Where api/ (stream, thumbnails, tags) is served from.
 const API_BASE = 'https://randomvidpick-139266625585.us-east1.run.app';
 const META_URL = `${API_BASE}/api/meta`;
+// Compilations run on their own Cloud Run service with more CPU (smooth mode
+// re-encodes); the main API stays small so normal playback stays cheap.
+const COMPILE_BASE = 'https://rvp-compile-139266625585.us-east1.run.app';
 const RECENT_MS      = 30 * 24 * 3600 * 1000; // "recently watched" = past month
 
 // Display-only cleanup of filenames (Drive names and search are untouched):
@@ -227,7 +230,7 @@ async function collectVideos(folderId, pathSoFar = '') {
     const mimeQuery = VIDEO_MIME_TYPES.map(m => `mimeType='${m}'`).join(' or ');
     let url = `https://www.googleapis.com/drive/v3/files`
       + `?q=(${mimeQuery}) and '${folderId}' in parents and trashed=false`
-      + `&fields=nextPageToken,files(id,name,createdTime,size,videoMediaMetadata(durationMillis))`
+      + `&fields=nextPageToken,files(id,name,createdTime,size,videoMediaMetadata(durationMillis,width,height))`
       + `&pageSize=1000`;
     if (pageToken) url += `&pageToken=${pageToken}`;
     const data = await driveRequest(url);
@@ -243,6 +246,9 @@ async function collectVideos(folderId, pathSoFar = '') {
           // Drive only knows duration for videos it finished processing;
           // the rest get filled in from KV (loadMeta) or measured in-browser.
           durationMs: driveMs > 0 ? driveMs : null,
+          // Lets smooth compilations pick an output resolution.
+          width:      Number(f.videoMediaMetadata && f.videoMediaMetadata.width) || 0,
+          height:     Number(f.videoMediaMetadata && f.videoMediaMetadata.height) || 0,
         });
       }
     }
@@ -1780,6 +1786,43 @@ browseRandomBtn.addEventListener('click', () => {
 // Compilation: random ~10s clips from everything in the current view, played
 // as one stream in VLC. The server picks, orders and cuts the clips (see
 // api/compile.js); durations help it cut from the middle of each video.
+// Long-press 🎬 to choose how compilations are made; the choice is remembered.
+const COMPILE_MODES = [
+  { id: 'original', label: 'Original', note: 'Untouched quality · brief flash between clips' },
+  { id: 'auto',     label: 'Smooth · Auto', note: 'Seamless · resolution most of the clips have' },
+  { id: '2160',     label: 'Smooth · 4K', note: 'Seamless · most data' },
+  { id: '1440',     label: 'Smooth · 1440p', note: 'Seamless' },
+  { id: '1080',     label: 'Smooth · 1080p', note: 'Seamless · least data' },
+];
+let compileMode = 'auto';
+try {
+  const saved = localStorage.getItem('rvp_compile_mode');
+  if (COMPILE_MODES.some(m => m.id === saved)) compileMode = saved;
+} catch (err) { /* private mode - keep default */ }
+
+function openCompileMenu() {
+  const rows = COMPILE_MODES.map(m => el('div', {
+    className: 'tri-row' + (m.id === compileMode ? ' include' : ''),
+    onclick: () => {
+      compileMode = m.id;
+      try { localStorage.setItem('rvp_compile_mode', m.id); } catch (err) { /* ignore */ }
+      closeSheet();
+    },
+  },
+    el('span', { className: 'tri-box', textContent: m.id === compileMode ? '✓' : '' }),
+    el('span', { className: 'sheet-list-name' }, m.label, el('div', { className: 'sheet-note', textContent: m.note }))));
+  openSheet(
+    el('div', { className: 'sheet-title', textContent: 'Compilation mode' }),
+    el('div', { className: 'sheet-section' }, ...rows),
+    el('div', { className: 'sheet-note', textContent: 'Smooth re-encodes every clip to one format so playback and seeking run straight through. Auto uses 4K or 1440p only when most clips in the view are.' }));
+}
+attachLongPress(browseCompileBtn, openCompileMenu);
+
+function compileModeLabel(mode, height) {
+  if (mode !== 'smooth') return 'Original';
+  return height === 2160 ? 'Smooth 4K' : `Smooth ${height}p`;
+}
+
 browseCompileBtn.addEventListener('click', async () => {
   if (!browseFiltered.length || browseCompileBtn.disabled) return;
   browseCompileBtn.disabled = true;
@@ -1789,14 +1832,17 @@ browseCompileBtn.addEventListener('click', async () => {
   nowPlayingBtn.disabled = true;
   nowPlaying.hidden = false;
   try {
-    const res = await fetch(`${API_BASE}/api/compile`, {
+    const res = await fetch(`${COMPILE_BASE}/api/compile`, {
       method:  'POST',
       headers: metaHeaders({ 'Content-Type': 'application/json' }),
-      body:    JSON.stringify({ clips: browseFiltered.map(v => ({ id: v.id, d: v.durationMs || 0 })) }),
+      body:    JSON.stringify({
+        mode:  compileMode,
+        clips: browseFiltered.map(v => ({ id: v.id, d: v.durationMs || 0, w: v.width || 0, h: v.height || 0 })),
+      }),
     });
     if (!res.ok) throw new Error(`compile ${res.status}`);
-    const { url, clips } = await res.json();
-    const title = `Compilation · ${clips} clips`;
+    const { url, clips, mode, height } = await res.json();
+    const title = `Compilation · ${clips} clips · ${compileModeLabel(mode, height)}`;
     nowPlayingAction = () => launchVlc(url, title);
     nowPlayingAction();
     nowPlayingTitle.textContent = title;
