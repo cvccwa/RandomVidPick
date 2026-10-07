@@ -1,5 +1,6 @@
 import { getServiceAccountToken } from './_lib/serviceAccount.js';
 import { verifyStream } from './_lib/streamSig.js';
+import { countDriveBytes, refusalReason } from './_lib/driveSource.js';
 
 const ALLOWED_ORIGIN = 'https://cvccwa.github.io';
 
@@ -17,12 +18,15 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 // Drive's error JSON names the reason (userRateLimitExceeded, ...).
 async function driveReason(res, method) {
   if (method === 'HEAD') return `HTTP ${res.status}`;
-  try {
-    const e = (await res.json()).error || {};
-    return [(e.errors || []).map(x => x.reason).join(','), e.message].filter(Boolean).join(': ').slice(0, 200) || `HTTP ${res.status}`;
-  } catch (err) {
-    return `HTTP ${res.status}`;
-  }
+  return refusalReason(res.status, await res.text().catch(() => ''));
+}
+
+// A 403 is worth retrying only when it's a rate limit, which clears in
+// seconds; others (downloadQuotaExceeded, no access) won't change, and
+// retrying just delays VLC's error.
+function worthRetrying(status, reason) {
+  if (status !== 403) return RETRYABLE.has(status);
+  return /rateLimitExceeded/i.test(reason);
 }
 
 function buildCappedRange(clientRangeHeader) {
@@ -87,13 +91,14 @@ export default async function handler(req) {
   for (let attempt = 0; ; attempt++) {
     try {
       driveRes = await fetch(driveUrl, { method: req.method, headers: reqHeaders });
+      countDriveBytes('stream', 0, { request: true, refused: !driveRes.ok });
     } catch (err) {
       if (attempt < RETRY_DELAYS_MS.length) { await sleep(RETRY_DELAYS_MS[attempt]); continue; }
       return new Response('upstream fetch failed', { status: 502 });
     }
     if (!RETRYABLE.has(driveRes.status)) break;
     const reason = await driveReason(driveRes, req.method);
-    if (attempt >= RETRY_DELAYS_MS.length) {
+    if (attempt >= RETRY_DELAYS_MS.length || !worthRetrying(driveRes.status, reason)) {
       console.log(`stream ${id.slice(0, 6)}… Drive ${driveRes.status} after ${attempt + 1} tries: ${reason}`);
       return new Response(`drive refused: ${reason}`, {
         status: driveRes.status,
@@ -112,7 +117,11 @@ export default async function handler(req) {
     if (v) resHeaders.set(h, v);
   }
 
-  return new Response(req.method === 'HEAD' ? null : driveRes.body, {
+  // Counted toward the "drive reads" usage log (see driveSource.js).
+  const body = req.method === 'HEAD' || !driveRes.body ? null : driveRes.body.pipeThrough(new TransformStream({
+    transform(chunk, ctrl) { countDriveBytes('stream', chunk.byteLength); ctrl.enqueue(chunk); },
+  }));
+  return new Response(body, {
     status:  driveRes.status,
     headers: resHeaders,
   });
