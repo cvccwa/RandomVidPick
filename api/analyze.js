@@ -1,7 +1,8 @@
 import { spawn } from 'node:child_process';
 import { getServiceAccountToken, kvCommand } from './_lib/serviceAccount.js';
 import { isAuthorized } from './_lib/auth.js';
-import { FFMPEG, TRANSIENT_RE, driveUrl, authHeader, probeInfo, driveDiagnosis } from './_lib/media.js';
+import { FFMPEG, TRANSIENT_RE, probeInfo, driveDiagnosis } from './_lib/media.js';
+import { sourceUrl, driveBytesRead } from './_lib/driveSource.js';
 import { listLibrary } from './_lib/library.js';
 
 // Highlight analysis for smart compilations. Each video is sampled about
@@ -18,9 +19,10 @@ import { listLibrary } from './_lib/library.js';
 //   GET  /api/analyze   how many videos have been analysed (owner)
 //
 // Work left is kept in KV, so each run picks up where the last stopped.
-// Run time is capped per UTC day (ANALYZE_DAILY_MINUTES, default 30) so
-// the backlog spreads over several days instead of eating the month's
-// free CPU at once.
+// Run time is capped per UTC day (ANALYZE_DAILY_MINUTES, default 30), as
+// is what it reads from Drive (ANALYZE_DAILY_GB, default 10), so the
+// backlog spreads over several days instead of eating the month's free CPU
+// or Drive's daily download allowance at once.
 // The library is re-listed from Drive at most hourly to catch new uploads,
 // so a run with nothing to do ends in milliseconds.
 
@@ -44,6 +46,13 @@ const HARD_STOP_S    = 150;  // a video still running at this point is dropped a
 const START_MARGIN_S = 20;   // don't start a video this close to the deadline
 const DAILY_MINUTES  = Number(process.env.ANALYZE_DAILY_MINUTES) || 30;
 const DAY_KEY        = 'rvp:analyze:day:';
+// Drive limits how much can be downloaded from the owner's files per day,
+// and hitting that limit blocks normal playback too. Each sample reads from
+// the nearest keyframe before it, so a video costs a sizeable share of its
+// file (about half of a 1 GB test video). Analysis stops for the day once
+// it has read this much.
+const DAILY_GB       = Number(process.env.ANALYZE_DAILY_GB) || 10;
+const BYTES_KEY      = 'rvp:analyze:bytes:';
 // Kept gentle: bursts of reads get the service account rate-limited by
 // Drive. 2 x 2 = at most 4 reads in flight (was 24), with a pause after
 // each and a longer one whenever Drive refuses.
@@ -84,9 +93,8 @@ function measure(id, t, token, hasAudio) {
     const graph = hasAudio ? `${video};[0:a:0]volumedetect[a]` : video;
     const ff = spawn(FFMPEG, [
       '-hide_banner', '-nostats', '-loglevel', 'info',
-      ...authHeader(token),
       '-ss', t.toFixed(2), '-t', String(WINDOW_S),
-      '-i', driveUrl(id),
+      '-i', sourceUrl(id, 'analyze'),
       '-filter_complex', graph,
       '-map', '[v]', ...(hasAudio ? ['-map', '[a]'] : []),
       '-f', 'null', '-',
@@ -144,7 +152,7 @@ class OutOfTime extends Error {}
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 export async function analyzeVideo(id, durationMs, token, stopAt = Infinity) {
-  const info = await probeInfo(id, token);
+  const info = await probeInfo(id, token, 'analyze');
   const d = durationMs > 0 ? durationMs / 1000 : info.duration;
   if (!(d >= MIN_DURATION_S)) return { v: VERSION, d: Math.round(d || 0), peaks: [] };
 
@@ -237,9 +245,17 @@ async function loadTodo(token) {
 async function runBatch() {
   const started = Date.now();
   const dayKey = DAY_KEY + new Date(started).toISOString().slice(0, 10);
-  const usedS = Number(await kvCommand(['GET', dayKey])) || 0;
+  const day = new Date(started).toISOString().slice(0, 10);
+  const bytesKey = BYTES_KEY + day;
+  const [usedRaw, usedBytesRaw] = await Promise.all([kvCommand(['GET', dayKey]), kvCommand(['GET', bytesKey])]);
+  const usedS = Number(usedRaw) || 0;
+  const usedBytes = Number(usedBytesRaw) || 0;
+  const budgetBytes = DAILY_GB * 1e9 - usedBytes;
+  if (budgetBytes <= 0) return { analyzed: 0, capped: `${DAILY_GB} GB read from Drive` };
   const budgetS = Math.min(RUN_BUDGET_S, DAILY_MINUTES * 60 - usedS);
-  if (budgetS < START_MARGIN_S + 10) return { analyzed: 0, capped: true, usedMinutes: Math.round(usedS / 60) };
+  if (budgetS < START_MARGIN_S + 10) return { analyzed: 0, capped: `${DAILY_MINUTES} min` };
+  const startBytes = driveBytesRead('analyze');
+  const runBytes = () => driveBytesRead('analyze') - startBytes;
   const deadline = started + budgetS * 1000;
   const token = await getServiceAccountToken();
   const todo = await loadTodo(token);
@@ -251,7 +267,8 @@ async function runBatch() {
   let stopReason = null;
   let next = 0;
   async function worker() {
-    while (!stopReason && next < todo.length && Date.now() < deadline - START_MARGIN_S * 1000) {
+    while (!stopReason && next < todo.length && Date.now() < deadline - START_MARGIN_S * 1000
+      && runBytes() < budgetBytes) {
       const [id, durationMs] = todo[next++];
       const videoStart = Date.now();
       let result;
@@ -280,15 +297,19 @@ async function runBatch() {
 
   const remaining = todo.filter(([id]) => !finished.has(id));
   const ranS = Math.ceil((Date.now() - started) / 1000);
+  const readBytes = runBytes();
   await Promise.all([
     kvCommand(['SET', TODO_KEY, JSON.stringify(remaining)]),
     kvCommand(['INCRBY', dayKey, String(ranS)]).then(() => kvCommand(['EXPIRE', dayKey, String(2 * 86400)])),
+    kvCommand(['INCRBY', bytesKey, String(readBytes)]).then(() => kvCommand(['EXPIRE', bytesKey, String(2 * 86400)])),
   ]);
   return {
     analyzed: finished.size,
     remaining: remaining.length,
     ranSeconds: ranS,
     secondsPerVideo: finished.size ? Math.round(videoSeconds / finished.size) : null,
+    readMB: Math.round(readBytes / 1e6),
+    dayReadGB: Math.round((usedBytes + readBytes) / 1e8) / 10,
     stopReason,
   };
 }
@@ -322,9 +343,10 @@ export default async function handler(req) {
   try {
     const result = await runBatch();
     console.log(result.capped
-      ? `analyze run: daily cap reached (${DAILY_MINUTES} min)`
+      ? `analyze run: daily cap reached (${result.capped})`
       : `analyze run: ${result.analyzed} analysed in ${result.ranSeconds} s `
-        + `(~${result.secondsPerVideo} s per video, ${PARALLEL} at once), ${result.remaining} left`
+        + `(~${result.secondsPerVideo} s per video, ${PARALLEL} at once), ${result.remaining} left; `
+        + `read ${result.readMB} MB from Drive (${result.dayReadGB} of ${DAILY_GB} GB today)`
         + (result.stopReason ? `; stopped early, Drive refusing: ${result.stopReason}` : ''));
     return json(result);
   } finally {

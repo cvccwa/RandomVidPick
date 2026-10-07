@@ -1,5 +1,6 @@
 import { getServiceAccountToken } from './_lib/serviceAccount.js';
 import { verifyStream } from './_lib/streamSig.js';
+import { countDriveBytes } from './_lib/driveSource.js';
 
 const ALLOWED_ORIGIN = 'https://cvccwa.github.io';
 
@@ -87,6 +88,7 @@ export default async function handler(req) {
   for (let attempt = 0; ; attempt++) {
     try {
       driveRes = await fetch(driveUrl, { method: req.method, headers: reqHeaders });
+      countDriveBytes('stream', 0, { request: true, refused: !driveRes.ok });
     } catch (err) {
       if (attempt < RETRY_DELAYS_MS.length) { await sleep(RETRY_DELAYS_MS[attempt]); continue; }
       return new Response('upstream fetch failed', { status: 502 });
@@ -112,7 +114,11 @@ export default async function handler(req) {
     if (v) resHeaders.set(h, v);
   }
 
-  return new Response(req.method === 'HEAD' ? null : driveRes.body, {
+  // Counted toward the "drive reads" usage log (see driveSource.js).
+  const body = req.method === 'HEAD' || !driveRes.body ? null : driveRes.body.pipeThrough(new TransformStream({
+    transform(chunk, ctrl) { countDriveBytes('stream', chunk.byteLength); ctrl.enqueue(chunk); },
+  }));
+  return new Response(body, {
     status:  driveRes.status,
     headers: resHeaders,
   });

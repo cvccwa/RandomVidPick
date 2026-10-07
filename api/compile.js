@@ -1,7 +1,8 @@
 import { spawn } from 'node:child_process';
 import { getServiceAccountToken, kvCommand, b64url } from './_lib/serviceAccount.js';
 import { isAuthorized, ID_RE } from './_lib/auth.js';
-import { FFMPEG, driveUrl, probeInfo, logDriveDiagnosis } from './_lib/media.js';
+import { FFMPEG, probeInfo, logDriveDiagnosis } from './_lib/media.js';
+import { sourceUrl } from './_lib/driveSource.js';
 
 // Compilation mode: random ~10s clips from many videos, played back to back
 // in VLC as one HLS stream.
@@ -276,9 +277,8 @@ function cutClip(clip, len, token, signal, dumpExtra) {
   return new Promise((resolve, reject) => {
     const ff = spawn(FFMPEG, [
       '-hide_banner', '-nostats', '-loglevel', 'info',
-      '-headers', `Authorization: Bearer ${token}\r\n`,
       '-ss', String(clip.s),
-      '-i', driveUrl(clip.id),
+      '-i', sourceUrl(clip.id, 'compile'),
       '-t', String(len),
       '-map', '0:v:0', '-map', '0:a:0?',
       '-c', 'copy',
@@ -390,9 +390,8 @@ function smoothArgs(source, n, session, token, hasAudio) {
   const audio = `[${hasAudio ? '0:a:0' : '1:a'}]aresample=48000,aformat=channel_layouts=stereo,apad[a]`;
   return [
     '-hide_banner', '-nostats', '-loglevel', 'error',
-    '-headers', `Authorization: Bearer ${token}\r\n`,
     '-ss', String(source.s),
-    '-i', driveUrl(source.id),
+    '-i', sourceUrl(source.id, 'compile'),
     ...(hasAudio ? [] : ['-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo']),
     '-filter_complex', `${video};${audio}`,
     '-map', '[v]', '-map', '[a]',
