@@ -4,9 +4,11 @@ import { isAuthorized } from './_lib/auth.js';
 import { FFMPEG, driveUrl, authHeader, probeInfo } from './_lib/media.js';
 import { listLibrary } from './_lib/library.js';
 
-// Highlight analysis for smart compilations. Each video is sampled at
-// SAMPLES points; at each, WINDOW_S seconds are measured for motion (how
-// much the picture changes frame to frame) and loudness. The strongest few
+// Highlight analysis for smart compilations. Each video is sampled about
+// once a minute (MIN_SAMPLES..MAX_SAMPLES points); at each, WINDOW_S
+// seconds are measured for motion (how much the picture changes frame to
+// frame) and loudness. A second pass then samples around the best few
+// spots to land on the actual peak within those scenes. The strongest few
 // moments are kept in KV (PEAKS_KEY: fileId -> JSON) for /api/compile to
 // cut around.
 //
@@ -16,6 +18,9 @@ import { listLibrary } from './_lib/library.js';
 //   GET  /api/analyze   how many videos have been analysed (owner)
 //
 // Work left is kept in KV, so each run picks up where the last stopped.
+// Run time is capped per UTC day (ANALYZE_DAILY_MINUTES, default 30) so
+// the backlog spreads over several days instead of eating the month's
+// free CPU at once.
 // The library is re-listed from Drive at most hourly to catch new uploads,
 // so a run with nothing to do ends in milliseconds.
 
@@ -25,12 +30,18 @@ const TODO_KEY       = 'rvp:analyze:todo';
 const LISTED_KEY     = 'rvp:analyze:listedAt';
 const LOCK_KEY       = 'rvp:analyze:lock';
 const VERSION        = 1;
-const SAMPLES        = 16;
+const MIN_SAMPLES    = 16;
+const MAX_SAMPLES    = 48;
+const SAMPLE_EVERY_S = 60;
+const REFINE_TOP     = 3;                 // spots refined in the second pass
+const REFINE_OFFSETS = [-1 / 3, 1 / 3, 2 / 3]; // x coarse spacing; forward-leaning, as clips run forward
 const WINDOW_S       = 2;
 const KEEP_PEAKS     = 5;
 const MIN_DURATION_S = 30;   // shorter videos just get random cuts
 const RUN_BUDGET_S   = 150;  // under Cloud Scheduler's default 180 s attempt deadline
-const START_MARGIN_S = 25;   // don't start a video this close to the deadline
+const START_MARGIN_S = 50;   // don't start a video this close to the deadline (long ones take ~40 s)
+const DAILY_MINUTES  = Number(process.env.ANALYZE_DAILY_MINUTES) || 30;
+const DAY_KEY        = 'rvp:analyze:day:';
 const PARALLEL       = 6;    // videos at once; each runs one ffmpeg at a time
 const RELIST_MS      = 3600e3;
 const RETRY_FAILED_MS = 7 * 86400e3; // a failure may have been a passing Drive error
@@ -113,20 +124,31 @@ export async function analyzeVideo(id, durationMs, token) {
   const d = durationMs > 0 ? durationMs / 1000 : info.duration;
   if (!(d >= MIN_DURATION_S)) return { v: VERSION, d: Math.round(d || 0), peaks: [] };
 
+  const lo = d * 0.08;
   const span = d * 0.84 - WINDOW_S;
+  const count = Math.min(MAX_SAMPLES, Math.max(MIN_SAMPLES, Math.round(d / SAMPLE_EVERY_S)));
+  const step = span / count;
   const samples = [];
-  for (let i = 0; i < SAMPLES; i++) {
-    const t = d * 0.08 + span * (i + 0.5) / SAMPLES;
+  const sampleAt = async t => {
     try {
       samples.push({ t, ...(await measure(id, t, token, info.hasAudio)) });
     } catch (err) { /* unreadable spot - skip it */ }
-  }
-  if (!samples.length) throw new Error('no samples measured');
+  };
 
-  const motionRank = ranks(samples.map(s => s.motion));
-  const useAudio = samples.every(s => s.loud !== null);
-  const loudRank = useAudio ? ranks(samples.map(s => s.loud)) : null;
-  samples.forEach((s, i) => { s.score = useAudio ? (motionRank[i] + loudRank[i]) / 2 : motionRank[i]; });
+  // Pass 1: evenly across the middle of the video.
+  for (let i = 0; i < count; i++) await sampleAt(lo + step * (i + 0.5));
+  if (!samples.length) throw new Error('no samples measured');
+  scoreSamples(samples);
+
+  // Pass 2: around the best few spots, to find the peak inside each scene.
+  const best = [...samples].sort((a, b) => b.score - a.score).slice(0, REFINE_TOP);
+  for (const s of best) {
+    for (const k of REFINE_OFFSETS) {
+      const t = s.t + k * step;
+      if (t >= lo && t <= lo + span) await sampleAt(t);
+    }
+  }
+  scoreSamples(samples);
 
   // Best first, spaced apart so the peaks aren't all one scene.
   const gap = Math.max(15, d / 30);
@@ -136,6 +158,14 @@ export async function analyzeVideo(id, durationMs, token) {
     if (peaks.every(p => Math.abs(p[0] - s.t) >= gap)) peaks.push([Math.round(s.t * 10) / 10, Math.round(s.score * 1000) / 1000]);
   }
   return { v: VERSION, d: Math.round(d), peaks };
+}
+
+// Scores every sample 0..1 against the others in the same video.
+function scoreSamples(samples) {
+  const motionRank = ranks(samples.map(s => s.motion));
+  const useAudio = samples.every(s => s.loud !== null);
+  const loudRank = useAudio ? ranks(samples.map(s => s.loud)) : null;
+  samples.forEach((s, i) => { s.score = useAudio ? (motionRank[i] + loudRank[i]) / 2 : motionRank[i]; });
 }
 
 async function loadTodo(token) {
@@ -158,7 +188,12 @@ async function loadTodo(token) {
 }
 
 async function runBatch() {
-  const deadline = Date.now() + RUN_BUDGET_S * 1000;
+  const started = Date.now();
+  const dayKey = DAY_KEY + new Date(started).toISOString().slice(0, 10);
+  const usedS = Number(await kvCommand(['GET', dayKey])) || 0;
+  const budgetS = Math.min(RUN_BUDGET_S, DAILY_MINUTES * 60 - usedS);
+  if (budgetS < START_MARGIN_S + 10) return { analyzed: 0, capped: true, usedMinutes: Math.round(usedS / 60) };
+  const deadline = started + budgetS * 1000;
   const token = await getServiceAccountToken();
   const todo = await loadTodo(token);
   if (!todo.length) return { analyzed: 0, remaining: 0 };
@@ -182,8 +217,12 @@ async function runBatch() {
   await Promise.all(Array.from({ length: PARALLEL }, worker));
 
   const remaining = todo.filter(([id]) => !finished.has(id));
-  await kvCommand(['SET', TODO_KEY, JSON.stringify(remaining)]);
-  return { analyzed: finished.size, remaining: remaining.length };
+  const ranS = Math.ceil((Date.now() - started) / 1000);
+  await Promise.all([
+    kvCommand(['SET', TODO_KEY, JSON.stringify(remaining)]),
+    kvCommand(['INCRBY', dayKey, String(ranS)]).then(() => kvCommand(['EXPIRE', dayKey, String(2 * 86400)])),
+  ]);
+  return { analyzed: finished.size, remaining: remaining.length, ranSeconds: ranS };
 }
 
 export default async function handler(req) {
@@ -204,7 +243,9 @@ export default async function handler(req) {
   if (!locked) return json({ busy: true });
   try {
     const result = await runBatch();
-    console.log(`analyze run: ${result.analyzed} analysed, ${result.remaining} left`);
+    console.log(result.capped
+      ? `analyze run: daily cap reached (${DAILY_MINUTES} min)`
+      : `analyze run: ${result.analyzed} analysed, ${result.remaining} left`);
     return json(result);
   } finally {
     await kvCommand(['DEL', LOCK_KEY]).catch(() => {});
