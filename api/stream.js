@@ -1,4 +1,5 @@
 import { getServiceAccountToken } from './_lib/serviceAccount.js';
+import { verifyStream } from './_lib/streamSig.js';
 
 export const config = { runtime: 'edge' };
 
@@ -34,6 +35,16 @@ export default async function handler(req) {
   const { searchParams } = new URL(req.url);
   const id = searchParams.get('id');
   if (!id) return new Response('missing id', { status: 400 });
+
+  // Links come from /api/sign and expire; a bare or copied-and-stale id
+  // gets nothing.
+  let valid;
+  try {
+    valid = await verifyStream(id, searchParams.get('exp'), searchParams.get('sig'));
+  } catch (err) {
+    return new Response('signing unavailable', { status: 503 });
+  }
+  if (!valid) return new Response('link expired or invalid', { status: 403 });
 
   let token;
   try {

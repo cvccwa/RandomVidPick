@@ -1,17 +1,15 @@
 import { kvCommand } from './_lib/serviceAccount.js';
+import { isAuthorized, ID_RE } from './_lib/auth.js';
 
 export const config = { runtime: 'edge' };
 
 const ALLOWED_ORIGIN = 'https://cvccwa.github.io';
-const ROOT_FOLDER    = '1JBAz8KFVSHfnzojWnhECD7gtBRkLBCk9';
 const DUR_KEY        = 'rvp:dur';     // hash: fileId -> duration ms
 const WATCHED_KEY    = 'rvp:watched'; // hash: fileId -> last-watched epoch ms
 const TAGS_KEY       = 'rvp:tags';    // hash: fileId -> JSON {tagName: source}
 const TAG_SOURCES    = new Set(['m', 'f', 'i']); // manual, filename-derived, imported
 const MAX_TAGS       = 50;
 const MAX_TAG_LEN    = 60;            // 40-char name + 'creator:' prefix, with margin
-const AUTH_TTL_S     = 3000;          // re-verify a user token at most every ~50 min
-const ID_RE          = /^[\w-]{10,100}$/;
 
 const KV_CONFIGURED = Boolean(
   (process.env.KV_REST_API_URL   || process.env.UPSTASH_REDIS_REST_URL) &&
@@ -30,34 +28,6 @@ function json(body, status = 200) {
     status,
     headers: { ...CORS, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
   });
-}
-
-async function sha256Hex(str) {
-  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
-  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
-}
-
-// The watched list holds Drive file IDs, and /api/stream will stream any ID
-// it's handed - so this endpoint must not answer anonymous callers. A caller
-// is authorized if their own Google token can read the library folder. The
-// result is cached in KV by token hash so it's one Drive call per token, not
-// per request.
-async function isAuthorized(req) {
-  const m = /^Bearer (.+)$/.exec(req.headers.get('authorization') || '');
-  if (!m) return false;
-  const cacheKey = `rvp:auth:${await sha256Hex(m[1])}`;
-
-  try {
-    if (await kvCommand(['GET', cacheKey])) return true;
-  } catch (err) { /* fall through to a live check */ }
-
-  const res = await fetch(
-    `https://www.googleapis.com/drive/v3/files/${ROOT_FOLDER}?fields=id`,
-    { headers: { Authorization: `Bearer ${m[1]}` } }
-  );
-  if (!res.ok) return false;
-  kvCommand(['SET', cacheKey, '1', 'EX', AUTH_TTL_S]).catch(() => {});
-  return true;
 }
 
 // Returns a cleaned {tag: source} map, or null if anything is malformed.
