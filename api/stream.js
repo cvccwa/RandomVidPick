@@ -10,6 +10,21 @@ const ALLOWED_ORIGIN = 'https://cvccwa.github.io';
 // next chunk. Tunable via env var without a code change.
 const CHUNK_SIZE = parseInt(process.env.STREAM_CHUNK_BYTES) || 8 * 1024 * 1024;
 
+const RETRYABLE       = new Set([403, 429, 500, 502, 503, 504]);
+const RETRY_DELAYS_MS = [400, 1200, 2500];
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+// Drive's error JSON names the reason (userRateLimitExceeded, ...).
+async function driveReason(res, method) {
+  if (method === 'HEAD') return `HTTP ${res.status}`;
+  try {
+    const e = (await res.json()).error || {};
+    return [(e.errors || []).map(x => x.reason).join(','), e.message].filter(Boolean).join(': ').slice(0, 200) || `HTTP ${res.status}`;
+  } catch (err) {
+    return `HTTP ${res.status}`;
+  }
+}
+
 function buildCappedRange(clientRangeHeader) {
   if (!clientRangeHeader) return `bytes=0-${CHUNK_SIZE - 1}`;
   const match = /^bytes=(\d+)-(\d*)$/.exec(clientRangeHeader.trim());
@@ -64,11 +79,28 @@ export default async function handler(req) {
     reqHeaders['Range'] = buildCappedRange(req.headers.get('range'));
   }
 
+  // Drive sometimes refuses a request it would serve a moment later (403
+  // rate limiting, 429, 5xx) - most noticeably when the service account has
+  // been busy. Retry briefly rather than handing VLC an error mid-video, and
+  // log Drive's reason when it still refuses.
   let driveRes;
-  try {
-    driveRes = await fetch(driveUrl, { method: req.method, headers: reqHeaders });
-  } catch (err) {
-    return new Response('upstream fetch failed', { status: 502 });
+  for (let attempt = 0; ; attempt++) {
+    try {
+      driveRes = await fetch(driveUrl, { method: req.method, headers: reqHeaders });
+    } catch (err) {
+      if (attempt < RETRY_DELAYS_MS.length) { await sleep(RETRY_DELAYS_MS[attempt]); continue; }
+      return new Response('upstream fetch failed', { status: 502 });
+    }
+    if (!RETRYABLE.has(driveRes.status)) break;
+    const reason = await driveReason(driveRes, req.method);
+    if (attempt >= RETRY_DELAYS_MS.length) {
+      console.log(`stream ${id.slice(0, 6)}… Drive ${driveRes.status} after ${attempt + 1} tries: ${reason}`);
+      return new Response(`drive refused: ${reason}`, {
+        status: driveRes.status,
+        headers: { 'Access-Control-Allow-Origin': ALLOWED_ORIGIN },
+      });
+    }
+    await sleep(RETRY_DELAYS_MS[attempt]);
   }
 
   const resHeaders = new Headers({
