@@ -1932,7 +1932,10 @@ const COMPILE_FPS = [['auto', 'Auto'], ['60', '60 fps'], ['30', '30 fps']];
 // Highlights cuts around each video's loudest / most active moments
 // (analysed in the background by api/analyze.js); Random picks anywhere.
 const COMPILE_PICK = [['highlights', 'Highlights'], ['random', 'Random']];
-let compilePrefs = { mode: 'smooth', res: 'auto', fps: 'auto', pick: 'highlights' };
+// Auto: with highlights, each clip lasts about as long as the action it was
+// cut from (6-20 s); otherwise 10 s.
+const COMPILE_LEN  = [['auto', 'Auto'], ['5', '5 s'], ['10', '10 s'], ['15', '15 s'], ['20', '20 s']];
+let compilePrefs = { mode: 'smooth', res: 'auto', fps: 'auto', pick: 'highlights', len: 'auto' };
 try {
   const saved = localStorage.getItem('rvp_compile_mode');
   if (saved && saved.startsWith('{')) {
@@ -1942,6 +1945,7 @@ try {
       res:  COMPILE_RES.some(r => r[0] === p.res) ? p.res : 'auto',
       fps:  COMPILE_FPS.some(f => f[0] === p.fps) ? p.fps : 'auto',
       pick: COMPILE_PICK.some(k => k[0] === p.pick) ? p.pick : 'highlights',
+      len:  COMPILE_LEN.some(k => k[0] === p.len) ? p.len : 'auto',
     };
   } else if (saved === 'original') {
     compilePrefs.mode = 'original';
@@ -1980,6 +1984,8 @@ function openCompileMenu() {
     smooth ? el('div', { className: 'sheet-note', textContent: 'Auto picks what most clips in the view are. Auto frame rate stays at 30 for 4K; 4K at 60 fps will likely stall.' }) : null,
     choiceRow('Clip picks', COMPILE_PICK, 'pick'),
     highlightNote,
+    choiceRow('Clip length', COMPILE_LEN, 'len'),
+    el('div', { className: 'sheet-note', textContent: 'Auto follows the action: short bursts get short clips, sustained scenes up to 20 s (needs Highlights; otherwise 10 s).' }),
     el('div', { className: 'sheet-row sheet-actions' },
       el('button', { type: 'button', className: 'sheet-btn primary', textContent: 'Done', onclick: closeSheet })));
 }
@@ -2028,6 +2034,7 @@ browseCompileBtn.addEventListener('click', async () => {
         res:   compilePrefs.res,
         fps:   compilePrefs.fps,
         pick:  compilePrefs.pick,
+        len:   compilePrefs.len,
         clips: browseFiltered.map(v => ({ id: v.id, d: v.durationMs || 0, w: v.width || 0, h: v.height || 0 })),
       }),
     });

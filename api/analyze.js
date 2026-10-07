@@ -35,6 +35,7 @@ const MAX_SAMPLES    = 48;
 const SAMPLE_EVERY_S = 60;
 const REFINE_TOP     = 3;                 // spots refined in the second pass
 const REFINE_OFFSETS = [-1 / 3, 1 / 3, 2 / 3]; // x coarse spacing; forward-leaning, as clips run forward
+const EXTENT_DROP    = 0.15;              // neighbours within this of a peak's score count as the same busy stretch
 const WINDOW_S       = 2;
 const KEEP_PEAKS     = 5;
 const MIN_DURATION_S = 30;   // shorter videos just get random cuts
@@ -150,12 +151,26 @@ export async function analyzeVideo(id, durationMs, token) {
   }
   scoreSamples(samples);
 
-  // Best first, spaced apart so the peaks aren't all one scene.
+  // Best first, spaced apart so the peaks aren't all one scene. Each peak
+  // is [time, score, length]: length is how long the busy stretch around
+  // it lasts, judged from neighbouring samples that score nearly as high -
+  // coarse (samples are tens of seconds apart), but enough to tell a
+  // short burst from a sustained scene for variable clip lengths.
+  const byTime = [...samples].sort((a, b) => a.t - b.t);
+  const extentOf = s => {
+    let i = byTime.indexOf(s);
+    let j = i;
+    while (i > 0 && byTime[i - 1].score >= s.score - EXTENT_DROP) i--;
+    while (j < byTime.length - 1 && byTime[j + 1].score >= s.score - EXTENT_DROP) j++;
+    return byTime[j].t + WINDOW_S - byTime[i].t;
+  };
   const gap = Math.max(15, d / 30);
   const peaks = [];
   for (const s of [...samples].sort((a, b) => b.score - a.score)) {
     if (peaks.length >= KEEP_PEAKS) break;
-    if (peaks.every(p => Math.abs(p[0] - s.t) >= gap)) peaks.push([Math.round(s.t * 10) / 10, Math.round(s.score * 1000) / 1000]);
+    if (peaks.every(p => Math.abs(p[0] - s.t) >= gap)) {
+      peaks.push([Math.round(s.t * 10) / 10, Math.round(s.score * 1000) / 1000, Math.round(extentOf(s))]);
+    }
   }
   return { v: VERSION, d: Math.round(d), peaks };
 }
