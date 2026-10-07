@@ -7,7 +7,7 @@ const VIDEO_MIME_TYPES = [
   'video/quicktime', 'video/x-msvideo', 'video/mpeg',
   'video/3gpp', 'video/x-flv', 'video/x-ms-wmv'
 ];
-const APP_VERSION = 'v33';
+const APP_VERSION = 'v34';
 const BROWSE_BATCH = 50;
 // Where api/ (stream, thumbnails, tags) is served from.
 const API_BASE = 'https://randomvidpick-139266625585.us-east1.run.app';
@@ -607,7 +607,25 @@ function launchVlc(url, title) {
 // last compilation.
 let nowPlayingAction = null;
 function replayNowPlaying() {
+  nowPlayingBtn.classList.remove('ready');
   if (nowPlayingAction) nowPlayingAction();
+}
+
+// Chrome only lets a page open an app (VLC) without asking for a few
+// seconds after the user's tap. If getting ready took longer than that
+// (4K warm start, a cold server), don't trigger Chrome's "Open in VLC?"
+// prompt - light up the bar's VLC button instead, so the next tap opens it.
+const AUTO_LAUNCH_WINDOW_MS = 4000;
+function launchOrOffer(tappedAt, title) {
+  nowPlayingBtn.disabled = false;
+  if (Date.now() - tappedAt <= AUTO_LAUNCH_WINDOW_MS) {
+    nowPlayingTitle.textContent = title;
+    nowPlayingAction();
+    return;
+  }
+  nowPlayingTitle.textContent = `Ready · tap ▶ VLC · ${title}`;
+  nowPlayingBtn.classList.add('ready');
+  if (navigator.vibrate) navigator.vibrate(40);
 }
 
 // ─── BROWSE ───────────────────────────────────────────────────────────────────
@@ -1886,7 +1904,9 @@ function compileModeLabel(mode, height, fps) {
 
 browseCompileBtn.addEventListener('click', async () => {
   if (!browseFiltered.length || browseCompileBtn.disabled) return;
+  const tappedAt = Date.now();
   browseCompileBtn.disabled = true;
+  nowPlayingBtn.classList.remove('ready');
   lastPicked = null;
   nowPlayingAction = null;
   // 4K compilations wait on the server for their first clip (warm start).
@@ -1909,9 +1929,7 @@ browseCompileBtn.addEventListener('click', async () => {
     const { url, clips, mode, height, fps } = await res.json();
     const title = `Compilation · ${clips} clips · ${compileModeLabel(mode, height, fps)}`;
     nowPlayingAction = () => launchVlc(url, title);
-    nowPlayingAction();
-    nowPlayingTitle.textContent = title;
-    nowPlayingBtn.disabled = false;
+    launchOrOffer(tappedAt, title);
   } catch (err) {
     nowPlayingTitle.textContent = "Couldn't build a compilation. Try again.";
   } finally {
@@ -1922,8 +1940,10 @@ browseCompileBtn.addEventListener('click', async () => {
 // Stays in the library: the bar at the bottom shows what was last opened,
 // with a button to send it to VLC again if the first launch didn't take.
 async function playVideo(video) {
+  const tappedAt = Date.now();
   lastPicked = video;
   nowPlayingAction = openInVlc;
+  nowPlayingBtn.classList.remove('ready');
   nowPlayingTitle.textContent = `Warming stream… ${displayName(video.name)}`;
   nowPlayingBtn.disabled = true;
   nowPlaying.hidden = false;
@@ -1931,9 +1951,7 @@ async function playVideo(video) {
   await prewarmStream(video.id);
   if (lastPicked !== video) return; // another video was tapped meanwhile
 
-  openInVlc();
-  nowPlayingTitle.textContent = displayName(video.name);
-  nowPlayingBtn.disabled = false;
+  launchOrOffer(tappedAt, displayName(video.name));
 }
 
 // ─── INIT ─────────────────────────────────────────────────────────────────────
