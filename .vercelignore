@@ -5,3 +5,6 @@ manifest.json
 icon-192.png
 icon-512.png
 README.md
+Dockerfile
+.dockerignore
+server

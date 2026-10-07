@@ -20,7 +20,26 @@ export function b64url(binaryStr) {
   return btoa(binaryStr).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
 }
 
+// On Cloud Run the service runs as the Drive service account itself, so the
+// platform hands out its tokens directly - no private key in env vars. The
+// process stays up between requests there, so a plain variable is enough of
+// a cache. (K_SERVICE is set by Cloud Run.)
+const METADATA_TOKEN_URL = 'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token'
+  + '?scopes=' + encodeURIComponent('https://www.googleapis.com/auth/drive.readonly');
+let metadataToken = null; // { token, expiresAt }
+
+async function getMetadataToken() {
+  if (metadataToken && Date.now() < metadataToken.expiresAt) return metadataToken.token;
+  const res = await fetch(METADATA_TOKEN_URL, { headers: { 'Metadata-Flavor': 'Google' } });
+  if (!res.ok) throw new Error(`metadata token ${res.status}`);
+  const { access_token, expires_in } = await res.json();
+  metadataToken = { token: access_token, expiresAt: Date.now() + (expires_in - 60) * 1000 };
+  return access_token;
+}
+
 export async function getServiceAccountToken() {
+  if (process.env.K_SERVICE && !process.env.GOOGLE_PRIVATE_KEY) return getMetadataToken();
+
   if (KV_URL && KV_TOKEN) {
     try {
       const cached = await kvCommand(['GET', TOKEN_KEY]);
