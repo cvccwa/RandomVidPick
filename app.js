@@ -14,7 +14,7 @@ const API_BASE = 'https://randomvidpick-139266625585.us-east1.run.app';
 const META_URL = `${API_BASE}/api/meta`;
 // Compilations run on their own Cloud Run service with more CPU (smooth mode
 // re-encodes); the main API stays small so normal playback stays cheap.
-const COMPILE_BASE = API_BASE;
+const COMPILE_BASE = 'https://rvp-compile-139266625585.us-east1.run.app';
 const RECENT_MS      = 30 * 24 * 3600 * 1000; // "recently watched" = past month
 
 // Display-only cleanup of filenames (Drive names and search are untouched):
