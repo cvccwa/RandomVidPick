@@ -3,45 +3,9 @@ import { sourceUrl } from './driveSource.js';
 
 // Shared by compilations (api/compile.js) and highlight analysis
 // (api/analyze.js). ffmpeg reads Drive files through driveSource.js so the
-// bytes are counted; driveUrl is for direct checks only.
+// bytes are counted and Drive's refusal reasons logged.
 export const DRIVE_API = process.env.DRIVE_API_BASE || 'https://www.googleapis.com';
 export const FFMPEG    = process.env.FFMPEG_PATH || 'ffmpeg';
-
-export function driveUrl(id) {
-  return `${DRIVE_API}/drive/v3/files/${encodeURIComponent(id)}?alt=media`;
-}
-
-
-// ffmpeg only reports "403 Forbidden (access denied)". When it does, ask
-// Drive directly a few ways to see why: a plain one-byte read (what the
-// stream endpoint does), the same read with ffmpeg's User-Agent, and an
-// open-ended range like ffmpeg's. Logged at most once a minute.
-let lastDiagnosis = 0;
-async function tryRead(id, token, headers) {
-  try {
-    const res = await fetch(driveUrl(id), { headers: { Authorization: `Bearer ${token}`, ...headers } });
-    if (res.ok) { res.body?.cancel(); return String(res.status); }
-    const body = await res.json().catch(() => ({}));
-    const e = body.error || {};
-    const reasons = (e.errors || []).map(x => x.reason).filter(Boolean).join(',');
-    return `${res.status} ${reasons || e.status || ''} ${(e.message || '').slice(0, 120)}`.trim();
-  } catch (err) {
-    return `failed (${err.message})`;
-  }
-}
-export async function driveDiagnosis(id, token, { force = false } = {}) {
-  if (!force && Date.now() - lastDiagnosis < 60e3) return null;
-  lastDiagnosis = Date.now();
-  const [plain, ua, open] = await Promise.all([
-    tryRead(id, token, { Range: 'bytes=0-0' }),
-    tryRead(id, token, { Range: 'bytes=0-0', 'User-Agent': 'Lavf/59.27.100' }),
-    tryRead(id, token, { Range: 'bytes=0-' }),
-  ]);
-  return `plain: ${plain} | ffmpeg agent: ${ua} | open range: ${open}`;
-}
-export function logDriveDiagnosis(where, id, token) {
-  driveDiagnosis(id, token).then(d => { if (d) console.log(`${where}: Drive check ${id.slice(0, 6)}… ${d}`); }, () => {});
-}
 
 const probeCache = new Map(); // file id -> { hasAudio, fps, duration }
 

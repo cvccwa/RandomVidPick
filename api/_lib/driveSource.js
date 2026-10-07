@@ -49,6 +49,34 @@ export function driveBytesRead(purpose) {
   return totals.get(purpose) || 0;
 }
 
+// --- refusals ---------------------------------------------------------------
+
+// Drive's JSON error names the reason (downloadQuotaExceeded,
+// userRateLimitExceeded, ...); ffmpeg only ever says "403 Forbidden".
+export function refusalReason(status, bodyText) {
+  try {
+    const e = JSON.parse(bodyText).error || {};
+    const reasons = (e.errors || []).map(x => x.reason).filter(Boolean).join(',');
+    return [reasons, e.message].filter(Boolean).join(': ').slice(0, 200) || `HTTP ${status}`;
+  } catch (err) {
+    return `HTTP ${status}`;
+  }
+}
+
+const lastRefusal = new Map(); // purpose -> { reason, loggedAt }
+
+// The most recent reason Drive gave for refusing a read for this purpose.
+export function lastDriveRefusal(purpose) {
+  return lastRefusal.get(purpose)?.reason || null;
+}
+
+function noteRefusal(purpose, id, status, reason) {
+  const prev = lastRefusal.get(purpose);
+  const loggedAt = prev && Date.now() - prev.loggedAt < 60e3 ? prev.loggedAt : Date.now();
+  if (loggedAt !== prev?.loggedAt) console.log(`${purpose}: Drive refused ${id.slice(0, 6)}… ${status} ${reason}`);
+  lastRefusal.set(purpose, { reason: `${status} ${reason}`, loggedAt });
+}
+
 // --- pass-through for ffmpeg ------------------------------------------------
 
 function mediaUrl(id) {
@@ -77,6 +105,14 @@ async function relay(req, res) {
     for (const h of ['content-type', 'content-length', 'content-range', 'accept-ranges']) {
       const v = drive.headers.get(h);
       if (v) out[h] = v;
+    }
+    if (!drive.ok) {
+      // Logged here (at most once a minute per purpose) because ffmpeg
+      // drops the reason.
+      const text = req.method === 'HEAD' ? '' : await drive.text().catch(() => '');
+      noteRefusal(purpose, id, drive.status, refusalReason(drive.status, text));
+      res.writeHead(drive.status, out);
+      return res.end(text);
     }
     res.writeHead(drive.status, out);
     if (!drive.body || req.method === 'HEAD') return res.end();

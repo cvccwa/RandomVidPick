@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { getServiceAccountToken, kvCommand, b64url } from './_lib/serviceAccount.js';
 import { isAuthorized, ID_RE } from './_lib/auth.js';
-import { FFMPEG, probeInfo, logDriveDiagnosis } from './_lib/media.js';
+import { FFMPEG, probeInfo } from './_lib/media.js';
 import { sourceUrl } from './_lib/driveSource.js';
 
 // Compilation mode: random ~10s clips from many videos, played back to back
@@ -354,7 +354,6 @@ async function originalSegment(session, n, signal) {
     } catch (err) {
       if (signal?.aborted) break;
       console.log(`compile clip ${i} failed: ${err.message}`);
-      if (err.transient) logDriveDiagnosis('compile', clips[i].id, token);
     }
   }
   return new Response('clip unavailable', { status: 502 });
@@ -503,7 +502,6 @@ async function runJob(job, session, n, emit) {
       if (ok) { job.done = true; emit(); return; }
     } catch (err) {
       console.log(`compile smooth clip ${i} failed: ${err.message}`);
-      if (err.transient) logDriveDiagnosis('compile smooth', clip.id, token);
     }
   }
   job.failed = true;

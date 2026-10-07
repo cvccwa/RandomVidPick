@@ -1,8 +1,8 @@
 import { spawn } from 'node:child_process';
 import { getServiceAccountToken, kvCommand } from './_lib/serviceAccount.js';
 import { isAuthorized } from './_lib/auth.js';
-import { FFMPEG, TRANSIENT_RE, probeInfo, driveDiagnosis } from './_lib/media.js';
-import { sourceUrl, driveBytesRead } from './_lib/driveSource.js';
+import { FFMPEG, TRANSIENT_RE, probeInfo } from './_lib/media.js';
+import { sourceUrl, driveBytesRead, lastDriveRefusal } from './_lib/driveSource.js';
 import { listLibrary } from './_lib/library.js';
 
 // Highlight analysis for smart compilations. Each video is sampled about
@@ -280,7 +280,7 @@ async function runBatch() {
           // Not the file's fault: leave it for a later run, and stop early if
           // Drive keeps refusing rather than burning through the list.
           if (++transientStreak >= STOP_AFTER_TRANSIENT && !stopReason) {
-            stopReason = `${err.message} [Drive says: ${await driveDiagnosis(id, token, { force: true })}]`;
+            stopReason = `${err.message} [Drive says: ${lastDriveRefusal('analyze') || 'no reason given'}]`;
           }
           continue;
         }
@@ -344,6 +344,8 @@ export default async function handler(req) {
     const result = await runBatch();
     console.log(result.capped
       ? `analyze run: daily cap reached (${result.capped})`
+      : result.ranSeconds === undefined
+      ? 'analyze run: nothing left to analyse'
       : `analyze run: ${result.analyzed} analysed in ${result.ranSeconds} s `
         + `(~${result.secondsPerVideo} s per video, ${PARALLEL} at once), ${result.remaining} left; `
         + `read ${result.readMB} MB from Drive (${result.dayReadGB} of ${DAILY_GB} GB today)`
