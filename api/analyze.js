@@ -197,6 +197,21 @@ function scoreSamples(samples) {
   samples.forEach((s, i) => { s.score = useAudio ? (motionRank[i] + loudRank[i]) / 2 : motionRank[i]; });
 }
 
+// ffmpeg only reports "403 Forbidden"; Drive's JSON body says why
+// (userRateLimitExceeded, downloadQuotaExceeded, ...). Asked once per run.
+async function driveRefusalReason(id, token) {
+  try {
+    const res = await fetch(driveUrl(id), { headers: { Authorization: `Bearer ${token}`, Range: 'bytes=0-0' } });
+    if (res.ok) { res.body?.cancel(); return `direct read OK (${res.status})`; }
+    const body = await res.json().catch(() => ({}));
+    const e = body.error || {};
+    const reasons = (e.errors || []).map(x => x.reason).filter(Boolean).join(',');
+    return `HTTP ${res.status} ${reasons || e.status || ''}: ${(e.message || '').slice(0, 160)}`;
+  } catch (err) {
+    return `direct read failed: ${err.message}`;
+  }
+}
+
 async function loadTodo(token) {
   const [raw, listedAt] = await Promise.all([kvCommand(['GET', TODO_KEY]), kvCommand(['GET', LISTED_KEY])]);
   let todo = raw ? JSON.parse(raw) : null;
@@ -246,7 +261,9 @@ async function runBatch() {
         if (err.transient) {
           // Not the file's fault: leave it for a later run, and stop early if
           // Drive keeps refusing rather than burning through the list.
-          if (++transientStreak >= STOP_AFTER_TRANSIENT && !stopReason) stopReason = err.message;
+          if (++transientStreak >= STOP_AFTER_TRANSIENT && !stopReason) {
+            stopReason = `${err.message} [Drive says: ${await driveRefusalReason(id, token)}]`;
+          }
           continue;
         }
         console.log(`analyze ${id.slice(0, 6)}… failed: ${err.message}`);
