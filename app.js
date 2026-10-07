@@ -7,7 +7,7 @@ const VIDEO_MIME_TYPES = [
   'video/quicktime', 'video/x-msvideo', 'video/mpeg',
   'video/3gpp', 'video/x-flv', 'video/x-ms-wmv'
 ];
-const APP_VERSION = 'v35';
+const APP_VERSION = 'v36';
 const BROWSE_BATCH = 50;
 // Where api/ (stream, thumbnails, tags) is served from.
 const API_BASE = 'https://randomvidpick-139266625585.us-east1.run.app';
@@ -1929,7 +1929,13 @@ browseRandomBtn.addEventListener('click', () => {
 // the clips in the view are - decided by the server).
 const COMPILE_RES = [['auto', 'Auto'], ['2160', '4K'], ['1440', '1440p'], ['1080', '1080p']];
 const COMPILE_FPS = [['auto', 'Auto'], ['60', '60 fps'], ['30', '30 fps']];
-let compilePrefs = { mode: 'smooth', res: 'auto', fps: 'auto' };
+// Highlights cuts around each video's loudest / most active moments
+// (analysed in the background by api/analyze.js); Random picks anywhere.
+const COMPILE_PICK = [['highlights', 'Highlights'], ['random', 'Random']];
+// Auto: with highlights, each clip lasts about as long as the action it was
+// cut from (6-20 s); otherwise 10 s.
+const COMPILE_LEN  = [['auto', 'Auto'], ['5', '5 s'], ['10', '10 s'], ['15', '15 s'], ['20', '20 s']];
+let compilePrefs = { mode: 'smooth', res: 'auto', fps: 'auto', pick: 'highlights', len: 'auto' };
 try {
   const saved = localStorage.getItem('rvp_compile_mode');
   if (saved && saved.startsWith('{')) {
@@ -1938,6 +1944,8 @@ try {
       mode: p.mode === 'original' ? 'original' : 'smooth',
       res:  COMPILE_RES.some(r => r[0] === p.res) ? p.res : 'auto',
       fps:  COMPILE_FPS.some(f => f[0] === p.fps) ? p.fps : 'auto',
+      pick: COMPILE_PICK.some(k => k[0] === p.pick) ? p.pick : 'highlights',
+      len:  COMPILE_LEN.some(k => k[0] === p.len) ? p.len : 'auto',
     };
   } else if (saved === 'original') {
     compilePrefs.mode = 'original';
@@ -1964,6 +1972,8 @@ function openCompileMenu() {
         compilePrefs[key] = value; saveCompilePrefs(); openCompileMenu();
       }))));
   const smooth = compilePrefs.mode === 'smooth';
+  const highlightNote = el('div', { className: 'sheet-note', textContent: 'Checking highlight analysis…' });
+  loadHighlightProgress().then(text => { highlightNote.textContent = text; });
   openSheet(
     el('div', { className: 'sheet-title', textContent: 'Compilation mode' }),
     el('div', { className: 'sheet-section' },
@@ -1972,10 +1982,31 @@ function openCompileMenu() {
     smooth ? choiceRow('Resolution', COMPILE_RES, 'res') : null,
     smooth ? choiceRow('Frame rate', COMPILE_FPS, 'fps') : null,
     smooth ? el('div', { className: 'sheet-note', textContent: 'Auto picks what most clips in the view are. Auto frame rate stays at 30 for 4K; 4K at 60 fps will likely stall.' }) : null,
+    choiceRow('Clip picks', COMPILE_PICK, 'pick'),
+    highlightNote,
+    choiceRow('Clip length', COMPILE_LEN, 'len'),
+    el('div', { className: 'sheet-note', textContent: 'Auto follows the action: short bursts get short clips, sustained scenes up to 20 s (needs Highlights; otherwise 10 s).' }),
     el('div', { className: 'sheet-row sheet-actions' },
       el('button', { type: 'button', className: 'sheet-btn primary', textContent: 'Done', onclick: closeSheet })));
 }
 attachLongPress(browseCompileBtn, openCompileMenu);
+
+// "Highlights ready for 340 of 2,100 videos" - analysed counts come from the
+// compile service; videos not analysed yet get random cuts.
+async function loadHighlightProgress() {
+  try {
+    const res = await fetch(`${COMPILE_BASE}/api/analyze`, { headers: metaHeaders() });
+    if (!res.ok) throw new Error(String(res.status));
+    const { analyzed } = await res.json();
+    const total = (videoCache || []).length;
+    const done = Math.min(analyzed, total);
+    return done >= total
+      ? 'Highlights are ready for every video.'
+      : `Highlights ready for ${done.toLocaleString()} of ${total.toLocaleString()} videos; the rest get random cuts until they're analysed.`;
+  } catch (err) {
+    return "Couldn't check highlight analysis; videos without it get random cuts.";
+  }
+}
 
 function compileModeLabel(mode, height, fps) {
   if (mode !== 'smooth') return 'Original';
@@ -2002,12 +2033,15 @@ browseCompileBtn.addEventListener('click', async () => {
         mode:  compilePrefs.mode,
         res:   compilePrefs.res,
         fps:   compilePrefs.fps,
+        pick:  compilePrefs.pick,
+        len:   compilePrefs.len,
         clips: browseFiltered.map(v => ({ id: v.id, d: v.durationMs || 0, w: v.width || 0, h: v.height || 0 })),
       }),
     });
     if (!res.ok) throw new Error(`compile ${res.status}`);
-    const { url, clips, mode, height, fps } = await res.json();
-    const title = `Compilation · ${clips} clips · ${compileModeLabel(mode, height, fps)}`;
+    const { url, clips, mode, height, fps, pick, highlights } = await res.json();
+    const picks = pick === 'highlights' ? ` · ${highlights} highlights` : '';
+    const title = `Compilation · ${clips} clips · ${compileModeLabel(mode, height, fps)}${picks}`;
     nowPlayingAction = () => launchVlc(url, title);
     launchOrOffer(tappedAt, title);
   } catch (err) {

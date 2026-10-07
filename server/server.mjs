@@ -9,6 +9,7 @@ import meta from '../api/meta.js';
 import keepalive from '../api/keepalive.js';
 import sign from '../api/sign.js';
 import compile from '../api/compile.js';
+import analyze from '../api/analyze.js';
 
 const routes = {
   '/api/stream':    stream,
@@ -17,6 +18,7 @@ const routes = {
   '/api/keepalive': keepalive,
   '/api/sign':      sign,
   '/api/compile':   compile, // also serves /api/compile/*
+  '/api/analyze':   analyze,
 };
 
 function findHandler(pathname) {

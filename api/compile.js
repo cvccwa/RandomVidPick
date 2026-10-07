@@ -1,11 +1,12 @@
 import { spawn } from 'node:child_process';
 import { getServiceAccountToken, kvCommand, b64url } from './_lib/serviceAccount.js';
 import { isAuthorized, ID_RE } from './_lib/auth.js';
+import { FFMPEG, driveUrl, probeInfo } from './_lib/media.js';
 
 // Compilation mode: random ~10s clips from many videos, played back to back
 // in VLC as one HLS stream.
 //
-//   POST /api/compile   {clips: [{id, d, w, h}], mode, res, fps}  -> {url}   (owner only)
+//   POST /api/compile   {clips: [{id, d, w, h}], mode, res, fps, pick, len}  -> {url}   (owner only)
 //   GET  /api/compile/playlist.m3u8?s=SESSION
 //   GET  /api/compile/seg.ts?s=SESSION&n=INDEX
 //
@@ -15,7 +16,7 @@ import { isAuthorized, ID_RE } from './_lib/auth.js';
 //   discontinuity tag sits between them and VLC visibly resets at each one.
 // - smooth: each clip is re-encoded to one format for the whole compilation
 //   (same resolution and frame rate, H.264 + AAC stereo) and to exactly
-//   CLIP_S seconds on one continuous timeline, so playback runs straight
+//   its clip length on one continuous timeline, so playback runs straight
 //   through and seeking lines up. Resolution and frame rate are fixed per
 //   compilation, each chosen or Auto (what most of its clips are; see
 //   pickHeight / pickFps). While one clip is served, the next ones are
@@ -23,16 +24,23 @@ import { isAuthorized, ID_RE } from './_lib/auth.js';
 //
 // The session id is a long random token, so knowing it is what grants access
 // to the playlist and segments (VLC can't send headers); it lives in KV for
-// SESSION_TTL_S. Only ~CLIP_S seconds of each source file is ever fetched.
+// SESSION_TTL_S. Only a clip's worth of each source file is ever fetched.
+//
+// Clip length (len): a fixed 5/10/15/20 s, or 'auto' - with highlights,
+// each clip lasts about as long as the busy stretch it was cut from
+// (AUTO_MIN_S..AUTO_MAX_S); without, CLIP_S. Each clip stores its length
+// (l) and its start on the compilation timeline (o).
 
 const ALLOWED_ORIGIN = 'https://cvccwa.github.io';
-const CLIP_S         = 10;
+const CLIP_S         = 10;   // default clip length
+const LEN_OPTIONS    = new Set(['auto', '5', '10', '15', '20']);
+const AUTO_MIN_S     = 6;
+const AUTO_MAX_S     = 20;
+const AUTO_PAD_S     = 6;    // a burst's measured length + this = its clip
 const MAX_CLIPS      = 360;        // one hour of clips per session
 const MAX_INPUT      = 5000;
 const SESSION_TTL_S  = 12 * 3600;
 const SEGMENT_TRIES  = 3;          // a broken source is swapped for another clip
-const DRIVE_API      = process.env.DRIVE_API_BASE || 'https://www.googleapis.com';
-const FFMPEG         = process.env.FFMPEG_PATH || 'ffmpeg';
 const SID_RE         = /^[\w-]{40,64}$/;
 const RES_OPTIONS    = new Set(['auto', '2160', '1440', '1080']);
 const FPS_OPTIONS    = new Set(['auto', '60', '30']);
@@ -51,19 +59,44 @@ function json(body, status = 200) {
   });
 }
 
-function driveUrl(id) {
-  return `${DRIVE_API}/drive/v3/files/${encodeURIComponent(id)}?alt=media`;
-}
-
 // Where in a video to cut: somewhere in the middle 80%, so intros/outros are
 // skipped. Unknown durations get an early-ish guess; a cut past the end just
 // fails and gets replaced by another clip.
-function pickStart(durationMs) {
+function pickStart(durationMs, len = CLIP_S) {
   const d = durationMs / 1000;
   if (!(d > 0)) return 20 + Math.random() * 100;
-  if (d < CLIP_S * 3) return 0;
-  const lo = d * 0.1, hi = d * 0.9 - CLIP_S;
+  if (d < len * 3) return 0;
+  const lo = d * 0.1, hi = d * 0.9 - len;
   return lo + Math.random() * Math.max(0, hi - lo);
+}
+
+// pick: 'highlights' cuts around a video's analysed peaks (api/analyze.js),
+// choosing randomly among its best few so repeat compilations still vary;
+// videos not analysed yet fall back to pickStart.
+const PEAKS_KEY = 'rvp:peaks';
+const PEAK_CHOICES = 3;
+const PEAK_LEAD_S = 3; // start a little before the measured moment
+const PEAK_SCORE_SPREAD = 0.25;
+
+// -> { start, extent } for one of the video's best moments, or null.
+function highlightPick(raw) {
+  try {
+    // Best first; only moments close to the video's best are candidates, so
+    // an uneventful video's middling "peaks" aren't treated as highlights.
+    const all = JSON.parse(raw).peaks || [];
+    if (!all.length) return null;
+    const peaks = all.filter(p => p[1] >= all[0][1] - PEAK_SCORE_SPREAD).slice(0, PEAK_CHOICES);
+    const [t, , extent] = peaks[Math.floor(Math.random() * peaks.length)];
+    return { start: Math.max(0, t - PEAK_LEAD_S), extent: extent || 0 };
+  } catch (err) {
+    return null;
+  }
+}
+
+function clipLength(lenChoice, pick) {
+  if (lenChoice !== 'auto') return Number(lenChoice);
+  if (!pick) return CLIP_S;
+  return Math.min(AUTO_MAX_S, Math.max(AUTO_MIN_S, Math.round(pick.extent + AUTO_PAD_S)));
 }
 
 // Smooth-mode output height. Videos are classed by their short side, so a
@@ -131,12 +164,23 @@ async function createSession(req) {
     [pool[i], pool[j]] = [pool[j], pool[i]];
   }
   const picked = pool.slice(0, MAX_CLIPS);
+  const pick = body.pick === 'highlights' ? 'highlights' : 'random';
+  const lenChoice = LEN_OPTIONS.has(String(body.len)) ? String(body.len) : 'auto';
+  const starts = picked.map(() => null);
+  if (pick === 'highlights') {
+    const raw = await kvCommand(['HMGET', PEAKS_KEY, ...picked.map(c => c.id)]).catch(() => []);
+    (raw || []).forEach((r, i) => { if (r) starts[i] = highlightPick(r); });
+  }
   const height = smooth ? pickHeight(res, picked) : null;
   const session = {
     mode:  smooth ? 'smooth' : 'original',
     height,
     fps:   smooth ? await pickFps(fpsChoice, height, picked) : null,
-    clips: picked.map(c => ({ id: c.id, s: Math.round(pickStart(c.d) * 10) / 10 })),
+    clips: timeline(picked.map((c, i) => {
+      const l = clipLength(lenChoice, starts[i]);
+      const s = starts[i] ? starts[i].start : pickStart(c.d, l);
+      return { id: c.id, s: Math.round(s * 10) / 10, l };
+    })),
   };
 
   const sid = b64url(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))));
@@ -152,6 +196,9 @@ async function createSession(req) {
     mode:   session.mode,
     height: session.height,
     fps:    session.fps,
+    pick,
+    highlights: starts.filter(s => s !== null).length,
+    len:        lenChoice,
   });
 }
 
@@ -169,6 +216,17 @@ async function loadSession(sid) {
   return session;
 }
 
+// Places clips back to back: o = where each starts on the compilation's
+// timeline (smooth mode offsets each segment's timestamps by it).
+function timeline(clips) {
+  let o = 0;
+  return clips.map(c => { const placed = { ...c, o }; o += c.l; return placed; });
+}
+
+// Older sessions stored neither length nor offset.
+const lenOf    = (session, n) => session.clips[n].l || CLIP_S;
+const offsetOf = (session, n) => (session.clips[n].o ?? n * CLIP_S);
+
 function playlist(sid, session) {
   const smooth = session.mode === 'smooth';
   const lines = [
@@ -176,13 +234,13 @@ function playlist(sid, session) {
     '#EXT-X-VERSION:3',
     '#EXT-X-PLAYLIST-TYPE:VOD',
     // Stream copy starts each cut on the keyframe before the chosen point,
-    // so original-mode segments can run a few seconds over CLIP_S.
-    `#EXT-X-TARGETDURATION:${smooth ? CLIP_S : CLIP_S * 2}`,
+    // so original-mode segments can run a few seconds over their length.
+    `#EXT-X-TARGETDURATION:${Math.max(...session.clips.map((_, n) => lenOf(session, n))) * (smooth ? 1 : 2)}`,
     '#EXT-X-MEDIA-SEQUENCE:0',
   ];
   session.clips.forEach((_, n) => {
     if (!smooth) lines.push('#EXT-X-DISCONTINUITY');
-    lines.push(`#EXTINF:${CLIP_S}.000,`, `seg.ts?s=${sid}&n=${n}`);
+    lines.push(`#EXTINF:${lenOf(session, n)}.000,`, `seg.ts?s=${sid}&n=${n}`);
   });
   lines.push('#EXT-X-ENDLIST', '');
   return new Response(lines.join('\n'), {
@@ -214,14 +272,14 @@ const NEEDS_DX = new Set(['mpeg4']);
 // codec and started writing, with the bytes so far, the rest of stdout and
 // the codec; rejects if it exits without output (unreadable file, cut past
 // the end, codec the TS muxer refuses).
-function cutClip(clip, token, signal, dumpExtra) {
+function cutClip(clip, len, token, signal, dumpExtra) {
   return new Promise((resolve, reject) => {
     const ff = spawn(FFMPEG, [
       '-hide_banner', '-nostats', '-loglevel', 'info',
       '-headers', `Authorization: Bearer ${token}\r\n`,
       '-ss', String(clip.s),
-      '-i', `${DRIVE_API}/drive/v3/files/${encodeURIComponent(clip.id)}?alt=media`,
-      '-t', String(CLIP_S),
+      '-i', driveUrl(clip.id),
+      '-t', String(len),
       '-map', '0:v:0', '-map', '0:a:0?',
       '-c', 'copy',
       ...(dumpExtra ? ['-bsf:v', 'dump_extra'] : []),
@@ -258,25 +316,27 @@ function cutClip(clip, token, signal, dumpExtra) {
   });
 }
 
-async function openClip(clip, token, signal) {
-  let cut = await cutClip(clip, token, signal, false);
+async function openClip(clip, len, token, signal) {
+  let cut = await cutClip(clip, len, token, signal, false);
   if (COPY_OK.has(cut.codec)) return cut;
   cut.kill();
   if (NEEDS_DX.has(cut.codec)) {
-    cut = await cutClip(clip, token, signal, true);
+    cut = await cutClip(clip, len, token, signal, true);
     if (cut.codec !== 'unknown') return cut;
     cut.kill();
   }
   throw new Error(`unsupported codec ${cut.codec}`);
 }
 
-async function originalSegment(clips, n, signal) {
+async function originalSegment(session, n, signal) {
+  const { clips } = session;
   const token = await getServiceAccountToken();
   // Try the clip at n; if its source won't cut, fall back to other clips
   // from the same session so playback keeps going.
   for (const i of fallbackOrder(clips, n)) {
     try {
-      const { chunks, rest, kill } = await openClip(clips[i], token, signal);
+      // A stand-in clip plays for this slot's length.
+      const { chunks, rest, kill } = await openClip(clips[i], lenOf(session, n), token, signal);
       // Once the viewer disconnects (VLC seeks or closes) the stream is
       // cancelled; ffmpeg's remaining output must not touch it after that.
       let open = true;
@@ -301,31 +361,6 @@ async function originalSegment(clips, n, signal) {
 
 // ─── SMOOTH MODE ──────────────────────────────────────────────────────────────
 const MIN_SEGMENT_B  = 128 * 1024; // less than this from an encode = it failed
-const probeCache     = new Map();  // file id -> { hasAudio, fps }
-
-// A file's audio presence and frame rate, from ffmpeg's stream listing
-// (reads only the container header). Clips without audio get silence
-// instead, so every segment has the same tracks.
-function probeInfo(id, token) {
-  if (probeCache.has(id)) return Promise.resolve(probeCache.get(id));
-  return new Promise((resolve, reject) => {
-    const ff = spawn(FFMPEG, ['-hide_banner', '-headers', `Authorization: Bearer ${token}\r\n`, '-i', driveUrl(id)],
-      { stdio: ['ignore', 'ignore', 'pipe'] });
-    let stderr = '';
-    ff.stderr.on('data', d => { if (stderr.length < 20000) stderr += d; });
-    ff.on('error', reject);
-    ff.on('close', () => {
-      const videoLine = (/Stream #0:\d+[^:]*: Video:.*/.exec(stderr) || [])[0];
-      if (!videoLine) return reject(new Error('no video stream'));
-      const rate = /([\d.]+) fps/.exec(videoLine) || /([\d.]+) tbr/.exec(videoLine);
-      const info = { hasAudio: /Stream #0:\d+[^:]*: Audio:/.test(stderr), fps: rate ? Number(rate[1]) : 0 };
-      if (probeCache.size > 500) probeCache.delete(probeCache.keys().next().value);
-      probeCache.set(id, info);
-      resolve(info);
-    });
-  });
-}
-
 // Encoder speed/size by workload (pixels per second). veryfast keeps
 // 1080p30 well ahead of real time; heavier outputs use faster presets so
 // the encode keeps up, at the cost of more bits - capped by maxrate so
@@ -338,31 +373,34 @@ function encoderFor(height, fps) {
   return ['-preset', preset, '-crf', '20', '-maxrate', `${maxrate}M`, '-bufsize', `${maxrate * 2}M`];
 }
 
-function smoothArgs(clip, n, session, token, hasAudio) {
+// source = the clip whose video is cut (a stand-in if clip n's source
+// failed); n = the timeline slot it fills, which sets length and offset.
+function smoothArgs(source, n, session, token, hasAudio) {
   const { height } = session;
+  const len = lenOf(session, n);
   const fps = session.fps || 30;
   const width = Math.round(height * 16 / 9);
   // Fit inside the frame (letterbox/pillarbox, never crop), fixed fps, and
   // pad short sources with their last frame / silence so every segment is
-  // exactly CLIP_S long.
+  // exactly its slot's length.
   const video = `[0:v:0]scale=${width}:${height}:force_original_aspect_ratio=decrease,`
     + `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=${fps},`
-    + `format=yuv420p,tpad=stop_mode=clone:stop_duration=${CLIP_S}[v]`;
+    + `format=yuv420p,tpad=stop_mode=clone:stop_duration=${len}[v]`;
   const audio = `[${hasAudio ? '0:a:0' : '1:a'}]aresample=48000,aformat=channel_layouts=stereo,apad[a]`;
   return [
     '-hide_banner', '-nostats', '-loglevel', 'error',
     '-headers', `Authorization: Bearer ${token}\r\n`,
-    '-ss', String(clip.s),
-    '-i', driveUrl(clip.id),
+    '-ss', String(source.s),
+    '-i', driveUrl(source.id),
     ...(hasAudio ? [] : ['-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo']),
     '-filter_complex', `${video};${audio}`,
     '-map', '[v]', '-map', '[a]',
-    '-t', String(CLIP_S),
+    '-t', String(len),
     '-c:v', 'libx264', ...encoderFor(height, fps), '-profile:v', 'high',
     '-g', String(fps * 2),
     '-c:a', 'aac', '-b:a', '160k',
-    // Segment n sits at n*CLIP_S on one shared timeline - no discontinuities.
-    '-output_ts_offset', String(n * CLIP_S),
+    // Segment n sits at its offset on one shared timeline - no discontinuities.
+    '-output_ts_offset', String(offsetOf(session, n)),
     '-f', 'mpegts',
     'pipe:1',
   ];
@@ -582,7 +620,7 @@ export default async function handler(req) {
     if (req.method === 'HEAD') return new Response(null, { headers: { 'Content-Type': 'video/mp2t' } });
     return session.mode === 'smooth'
       ? smoothSegment(sid, session, n)
-      : originalSegment(session.clips, n, req.signal);
+      : originalSegment(session, n, req.signal);
   }
   return new Response('not found', { status: 404 });
 }
