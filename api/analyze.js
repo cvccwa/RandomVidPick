@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { getServiceAccountToken, kvCommand } from './_lib/serviceAccount.js';
 import { isAuthorized } from './_lib/auth.js';
-import { FFMPEG, driveUrl, authHeader, probeInfo } from './_lib/media.js';
+import { FFMPEG, TRANSIENT_RE, driveUrl, authHeader, probeInfo } from './_lib/media.js';
 import { listLibrary } from './_lib/library.js';
 
 // Highlight analysis for smart compilations. Each video is sampled about
@@ -44,8 +44,13 @@ const HARD_STOP_S    = 150;  // a video still running at this point is dropped a
 const START_MARGIN_S = 20;   // don't start a video this close to the deadline
 const DAILY_MINUTES  = Number(process.env.ANALYZE_DAILY_MINUTES) || 30;
 const DAY_KEY        = 'rvp:analyze:day:';
-const PARALLEL       = 6;    // videos at once
-const SAMPLE_PARALLEL = 4;   // samples per video at once - each spends most of its time waiting on Drive
+// Kept gentle: bursts of reads get the service account rate-limited by
+// Drive. 2 x 2 = at most 4 reads in flight (was 24), with a pause after
+// each and a longer one whenever Drive refuses.
+const PARALLEL       = 2;    // videos at once
+const SAMPLE_PARALLEL = 2;   // samples per video at once
+const SAMPLE_PAUSE_MS = 300;  // after each sample, per lane
+const REFUSED_PAUSE_MS = 5e3; // after a sample Drive refused
 const RELIST_MS      = 3600e3;
 const RETRY_FAILED_MS = 7 * 86400e3; // permanent failures (unreadable file) are re-checked weekly
 const STOP_AFTER_TRANSIENT = 5;       // this many Drive refusals in a row ends the run early
@@ -95,7 +100,11 @@ function measure(id, t, token, hasAudio) {
     ff.on('close', () => {
       clearTimeout(timer);
       const diffs = [...out.matchAll(/signalstats\.YAVG=([\d.]+)/g)].map(m => Number(m[1]));
-      if (!diffs.length) return reject(new Error('no frames'));
+      if (!diffs.length) {
+        const e = new Error('no frames');
+        e.transient = TRANSIENT_RE.test(err);
+        return reject(e);
+      }
       const vol = /mean_volume: (-?[\d.]+) dB/.exec(err);
       resolve({
         motion: diffs.reduce((a, b) => a + b, 0) / diffs.length,
@@ -132,6 +141,8 @@ async function runLimited(jobs, limit) {
 
 class OutOfTime extends Error {}
 
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
 export async function analyzeVideo(id, durationMs, token, stopAt = Infinity) {
   const info = await probeInfo(id, token);
   const d = durationMs > 0 ? durationMs / 1000 : info.duration;
@@ -144,9 +155,14 @@ export async function analyzeVideo(id, durationMs, token, stopAt = Infinity) {
   const samples = [];
   const sampleAt = async t => {
     if (Date.now() > stopAt) throw new OutOfTime('out of time');
+    let pause = SAMPLE_PAUSE_MS;
     try {
       samples.push({ t, ...(await measure(id, t, token, info.hasAudio)) });
-    } catch (err) { /* unreadable spot - skip it */ }
+    } catch (err) {
+      // Unreadable spot - skip it; if Drive refused, back off before the next.
+      if (err.transient) pause = REFUSED_PAUSE_MS;
+    }
+    await sleep(Math.max(0, Math.min(pause, stopAt - Date.now())));
   };
 
   // Pass 1: evenly across the middle of the video.
