@@ -47,7 +47,8 @@ const DAY_KEY        = 'rvp:analyze:day:';
 const PARALLEL       = 6;    // videos at once
 const SAMPLE_PARALLEL = 4;   // samples per video at once - each spends most of its time waiting on Drive
 const RELIST_MS      = 3600e3;
-const RETRY_FAILED_MS = 7 * 86400e3; // a failure may have been a passing Drive error
+const RETRY_FAILED_MS = 7 * 86400e3; // permanent failures (unreadable file) are re-checked weekly
+const STOP_AFTER_TRANSIENT = 5;       // this many Drive refusals in a row ends the run early
 const MEASURE_TIMEOUT_MS = 30e3;
 
 const CORS = {
@@ -150,7 +151,12 @@ export async function analyzeVideo(id, durationMs, token, stopAt = Infinity) {
 
   // Pass 1: evenly across the middle of the video.
   await runLimited(Array.from({ length: count }, (_, i) => () => sampleAt(lo + step * (i + 0.5))), SAMPLE_PARALLEL);
-  if (!samples.length) throw new Error('no samples measured');
+  if (!samples.length) {
+    // Every spot failed to read: almost always Drive refusing requests, not the file.
+    const err = new Error('no samples measured');
+    err.transient = true;
+    throw err;
+  }
   scoreSamples(samples);
 
   // Pass 2: around the best few spots, to find the peak inside each scene.
@@ -200,7 +206,9 @@ async function loadTodo(token) {
   for (let i = 0; i + 1 < (stored || []).length; i += 2) {
     let entry = {};
     try { entry = JSON.parse(stored[i + 1]); } catch (err) { /* re-analyse */ continue; }
-    if (entry.v === VERSION && !(entry.failed && Date.now() - (entry.at || 0) > RETRY_FAILED_MS)) doneSet.add(stored[i]);
+    // Failures not marked permanent (older entries included) are retried.
+    const retry = entry.failed && (!entry.permanent || Date.now() - (entry.at || 0) > RETRY_FAILED_MS);
+    if (entry.v === VERSION && !retry) doneSet.add(stored[i]);
   }
   todo = library.filter(v => !doneSet.has(v.id)).map(v => [v.id, v.durationMs]);
   await Promise.all([
@@ -223,9 +231,11 @@ async function runBatch() {
 
   const finished = new Set();
   let videoSeconds = 0;
+  let transientStreak = 0;
+  let stopReason = null;
   let next = 0;
   async function worker() {
-    while (next < todo.length && Date.now() < deadline - START_MARGIN_S * 1000) {
+    while (!stopReason && next < todo.length && Date.now() < deadline - START_MARGIN_S * 1000) {
       const [id, durationMs] = todo[next++];
       const videoStart = Date.now();
       let result;
@@ -233,9 +243,16 @@ async function runBatch() {
         result = await analyzeVideo(id, durationMs, token, started + HARD_STOP_S * 1000);
       } catch (err) {
         if (err instanceof OutOfTime) continue; // left in the to-do list for next run
+        if (err.transient) {
+          // Not the file's fault: leave it for a later run, and stop early if
+          // Drive keeps refusing rather than burning through the list.
+          if (++transientStreak >= STOP_AFTER_TRANSIENT && !stopReason) stopReason = err.message;
+          continue;
+        }
         console.log(`analyze ${id.slice(0, 6)}… failed: ${err.message}`);
-        result = { v: VERSION, failed: true, at: Date.now(), peaks: [] };
+        result = { v: VERSION, failed: true, permanent: true, at: Date.now(), peaks: [] };
       }
+      transientStreak = 0;
       await kvCommand(['HSET', PEAKS_KEY, id, JSON.stringify(result)]);
       finished.add(id);
       videoSeconds += (Date.now() - videoStart) / 1000;
@@ -254,6 +271,7 @@ async function runBatch() {
     remaining: remaining.length,
     ranSeconds: ranS,
     secondsPerVideo: finished.size ? Math.round(videoSeconds / finished.size) : null,
+    stopReason,
   };
 }
 
@@ -278,7 +296,8 @@ export default async function handler(req) {
     console.log(result.capped
       ? `analyze run: daily cap reached (${DAILY_MINUTES} min)`
       : `analyze run: ${result.analyzed} analysed in ${result.ranSeconds} s `
-        + `(~${result.secondsPerVideo} s per video, ${PARALLEL} at once), ${result.remaining} left`);
+        + `(~${result.secondsPerVideo} s per video, ${PARALLEL} at once), ${result.remaining} left`
+        + (result.stopReason ? `; stopped early, Drive refusing: ${result.stopReason}` : ''));
     return json(result);
   } finally {
     await kvCommand(['DEL', LOCK_KEY]).catch(() => {});

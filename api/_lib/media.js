@@ -16,6 +16,18 @@ export function authHeader(token) {
 
 const probeCache = new Map(); // file id -> { hasAudio, fps, duration }
 
+// Why ffmpeg couldn't read a file. HTTP / network trouble (Drive refusing
+// or rate-limiting, timeouts) is marked transient - worth retrying later -
+// as opposed to a file that genuinely has no readable video.
+const TRANSIENT_RE = /HTTP error|Server returned|4\d\d |5\d\d |Connection|timed out|Input\/output error|Network is unreachable|Temporary failure/i;
+function probeError(stderr) {
+  const lines = stderr.trim().split('\n').filter(l => !/^\s*(built with|configuration:|lib\w+ )/.test(l));
+  const detail = (lines.filter(l => /error|returned|failed|invalid/i.test(l)).pop() || lines.pop() || '').trim().slice(0, 200);
+  const err = new Error(`no video stream${detail ? `: ${detail}` : ''}`);
+  err.transient = TRANSIENT_RE.test(stderr);
+  return err;
+}
+
 // A file's audio presence, frame rate and duration (seconds), from ffmpeg's
 // stream listing - reads only the container header.
 export function probeInfo(id, token) {
@@ -28,7 +40,7 @@ export function probeInfo(id, token) {
     ff.on('error', reject);
     ff.on('close', () => {
       const videoLine = (/Stream #0:\d+[^:]*: Video:.*/.exec(stderr) || [])[0];
-      if (!videoLine) return reject(new Error('no video stream'));
+      if (!videoLine) return reject(probeError(stderr));
       const rate = /([\d.]+) fps/.exec(videoLine) || /([\d.]+) tbr/.exec(videoLine);
       const dur = /Duration: (\d+):(\d+):([\d.]+)/.exec(stderr);
       const info = {
