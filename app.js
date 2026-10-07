@@ -7,10 +7,10 @@ const VIDEO_MIME_TYPES = [
   'video/quicktime', 'video/x-msvideo', 'video/mpeg',
   'video/3gpp', 'video/x-flv', 'video/x-ms-wmv'
 ];
-const APP_VERSION = 'v27';
+const APP_VERSION = 'v28';
 const BROWSE_BATCH = 50;
 // Where api/ (stream, thumbnails, tags) is served from.
-const API_BASE = 'https://random-vid-pick.vercel.app';
+const API_BASE = 'https://randomvidpick-139266625585.us-east1.run.app';
 const META_URL = `${API_BASE}/api/meta`;
 const RECENT_MS      = 30 * 24 * 3600 * 1000; // "recently watched" = past month
 
