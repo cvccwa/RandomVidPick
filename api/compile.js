@@ -5,7 +5,7 @@ import { isAuthorized, ID_RE } from './_lib/auth.js';
 // Compilation mode: random ~10s clips from many videos, played back to back
 // in VLC as one HLS stream.
 //
-//   POST /api/compile   {clips: [{id, d, w, h}], mode}  -> {url}   (owner only)
+//   POST /api/compile   {clips: [{id, d, w, h}], mode, res, fps}  -> {url}   (owner only)
 //   GET  /api/compile/playlist.m3u8?s=SESSION
 //   GET  /api/compile/seg.ts?s=SESSION&n=INDEX
 //
@@ -14,11 +14,12 @@ import { isAuthorized, ID_RE } from './_lib/auth.js';
 //   no CPU - but clips keep their own codec/resolution/timing, so a
 //   discontinuity tag sits between them and VLC visibly resets at each one.
 // - smooth: each clip is re-encoded to one format for the whole compilation
-//   (same resolution, 30 fps, H.264 + AAC stereo) and to exactly CLIP_S
-//   seconds on one continuous timeline, so playback runs straight through
-//   and seeking lines up. The resolution is fixed per compilation (auto
-//   picks what most of its clips are; see pickHeight). While one clip is
-//   being served, the next is already encoding.
+//   (same resolution and frame rate, H.264 + AAC stereo) and to exactly
+//   CLIP_S seconds on one continuous timeline, so playback runs straight
+//   through and seeking lines up. Resolution and frame rate are fixed per
+//   compilation, each chosen or Auto (what most of its clips are; see
+//   pickHeight / pickFps). While one clip is served, the next ones are
+//   already encoding.
 //
 // The session id is a long random token, so knowing it is what grants access
 // to the playlist and segments (VLC can't send headers); it lives in KV for
@@ -33,7 +34,8 @@ const SEGMENT_TRIES  = 3;          // a broken source is swapped for another cli
 const DRIVE_API      = process.env.DRIVE_API_BASE || 'https://www.googleapis.com';
 const FFMPEG         = process.env.FFMPEG_PATH || 'ffmpeg';
 const SID_RE         = /^[\w-]{40,64}$/;
-const MODES          = new Set(['original', 'auto', '2160', '1440', '1080']);
+const RES_OPTIONS    = new Set(['auto', '2160', '1440', '1080']);
+const FPS_OPTIONS    = new Set(['auto', '60', '30']);
 
 const CORS = {
   'Access-Control-Allow-Origin':  ALLOWED_ORIGIN,
@@ -73,13 +75,27 @@ function classOf(w, h) {
   return short >= 2000 ? 2160 : short >= 1300 ? 1440 : 1080;
 }
 
-function pickHeight(mode, pool) {
-  if (mode !== 'auto') return Number(mode);
+function pickHeight(res, pool) {
+  if (res !== 'auto') return Number(res);
   const known = pool.filter(c => c.w > 0 && c.h > 0).map(c => classOf(c.w, c.h));
   for (const h of [2160, 1440]) {
     if (known.length && known.filter(k => k >= h).length * 2 >= known.length) return h;
   }
   return 1080;
+}
+
+// Smooth-mode frame rate. Drive doesn't report it, so Auto reads it from the
+// first clips that will play (container header only) and uses 60 when at
+// least half of those are 50 fps or more. 4K stays at 30 under Auto - 4K60
+// is far more than the compile service can encode in real time.
+const FPS_SAMPLE = 6;
+async function pickFps(fps, height, picked) {
+  if (fps !== 'auto') return Number(fps);
+  if (height >= 2160) return 30;
+  const token = await getServiceAccountToken();
+  const rates = (await Promise.all(picked.slice(0, FPS_SAMPLE).map(c =>
+    probeInfo(c.id, token).then(info => info.fps, () => 0)))).filter(r => r > 0);
+  return rates.length && rates.filter(r => r >= 47).length * 2 >= rates.length ? 60 : 30;
 }
 
 async function createSession(req) {
@@ -91,7 +107,11 @@ async function createSession(req) {
     return json({ error: 'bad json' }, 400);
   }
   const { clips } = body;
-  const mode = MODES.has(body.mode) ? body.mode : 'original';
+  // Older clients sent the resolution as the mode ('auto', '1080', ...).
+  const legacyRes = RES_OPTIONS.has(body.mode);
+  const smooth    = body.mode === 'smooth' || legacyRes;
+  const res       = RES_OPTIONS.has(body.res) ? body.res : legacyRes ? body.mode : 'auto';
+  const fpsChoice = FPS_OPTIONS.has(body.fps) ? body.fps : 'auto';
   if (!Array.isArray(clips) || !clips.length || clips.length > MAX_INPUT) {
     return json({ error: 'bad clips' }, 400);
   }
@@ -111,10 +131,12 @@ async function createSession(req) {
     [pool[i], pool[j]] = [pool[j], pool[i]];
   }
   const picked = pool.slice(0, MAX_CLIPS);
+  const height = smooth ? pickHeight(res, picked) : null;
   const session = {
-    mode:   mode === 'original' ? 'original' : 'smooth',
-    height: mode === 'original' ? null : pickHeight(mode, picked),
-    clips:  picked.map(c => ({ id: c.id, s: Math.round(pickStart(c.d) * 10) / 10 })),
+    mode:  smooth ? 'smooth' : 'original',
+    height,
+    fps:   smooth ? await pickFps(fpsChoice, height, picked) : null,
+    clips: picked.map(c => ({ id: c.id, s: Math.round(pickStart(c.d) * 10) / 10 })),
   };
 
   const sid = b64url(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))));
@@ -128,6 +150,7 @@ async function createSession(req) {
     clips:  session.clips.length,
     mode:   session.mode,
     height: session.height,
+    fps:    session.fps,
   });
 }
 
@@ -276,15 +299,14 @@ async function originalSegment(clips, n, signal) {
 }
 
 // ─── SMOOTH MODE ──────────────────────────────────────────────────────────────
-const SMOOTH_FPS     = 30;
 const MIN_SEGMENT_B  = 128 * 1024; // less than this from an encode = it failed
-const audioCache     = new Map();  // file id -> has an audio stream
+const probeCache     = new Map();  // file id -> { hasAudio, fps }
 
-// Whether a file has audio, from ffmpeg's stream listing (reads only the
-// container header). Clips without audio get silence instead, so every
-// segment has the same tracks.
-function probeAudio(id, token) {
-  if (audioCache.has(id)) return Promise.resolve(audioCache.get(id));
+// A file's audio presence and frame rate, from ffmpeg's stream listing
+// (reads only the container header). Clips without audio get silence
+// instead, so every segment has the same tracks.
+function probeInfo(id, token) {
+  if (probeCache.has(id)) return Promise.resolve(probeCache.get(id));
   return new Promise((resolve, reject) => {
     const ff = spawn(FFMPEG, ['-hide_banner', '-headers', `Authorization: Bearer ${token}\r\n`, '-i', driveUrl(id)],
       { stdio: ['ignore', 'ignore', 'pipe'] });
@@ -292,22 +314,38 @@ function probeAudio(id, token) {
     ff.stderr.on('data', d => { if (stderr.length < 20000) stderr += d; });
     ff.on('error', reject);
     ff.on('close', () => {
-      if (!/Stream #0:\d+[^:]*: Video:/.test(stderr)) return reject(new Error('no video stream'));
-      const hasAudio = /Stream #0:\d+[^:]*: Audio:/.test(stderr);
-      if (audioCache.size > 500) audioCache.delete(audioCache.keys().next().value);
-      audioCache.set(id, hasAudio);
-      resolve(hasAudio);
+      const videoLine = (/Stream #0:\d+[^:]*: Video:.*/.exec(stderr) || [])[0];
+      if (!videoLine) return reject(new Error('no video stream'));
+      const rate = /([\d.]+) fps/.exec(videoLine) || /([\d.]+) tbr/.exec(videoLine);
+      const info = { hasAudio: /Stream #0:\d+[^:]*: Audio:/.test(stderr), fps: rate ? Number(rate[1]) : 0 };
+      if (probeCache.size > 500) probeCache.delete(probeCache.keys().next().value);
+      probeCache.set(id, info);
+      resolve(info);
     });
   });
 }
 
-function smoothArgs(clip, n, height, token, hasAudio) {
+// Encoder speed/size by workload (pixels per second). veryfast keeps
+// 1080p30 well ahead of real time; heavier outputs use faster presets so
+// the encode keeps up, at the cost of more bits - capped by maxrate so
+// data use stays bounded.
+const MAXRATE_MBPS = { 1080: 12, 1440: 20, 2160: 35 };
+function encoderFor(height, fps) {
+  const pixelRate = Math.round(height * 16 / 9) * height * fps;
+  const preset = pixelRate <= 130e6 ? 'veryfast' : pixelRate <= 260e6 ? 'superfast' : 'ultrafast';
+  const maxrate = Math.round((MAXRATE_MBPS[height] || 12) * (fps > 30 ? 1.5 : 1));
+  return ['-preset', preset, '-crf', '20', '-maxrate', `${maxrate}M`, '-bufsize', `${maxrate * 2}M`];
+}
+
+function smoothArgs(clip, n, session, token, hasAudio) {
+  const { height } = session;
+  const fps = session.fps || 30;
   const width = Math.round(height * 16 / 9);
   // Fit inside the frame (letterbox/pillarbox, never crop), fixed fps, and
   // pad short sources with their last frame / silence so every segment is
   // exactly CLIP_S long.
   const video = `[0:v:0]scale=${width}:${height}:force_original_aspect_ratio=decrease,`
-    + `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=${SMOOTH_FPS},`
+    + `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=${fps},`
     + `format=yuv420p,tpad=stop_mode=clone:stop_duration=${CLIP_S}[v]`;
   const audio = `[${hasAudio ? '0:a:0' : '1:a'}]aresample=48000,aformat=channel_layouts=stereo,apad[a]`;
   return [
@@ -319,8 +357,8 @@ function smoothArgs(clip, n, height, token, hasAudio) {
     '-filter_complex', `${video};${audio}`,
     '-map', '[v]', '-map', '[a]',
     '-t', String(CLIP_S),
-    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-profile:v', 'high',
-    '-g', String(SMOOTH_FPS * 2),
+    '-c:v', 'libx264', ...encoderFor(height, fps), '-profile:v', 'high',
+    '-g', String(fps * 2),
     '-c:a', 'aac', '-b:a', '160k',
     // Segment n sits at n*CLIP_S on one shared timeline - no discontinuities.
     '-output_ts_offset', String(n * CLIP_S),
@@ -334,55 +372,56 @@ function smoothArgs(clip, n, height, token, hasAudio) {
 // segment is ~10-35 MB) so a request arriving mid-encode gets what's done so
 // far and then the rest as it comes.
 const jobs = new Map(); // `${sid}:${n}` -> job
+const ENCODE_AHEAD = 2;
 
-function startJob(sid, session, n) {
+// At most two encodes run at once so they don't starve each other; the
+// segment VLC is waiting for jumps the queue ahead of encode-ahead work.
+const MAX_PARALLEL_ENCODES = 2;
+let encodesRunning = 0;
+const encodeWaiters = []; // resolve fns, front = next to run
+
+function acquireEncodeSlot(job, urgent) {
+  return new Promise(resolve => {
+    if (encodesRunning < MAX_PARALLEL_ENCODES) { encodesRunning++; resolve(true); return; }
+    job.waiter = resolve;
+    if (urgent) encodeWaiters.unshift(resolve); else encodeWaiters.push(resolve);
+  });
+}
+function releaseEncodeSlot() {
+  const next = encodeWaiters.shift();
+  if (next) next(true); else encodesRunning--;
+}
+function promoteWaiter(job) {
+  const i = encodeWaiters.indexOf(job.waiter);
+  if (i > 0) { encodeWaiters.splice(i, 1); encodeWaiters.unshift(job.waiter); }
+}
+function dropWaiter(job) {
+  const i = encodeWaiters.indexOf(job.waiter);
+  if (i >= 0) { encodeWaiters.splice(i, 1); job.waiter(false); }
+}
+
+function startJob(sid, session, n, urgent) {
   const key = `${sid}:${n}`;
-  if (jobs.has(key)) return jobs.get(key);
-  const job = { chunks: [], done: false, failed: false, listeners: new Set(), kill: () => {} };
+  if (jobs.has(key)) {
+    const existing = jobs.get(key);
+    if (urgent) promoteWaiter(existing);
+    return existing;
+  }
+  const job = { chunks: [], done: false, failed: false, listeners: new Set(), kill: () => {}, waiter: null };
   jobs.set(key, job);
   const emit = () => job.listeners.forEach(fn => fn());
 
   (async () => {
-    const token = await getServiceAccountToken();
-    for (const i of fallbackOrder(session.clips, n)) {
-      if (job.cancelled) break;
-      const clip = session.clips[i];
-      try {
-        const hasAudio = await probeAudio(clip.id, token);
-        const ok = await new Promise(resolve => {
-          const ff = spawn(FFMPEG, smoothArgs(clip, n, session.height, token, hasAudio),
-            { stdio: ['ignore', 'pipe', 'pipe'] });
-          job.kill = () => ff.kill('SIGKILL');
-          let stderr = '';
-          let size = 0;
-          const pending = [];
-          let released = false;
-          ff.stderr.on('data', d => { if (stderr.length < 4000) stderr += d; });
-          ff.stdout.on('data', c => {
-            size += c.length;
-            // Hold output back until it's clearly a real encode, so a failed
-            // source can still be swapped without the viewer seeing it.
-            if (released) { job.chunks.push(c); emit(); return; }
-            pending.push(c);
-            if (size >= MIN_SEGMENT_B) { released = true; job.chunks.push(...pending); emit(); }
-          });
-          ff.on('error', () => resolve(false));
-          ff.on('close', code => {
-            if (!released && code === 0 && size > 0) { released = true; job.chunks.push(...pending); }
-            if (!released) console.log(`compile smooth clip ${i} failed: exit ${code} ${stderr.trim().slice(0, 200)}`);
-            resolve(released);
-          });
-        });
-        if (ok) { job.done = true; emit(); return; }
-      } catch (err) {
-        console.log(`compile smooth clip ${i} failed: ${err.message}`);
-      }
+    const got = await acquireEncodeSlot(job, urgent);
+    job.waiter = null;
+    if (!got) throw new Error('cancelled before start');
+    try {
+      await runJob(job, session, n, emit);
+    } finally {
+      releaseEncodeSlot();
     }
-    job.failed = true;
-    job.done = true;
-    emit();
   })().catch(err => {
-    console.log(`compile smooth job failed: ${err.message}`);
+    if (!job.cancelled) console.log(`compile smooth job failed: ${err.message}`);
     job.failed = true;
     job.done = true;
     emit();
@@ -390,14 +429,57 @@ function startJob(sid, session, n) {
   return job;
 }
 
+async function runJob(job, session, n, emit) {
+  const token = await getServiceAccountToken();
+  for (const i of fallbackOrder(session.clips, n)) {
+    if (job.cancelled) break;
+    const clip = session.clips[i];
+    try {
+      const { hasAudio } = await probeInfo(clip.id, token);
+      if (job.cancelled) break;
+      const ok = await new Promise(resolve => {
+        const ff = spawn(FFMPEG, smoothArgs(clip, n, session, token, hasAudio),
+          { stdio: ['ignore', 'pipe', 'pipe'] });
+        job.kill = () => ff.kill('SIGKILL');
+        let stderr = '';
+        let size = 0;
+        const pending = [];
+        let released = false;
+        ff.stderr.on('data', d => { if (stderr.length < 4000) stderr += d; });
+        ff.stdout.on('data', c => {
+          size += c.length;
+          // Hold output back until it's clearly a real encode, so a failed
+          // source can still be swapped without the viewer seeing it.
+          if (released) { job.chunks.push(c); emit(); return; }
+          pending.push(c);
+          if (size >= MIN_SEGMENT_B) { released = true; job.chunks.push(...pending); emit(); }
+        });
+        ff.on('error', () => resolve(false));
+        ff.on('close', code => {
+          if (!released && code === 0 && size > 0) { released = true; job.chunks.push(...pending); }
+          if (!released && !job.cancelled) console.log(`compile smooth clip ${i} failed: exit ${code} ${stderr.trim().slice(0, 200)}`);
+          resolve(released);
+        });
+      });
+      if (ok) { job.done = true; emit(); return; }
+    } catch (err) {
+      console.log(`compile smooth clip ${i} failed: ${err.message}`);
+    }
+  }
+  job.failed = true;
+  job.done = true;
+  emit();
+}
+
 // Keep only jobs near where this viewer is now; a seek abandons the rest.
 function pruneJobs(sid, n) {
   for (const [key, job] of jobs) {
     const [jsid, jn] = key.split(':');
-    const stale = jsid === sid ? (Number(jn) < n - 1 || Number(jn) > n + 1) : jobs.size > 8;
+    const stale = jsid === sid ? (Number(jn) < n - 1 || Number(jn) > n + ENCODE_AHEAD) : jobs.size > 8;
     if (stale) {
       job.cancelled = true;
-      if (!job.done) job.kill();
+      if (job.waiter) dropWaiter(job);
+      else if (!job.done) job.kill();
       jobs.delete(key);
     }
   }
@@ -405,8 +487,10 @@ function pruneJobs(sid, n) {
 
 function smoothSegment(sid, session, n) {
   pruneJobs(sid, n);
-  const job = startJob(sid, session, n);
-  if (n + 1 < session.clips.length) startJob(sid, session, n + 1); // encode ahead
+  const job = startJob(sid, session, n, true);
+  for (let k = 1; k <= ENCODE_AHEAD && n + k < session.clips.length; k++) {
+    startJob(sid, session, n + k, false); // encode ahead
+  }
 
   return new Promise(resolve => {
     let answered = false;
