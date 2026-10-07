@@ -7,7 +7,7 @@ const VIDEO_MIME_TYPES = [
   'video/quicktime', 'video/x-msvideo', 'video/mpeg',
   'video/3gpp', 'video/x-flv', 'video/x-ms-wmv'
 ];
-const APP_VERSION = 'v34';
+const APP_VERSION = 'v35';
 const BROWSE_BATCH = 50;
 // Where api/ (stream, thumbnails, tags) is served from.
 const API_BASE = 'https://randomvidpick-139266625585.us-east1.run.app';
@@ -96,7 +96,9 @@ function signOut() {
   accessToken = null;
   lastPicked  = null;
   videoCache  = null;
+  pendingLibrary = null;
   localStorage.removeItem('rvp_token');
+  localStorage.removeItem(LIBRARY_CACHE_KEY);
   localStorage.removeItem('rvp_token_expiry');
   updateUI(false);
 }
@@ -222,58 +224,87 @@ async function driveRequest(url) {
   return res.json();
 }
 
-async function collectVideos(folderId, pathSoFar = '') {
-  const videos = [];
-  let pageToken = null;
+// Walks the library folder tree with several Drive requests in flight at
+// once (each folder's videos and subfolders are listed together, and
+// sibling folders in parallel) - a one-request-at-a-time walk took 10+ s.
+const DRIVE_PARALLEL = 8;
+const VIDEO_FIELDS   = 'nextPageToken,files(id,name,createdTime,size,videoMediaMetadata(durationMillis,width,height))';
 
-  do {
-    const mimeQuery = VIDEO_MIME_TYPES.map(m => `mimeType='${m}'`).join(' or ');
-    let url = `https://www.googleapis.com/drive/v3/files`
-      + `?q=(${mimeQuery}) and '${folderId}' in parents and trashed=false`
-      + `&fields=nextPageToken,files(id,name,createdTime,size,videoMediaMetadata(durationMillis,width,height))`
-      + `&pageSize=1000`;
-    if (pageToken) url += `&pageToken=${pageToken}`;
-    const data = await driveRequest(url);
-    if (data.files) {
-      for (const f of data.files) {
-        const driveMs = Number(f.videoMediaMetadata && f.videoMediaMetadata.durationMillis);
+async function collectVideos(rootId) {
+  const videos = [];
+  let active = 0;
+  const waiting = [];
+  const acquire = () => (active < DRIVE_PARALLEL
+    ? (active++, Promise.resolve())
+    : new Promise(resolve => waiting.push(resolve)));
+  const release = () => { const next = waiting.shift(); if (next) next(); else active--; };
+
+  async function listAll(query, fields, onFile) {
+    let pageToken = null;
+    do {
+      let url = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}`
+        + `&fields=${encodeURIComponent(fields)}&pageSize=1000`;
+      if (pageToken) url += `&pageToken=${encodeURIComponent(pageToken)}`;
+      await acquire();
+      let data;
+      try { data = await driveRequest(url); } finally { release(); }
+      (data.files || []).forEach(onFile);
+      pageToken = data.nextPageToken || null;
+    } while (pageToken);
+  }
+
+  const mimeQuery = VIDEO_MIME_TYPES.map(m => `mimeType='${m}'`).join(' or ');
+  async function walk(folderId, path) {
+    const subfolders = [];
+    await Promise.all([
+      listAll(`(${mimeQuery}) and '${folderId}' in parents and trashed=false`, VIDEO_FIELDS, f => {
+        const meta = f.videoMediaMetadata || {};
+        const driveMs = Number(meta.durationMillis);
         videos.push({
           id:         f.id,
           name:       f.name,
-          path:       pathSoFar,
+          path,
           created:    Date.parse(f.createdTime) || 0,
           size:       Number(f.size) || 0,
           // Drive only knows duration for videos it finished processing;
           // the rest get filled in from KV (loadMeta) or measured in-browser.
           durationMs: driveMs > 0 ? driveMs : null,
           // Lets smooth compilations pick an output resolution.
-          width:      Number(f.videoMediaMetadata && f.videoMediaMetadata.width) || 0,
-          height:     Number(f.videoMediaMetadata && f.videoMediaMetadata.height) || 0,
+          width:      Number(meta.width) || 0,
+          height:     Number(meta.height) || 0,
         });
-      }
-    }
-    pageToken = data.nextPageToken || null;
-  } while (pageToken);
+      }),
+      listAll(`mimeType='application/vnd.google-apps.folder' and '${folderId}' in parents and trashed=false`,
+        'nextPageToken,files(id,name)', f => subfolders.push(f)),
+    ]);
+    await Promise.all(subfolders.map(f => walk(f.id, path ? `${path} / ${f.name}` : f.name)));
+  }
 
-  let subPageToken = null;
-  do {
-    let url = `https://www.googleapis.com/drive/v3/files`
-      + `?q=mimeType='application/vnd.google-apps.folder' and '${folderId}' in parents and trashed=false`
-      + `&fields=nextPageToken,files(id,name)`
-      + `&pageSize=1000`;
-    if (subPageToken) url += `&pageToken=${subPageToken}`;
-    const data = await driveRequest(url);
-    if (data.files) {
-      for (const folder of data.files) {
-        const subPath = pathSoFar ? `${pathSoFar} / ${folder.name}` : folder.name;
-        const subVideos = await collectVideos(folder.id, subPath);
-        videos.push(...subVideos);
-      }
-    }
-    subPageToken = data.nextPageToken || null;
-  } while (subPageToken);
-
+  await walk(rootId, '');
   return videos;
+}
+
+// The last scan is kept on the device so the library opens instantly; a
+// fresh scan then runs in the background (see refreshLibraryInBackground).
+const LIBRARY_CACHE_KEY = 'rvp_library';
+
+function loadLibraryCache() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(LIBRARY_CACHE_KEY) || 'null');
+    return saved && Array.isArray(saved.videos) ? saved.videos : null;
+  } catch (err) {
+    return null;
+  }
+}
+
+function saveLibraryCache(videos) {
+  try {
+    localStorage.setItem(LIBRARY_CACHE_KEY, JSON.stringify({ savedAt: Date.now(), videos }));
+  } catch (err) { /* full or private mode - the next open just scans again */ }
+}
+
+function librarySignature(videos) {
+  return videos.map(v => `${v.id}\u0001${v.name}\u0001${v.path}`).sort().join('\u0002');
 }
 
 // ─── META (durations + watched history, stored in KV via /api/meta) ──────────
@@ -1200,12 +1231,18 @@ function renderNextBatch() {
   browseGrid.insertBefore(frag, browseSentinel);
 
   browseRendered += slice.length;
-  browseCount.textContent = `Showing ${browseRendered} of ${browseFiltered.length} · Long-press a video to tag it`;
+  updateBrowseCount();
 
   if (browseRendered >= browseFiltered.length && browseObserver) {
     browseObserver.disconnect();
     browseObserver = null;
   }
+}
+
+function updateBrowseCount() {
+  const update = pendingLibrary ? ' · Library updated, tap to refresh' : ' · Long-press a video to tag it';
+  browseCount.textContent = `Showing ${browseRendered} of ${browseFiltered.length}${update}`;
+  browseCount.classList.toggle('has-update', Boolean(pendingLibrary));
 }
 
 function resetBrowseGrid(list) {
@@ -1237,10 +1274,16 @@ function resetBrowseGrid(list) {
 async function openBrowseView() {
   browseBtn.disabled = true;
   try {
+    let usedCache = false;
+    if (!videoCache) {
+      videoCache = loadLibraryCache();
+      usedCache = Boolean(videoCache);
+    }
     if (!videoCache) {
       pickingOverlay.classList.add('visible');
       setStatus('Scanning library...', 'loading');
       videoCache = await collectVideos(ROOT_FOLDER);
+      saveLibraryCache(videoCache);
       pickingOverlay.classList.remove('visible');
       setStatus('Signed in', 'ready');
     }
@@ -1258,6 +1301,7 @@ async function openBrowseView() {
     refreshTagBar();
     refreshBrowse();
     browseView.classList.add('visible');
+    if (usedCache) refreshLibraryInBackground();
   } catch (err) {
     pickingOverlay.classList.remove('visible');
     setStatus(err.message || 'Something went wrong', 'error');
@@ -1265,6 +1309,42 @@ async function openBrowseView() {
     browseBtn.disabled = false;
   }
 }
+
+// After opening from the saved copy, rescan quietly. If anything changed,
+// the count line offers the update rather than reshuffling the grid under
+// the viewer's finger.
+let pendingLibrary = null;
+async function refreshLibraryInBackground() {
+  let fresh;
+  try {
+    fresh = await collectVideos(ROOT_FOLDER);
+  } catch (err) {
+    return; // offline or token trouble - keep showing the saved copy
+  }
+  if (!videoCache) return; // signed out meanwhile
+  // Keep durations learned since the last scan (KV, in-browser measuring).
+  const known = new Map(videoCache.map(v => [v.id, v]));
+  for (const v of fresh) {
+    const old = known.get(v.id);
+    if (old && !v.durationMs && old.durationMs) v.durationMs = old.durationMs;
+  }
+  saveLibraryCache(fresh);
+  if (librarySignature(fresh) === librarySignature(videoCache)) return;
+  pendingLibrary = fresh;
+  updateBrowseCount();
+}
+
+function applyPendingLibrary() {
+  if (!pendingLibrary) return;
+  videoCache = pendingLibrary;
+  pendingLibrary = null;
+  reshuffle();
+  populateFolderFilter();
+  refreshTagBar();
+  refreshBrowse();
+}
+
+browseCount.addEventListener('click', applyPendingLibrary);
 
 function closeBrowseView() {
   setSelectMode(false);
