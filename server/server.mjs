@@ -7,12 +7,14 @@ import stream from '../api/stream.js';
 import thumbnail from '../api/thumbnail.js';
 import meta from '../api/meta.js';
 import keepalive from '../api/keepalive.js';
+import sign from '../api/sign.js';
 
 const routes = {
   '/api/stream':    stream,
   '/api/thumbnail': thumbnail,
   '/api/meta':      meta,
   '/api/keepalive': keepalive,
+  '/api/sign':      sign,
 };
 
 function toRequest(req, url) {

@@ -7,7 +7,7 @@ const VIDEO_MIME_TYPES = [
   'video/quicktime', 'video/x-msvideo', 'video/mpeg',
   'video/3gpp', 'video/x-flv', 'video/x-ms-wmv'
 ];
-const APP_VERSION = 'v28';
+const APP_VERSION = 'v29';
 const BROWSE_BATCH = 50;
 // Where api/ (stream, thumbnails, tags) is served from.
 const API_BASE = 'https://randomvidpick-139266625585.us-east1.run.app';
@@ -483,21 +483,73 @@ async function saveTags(updates) {
   if (failed) alert(`Couldn't save tags for ${failed} video(s). Check your connection and try again.`);
 }
 
-// ─── VLC LAUNCH ───────────────────────────────────────────────────────────────
-function prewarmStream(fileId) {
-  return fetch(`${API_BASE}/api/stream?id=${encodeURIComponent(fileId)}`, {
-    method: 'HEAD',
-  }).catch(() => {});
+// ─── STREAM LINKS ─────────────────────────────────────────────────────────────
+// The server only streams signed links that expire (see api/sign.js), so
+// every stream URL comes from here. Links are cached until close to expiry,
+// and ids asked for in the same moment (e.g. a screenful of frame grabs)
+// are signed in one request.
+const SIGN_BATCH_MAX   = 200;
+const SIGN_REFRESH_MS  = 30 * 60 * 1000; // re-sign links with <30 min left
+const signedStreams    = new Map();      // id -> { url, exp }
+const signWaiters      = new Map();      // id -> [{ resolve, reject }]
+let signTimer = null;
+
+function streamUrl(id) {
+  const hit = signedStreams.get(id);
+  if (hit && hit.exp * 1000 - Date.now() > SIGN_REFRESH_MS) return Promise.resolve(hit.url);
+  return new Promise((resolve, reject) => {
+    if (!signWaiters.has(id)) signWaiters.set(id, []);
+    signWaiters.get(id).push({ resolve, reject });
+    if (!signTimer) signTimer = setTimeout(flushSignRequests, 20);
+  });
 }
 
-function openInVlc() {
-  if (!lastPicked) return;
-  markWatched(lastPicked.id);
-  const title = encodeURIComponent(displayName(lastPicked.name));
-  const id    = encodeURIComponent(lastPicked.id);
-  const host  = `${API_BASE.replace(/^https:\/\//, '')}/api/stream?id=${id}`;
+async function flushSignRequests() {
+  signTimer = null;
+  const batch = [...signWaiters].slice(0, SIGN_BATCH_MAX);
+  for (const [id] of batch) signWaiters.delete(id);
+  if (signWaiters.size) signTimer = setTimeout(flushSignRequests, 0);
+
+  try {
+    const res = await fetch(`${API_BASE}/api/sign`, {
+      method:  'POST',
+      headers: metaHeaders({ 'Content-Type': 'application/json' }),
+      body:    JSON.stringify({ ids: batch.map(([id]) => id) }),
+    });
+    if (!res.ok) throw new Error(`sign ${res.status}`);
+    const { exp, sigs } = await res.json();
+    for (const [id, waiters] of batch) {
+      if (!sigs[id]) { waiters.forEach(w => w.reject(new Error('unsigned'))); continue; }
+      const url = `${API_BASE}/api/stream?id=${encodeURIComponent(id)}&exp=${exp}&sig=${sigs[id]}`;
+      signedStreams.set(id, { url, exp: Number(exp) });
+      waiters.forEach(w => w.resolve(url));
+    }
+  } catch (err) {
+    for (const [, waiters] of batch) waiters.forEach(w => w.reject(err));
+  }
+}
+
+// ─── VLC LAUNCH ───────────────────────────────────────────────────────────────
+function prewarmStream(fileId) {
+  return streamUrl(fileId)
+    .then(url => fetch(url, { method: 'HEAD' }))
+    .catch(() => {});
+}
+
+async function openInVlc() {
+  const video = lastPicked;
+  if (!video) return;
+  let url;
+  try {
+    url = await streamUrl(video.id);
+  } catch (err) {
+    alert("Couldn't get a play link. Check your connection and try again.");
+    return;
+  }
+  markWatched(video.id);
+  const title = encodeURIComponent(displayName(video.name));
   window.location.href =
-    `intent://${host}` +
+    `intent://${url.replace(/^https:\/\//, '')}` +
     `#Intent;scheme=https;package=org.videolan.vlc;type=video%2F*` +
     `;S.title=${title};end`;
 }
@@ -923,7 +975,7 @@ async function streamLooksDown(id) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 15000);
   try {
-    const res = await fetch(`${API_BASE}/api/stream?id=${encodeURIComponent(id)}`, {
+    const res = await fetch(await streamUrl(id), {
       headers: { Range: 'bytes=0-0' },
       signal:  ctrl.signal,
     });
@@ -985,7 +1037,7 @@ function captureFrame(id) {
       }
     };
 
-    video.src = `${API_BASE}/api/stream?id=${encodeURIComponent(id)}`;
+    streamUrl(id).then(url => { video.src = url; }, () => fail('sign-failed'));
   });
 }
 
@@ -1021,7 +1073,7 @@ function pumpDurationProbes() {
   const timer = setTimeout(done, 20000);
   el.onloadedmetadata = () => { recordDuration(job.video.id, el.duration); done(); };
   el.onerror = done;
-  el.src = `${API_BASE}/api/stream?id=${encodeURIComponent(job.video.id)}`;
+  streamUrl(job.video.id).then(url => { el.src = url; }, done);
 }
 
 // id -> badge elements of the currently rendered card, so a duration learned
