@@ -39,11 +39,13 @@ const EXTENT_DROP    = 0.15;              // neighbours within this of a peak's 
 const WINDOW_S       = 2;
 const KEEP_PEAKS     = 5;
 const MIN_DURATION_S = 30;   // shorter videos just get random cuts
-const RUN_BUDGET_S   = 150;  // under Cloud Scheduler's default 180 s attempt deadline
-const START_MARGIN_S = 50;   // don't start a video this close to the deadline (long ones take ~40 s)
+const RUN_BUDGET_S   = 120;  // well under Cloud Scheduler's default 180 s attempt deadline
+const HARD_STOP_S    = 150;  // a video still running at this point is dropped and retried next run
+const START_MARGIN_S = 20;   // don't start a video this close to the deadline
 const DAILY_MINUTES  = Number(process.env.ANALYZE_DAILY_MINUTES) || 30;
 const DAY_KEY        = 'rvp:analyze:day:';
-const PARALLEL       = 6;    // videos at once; each runs one ffmpeg at a time
+const PARALLEL       = 6;    // videos at once
+const SAMPLE_PARALLEL = 4;   // samples per video at once - each spends most of its time waiting on Drive
 const RELIST_MS      = 3600e3;
 const RETRY_FAILED_MS = 7 * 86400e3; // a failure may have been a passing Drive error
 const MEASURE_TIMEOUT_MS = 30e3;
@@ -120,7 +122,16 @@ function ranks(values) {
   return out;
 }
 
-export async function analyzeVideo(id, durationMs, token) {
+// Runs async jobs with at most `limit` in flight.
+async function runLimited(jobs, limit) {
+  let next = 0;
+  const lane = async () => { while (next < jobs.length) await jobs[next++](); };
+  await Promise.all(Array.from({ length: Math.min(limit, jobs.length) }, lane));
+}
+
+class OutOfTime extends Error {}
+
+export async function analyzeVideo(id, durationMs, token, stopAt = Infinity) {
   const info = await probeInfo(id, token);
   const d = durationMs > 0 ? durationMs / 1000 : info.duration;
   if (!(d >= MIN_DURATION_S)) return { v: VERSION, d: Math.round(d || 0), peaks: [] };
@@ -131,24 +142,21 @@ export async function analyzeVideo(id, durationMs, token) {
   const step = span / count;
   const samples = [];
   const sampleAt = async t => {
+    if (Date.now() > stopAt) throw new OutOfTime('out of time');
     try {
       samples.push({ t, ...(await measure(id, t, token, info.hasAudio)) });
     } catch (err) { /* unreadable spot - skip it */ }
   };
 
   // Pass 1: evenly across the middle of the video.
-  for (let i = 0; i < count; i++) await sampleAt(lo + step * (i + 0.5));
+  await runLimited(Array.from({ length: count }, (_, i) => () => sampleAt(lo + step * (i + 0.5))), SAMPLE_PARALLEL);
   if (!samples.length) throw new Error('no samples measured');
   scoreSamples(samples);
 
   // Pass 2: around the best few spots, to find the peak inside each scene.
   const best = [...samples].sort((a, b) => b.score - a.score).slice(0, REFINE_TOP);
-  for (const s of best) {
-    for (const k of REFINE_OFFSETS) {
-      const t = s.t + k * step;
-      if (t >= lo && t <= lo + span) await sampleAt(t);
-    }
-  }
+  const refine = best.flatMap(s => REFINE_OFFSETS.map(k => s.t + k * step)).filter(t => t >= lo && t <= lo + span);
+  await runLimited(refine.map(t => () => sampleAt(t)), SAMPLE_PARALLEL);
   scoreSamples(samples);
 
   // Best first, spaced apart so the peaks aren't all one scene. Each peak
@@ -214,19 +222,23 @@ async function runBatch() {
   if (!todo.length) return { analyzed: 0, remaining: 0 };
 
   const finished = new Set();
+  let videoSeconds = 0;
   let next = 0;
   async function worker() {
     while (next < todo.length && Date.now() < deadline - START_MARGIN_S * 1000) {
       const [id, durationMs] = todo[next++];
+      const videoStart = Date.now();
       let result;
       try {
-        result = await analyzeVideo(id, durationMs, token);
+        result = await analyzeVideo(id, durationMs, token, started + HARD_STOP_S * 1000);
       } catch (err) {
+        if (err instanceof OutOfTime) continue; // left in the to-do list for next run
         console.log(`analyze ${id.slice(0, 6)}… failed: ${err.message}`);
         result = { v: VERSION, failed: true, at: Date.now(), peaks: [] };
       }
       await kvCommand(['HSET', PEAKS_KEY, id, JSON.stringify(result)]);
       finished.add(id);
+      videoSeconds += (Date.now() - videoStart) / 1000;
     }
   }
   await Promise.all(Array.from({ length: PARALLEL }, worker));
@@ -237,7 +249,12 @@ async function runBatch() {
     kvCommand(['SET', TODO_KEY, JSON.stringify(remaining)]),
     kvCommand(['INCRBY', dayKey, String(ranS)]).then(() => kvCommand(['EXPIRE', dayKey, String(2 * 86400)])),
   ]);
-  return { analyzed: finished.size, remaining: remaining.length, ranSeconds: ranS };
+  return {
+    analyzed: finished.size,
+    remaining: remaining.length,
+    ranSeconds: ranS,
+    secondsPerVideo: finished.size ? Math.round(videoSeconds / finished.size) : null,
+  };
 }
 
 export default async function handler(req) {
@@ -260,7 +277,8 @@ export default async function handler(req) {
     const result = await runBatch();
     console.log(result.capped
       ? `analyze run: daily cap reached (${DAILY_MINUTES} min)`
-      : `analyze run: ${result.analyzed} analysed, ${result.remaining} left`);
+      : `analyze run: ${result.analyzed} analysed in ${result.ranSeconds} s `
+        + `(~${result.secondsPerVideo} s per video, ${PARALLEL} at once), ${result.remaining} left`);
     return json(result);
   } finally {
     await kvCommand(['DEL', LOCK_KEY]).catch(() => {});
