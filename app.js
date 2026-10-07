@@ -7,7 +7,7 @@ const VIDEO_MIME_TYPES = [
   'video/quicktime', 'video/x-msvideo', 'video/mpeg',
   'video/3gpp', 'video/x-flv', 'video/x-ms-wmv'
 ];
-const APP_VERSION = 'v29';
+const APP_VERSION = 'v30';
 const BROWSE_BATCH = 50;
 // Where api/ (stream, thumbnails, tags) is served from.
 const API_BASE = 'https://randomvidpick-139266625585.us-east1.run.app';
@@ -62,6 +62,7 @@ const browseDir        = document.getElementById('browseDir');
 const browseFilter     = document.getElementById('browseFilter');
 const browseTagBar     = document.getElementById('browseTagBar');
 const browseRandomBtn  = document.getElementById('browseRandomBtn');
+const browseCompileBtn = document.getElementById('browseCompileBtn');
 const selectBar        = document.getElementById('selectBar');
 const selectCount      = document.getElementById('selectCount');
 const sheetBackdrop    = document.getElementById('sheetBackdrop');
@@ -547,11 +548,21 @@ async function openInVlc() {
     return;
   }
   markWatched(video.id);
-  const title = encodeURIComponent(displayName(video.name));
+  launchVlc(url, displayName(video.name));
+}
+
+function launchVlc(url, title) {
   window.location.href =
     `intent://${url.replace(/^https:\/\//, '')}` +
     `#Intent;scheme=https;package=org.videolan.vlc;type=video%2F*` +
-    `;S.title=${title};end`;
+    `;S.title=${encodeURIComponent(title)};end`;
+}
+
+// What the now-playing bar's VLC button re-sends: the last video, or the
+// last compilation.
+let nowPlayingAction = null;
+function replayNowPlaying() {
+  if (nowPlayingAction) nowPlayingAction();
 }
 
 // ─── BROWSE ───────────────────────────────────────────────────────────────────
@@ -1766,10 +1777,42 @@ browseRandomBtn.addEventListener('click', () => {
   playVideo(browseFiltered[Math.floor(Math.random() * browseFiltered.length)]);
 });
 
+// Compilation: random ~10s clips from everything in the current view, played
+// as one stream in VLC. The server picks, orders and cuts the clips (see
+// api/compile.js); durations help it cut from the middle of each video.
+browseCompileBtn.addEventListener('click', async () => {
+  if (!browseFiltered.length || browseCompileBtn.disabled) return;
+  browseCompileBtn.disabled = true;
+  lastPicked = null;
+  nowPlayingAction = null;
+  nowPlayingTitle.textContent = `Building compilation from ${browseFiltered.length} videos…`;
+  nowPlayingBtn.disabled = true;
+  nowPlaying.hidden = false;
+  try {
+    const res = await fetch(`${API_BASE}/api/compile`, {
+      method:  'POST',
+      headers: metaHeaders({ 'Content-Type': 'application/json' }),
+      body:    JSON.stringify({ clips: browseFiltered.map(v => ({ id: v.id, d: v.durationMs || 0 })) }),
+    });
+    if (!res.ok) throw new Error(`compile ${res.status}`);
+    const { url, clips } = await res.json();
+    const title = `Compilation · ${clips} clips`;
+    nowPlayingAction = () => launchVlc(url, title);
+    nowPlayingAction();
+    nowPlayingTitle.textContent = title;
+    nowPlayingBtn.disabled = false;
+  } catch (err) {
+    nowPlayingTitle.textContent = "Couldn't build a compilation. Try again.";
+  } finally {
+    browseCompileBtn.disabled = false;
+  }
+});
+
 // Stays in the library: the bar at the bottom shows what was last opened,
 // with a button to send it to VLC again if the first launch didn't take.
 async function playVideo(video) {
   lastPicked = video;
+  nowPlayingAction = openInVlc;
   nowPlayingTitle.textContent = `Warming stream… ${displayName(video.name)}`;
   nowPlayingBtn.disabled = true;
   nowPlaying.hidden = false;

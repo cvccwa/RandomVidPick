@@ -227,6 +227,7 @@
 
     .browse-search {
       flex: 1;
+      min-width: 0;
       background: var(--surface);
       border: 1px solid var(--border);
       border-radius: 4px;
@@ -685,8 +686,9 @@
 <div class="browse-view" id="browseView">
   <div class="browse-header">
     <button class="btn btn-secondary browse-back" id="browseSignOutBtn" onclick="confirmSignOut()">Sign out</button>
-    <input type="text" class="browse-search" id="browseSearch" placeholder="Search filename or folder..." />
+    <input type="text" class="browse-search" id="browseSearch" placeholder="Search..." />
     <button class="browse-dir browse-random" id="browseRandomBtn" type="button" aria-label="Play a random video from this view" title="Random from this view">🎲</button>
+    <button class="browse-dir browse-random" id="browseCompileBtn" type="button" aria-label="Play a compilation of clips from this view" title="Compilation from this view">🎬</button>
   </div>
   <div class="browse-controls">
     <select class="browse-select" id="browseSort" aria-label="Sort by">
@@ -707,7 +709,7 @@
   </div>
   <div class="now-playing" id="nowPlaying" hidden>
     <span class="now-playing-title" id="nowPlayingTitle"></span>
-    <button class="btn btn-secondary now-playing-btn" id="nowPlayingBtn" type="button" onclick="openInVlc()">&#9654; VLC</button>
+    <button class="btn btn-secondary now-playing-btn" id="nowPlayingBtn" type="button" onclick="replayNowPlaying()">&#9654; VLC</button>
   </div>
   <div class="select-bar" id="selectBar" hidden>
     <span class="select-count" id="selectCount">0 selected</span>

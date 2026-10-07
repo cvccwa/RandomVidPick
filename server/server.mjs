@@ -8,6 +8,7 @@ import thumbnail from '../api/thumbnail.js';
 import meta from '../api/meta.js';
 import keepalive from '../api/keepalive.js';
 import sign from '../api/sign.js';
+import compile from '../api/compile.js';
 
 const routes = {
   '/api/stream':    stream,
@@ -15,9 +16,16 @@ const routes = {
   '/api/meta':      meta,
   '/api/keepalive': keepalive,
   '/api/sign':      sign,
+  '/api/compile':   compile, // also serves /api/compile/*
 };
 
-function toRequest(req, url) {
+function findHandler(pathname) {
+  if (routes[pathname]) return routes[pathname];
+  const prefix = Object.keys(routes).find(r => pathname.startsWith(r + '/'));
+  return prefix ? routes[prefix] : null;
+}
+
+function toRequest(req, url, signal) {
   const headers = new Headers();
   for (const [name, value] of Object.entries(req.headers)) {
     if (value !== undefined) headers.set(name, Array.isArray(value) ? value.join(', ') : value);
@@ -28,19 +36,23 @@ function toRequest(req, url) {
     headers,
     body:    hasBody ? Readable.toWeb(req) : undefined,
     duplex:  hasBody ? 'half' : undefined,
+    signal,
   });
 }
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-  const handler = routes[url.pathname];
+  const handler = findHandler(url.pathname);
   if (!handler) {
     res.writeHead(url.pathname === '/' ? 200 : 404, { 'Content-Type': 'text/plain' });
     return res.end(url.pathname === '/' ? 'ok' : 'not found');
   }
 
   try {
-    const response = await handler(toRequest(req, url));
+    // Lets handlers stop upstream work (e.g. ffmpeg) when the viewer leaves.
+    const aborter = new AbortController();
+    res.on('close', () => aborter.abort());
+    const response = await handler(toRequest(req, url, aborter.signal));
     res.writeHead(response.status, Object.fromEntries(response.headers));
     if (!response.body || req.method === 'HEAD') return res.end();
 
