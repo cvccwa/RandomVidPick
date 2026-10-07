@@ -5,16 +5,24 @@ import { isAuthorized, ID_RE } from './_lib/auth.js';
 // Compilation mode: random ~10s clips from many videos, played back to back
 // in VLC as one HLS stream.
 //
-//   POST /api/compile               {clips: [{id, d}]}  -> {url}   (owner only)
+//   POST /api/compile   {clips: [{id, d, w, h}], mode}  -> {url}   (owner only)
 //   GET  /api/compile/playlist.m3u8?s=SESSION
 //   GET  /api/compile/seg.ts?s=SESSION&n=INDEX
 //
+// Two modes:
+// - original: each clip is cut with stream copy - untouched quality, almost
+//   no CPU - but clips keep their own codec/resolution/timing, so a
+//   discontinuity tag sits between them and VLC visibly resets at each one.
+// - smooth: each clip is re-encoded to one format for the whole compilation
+//   (same resolution, 30 fps, H.264 + AAC stereo) and to exactly CLIP_S
+//   seconds on one continuous timeline, so playback runs straight through
+//   and seeking lines up. The resolution is fixed per compilation (auto
+//   picks what most of its clips are; see pickHeight). While one clip is
+//   being served, the next is already encoding.
+//
 // The session id is a long random token, so knowing it is what grants access
 // to the playlist and segments (VLC can't send headers); it lives in KV for
-// SESSION_TTL_S. Each segment is cut on request by ffmpeg straight from
-// Drive with stream copy (no re-encode), so only ~10s of each source file is
-// ever fetched and CPU cost stays small. A discontinuity tag before every
-// segment lets VLC handle clips with different codecs/resolutions.
+// SESSION_TTL_S. Only ~CLIP_S seconds of each source file is ever fetched.
 
 const ALLOWED_ORIGIN = 'https://cvccwa.github.io';
 const CLIP_S         = 10;
@@ -25,6 +33,7 @@ const SEGMENT_TRIES  = 3;          // a broken source is swapped for another cli
 const DRIVE_API      = process.env.DRIVE_API_BASE || 'https://www.googleapis.com';
 const FFMPEG         = process.env.FFMPEG_PATH || 'ffmpeg';
 const SID_RE         = /^[\w-]{40,64}$/;
+const MODES          = new Set(['original', 'auto', '2160', '1440', '1080']);
 
 const CORS = {
   'Access-Control-Allow-Origin':  ALLOWED_ORIGIN,
@@ -40,6 +49,10 @@ function json(body, status = 200) {
   });
 }
 
+function driveUrl(id) {
+  return `${DRIVE_API}/drive/v3/files/${encodeURIComponent(id)}?alt=media`;
+}
+
 // Where in a video to cut: somewhere in the middle 80%, so intros/outros are
 // skipped. Unknown durations get an early-ish guess; a cut past the end just
 // fails and gets replaced by another clip.
@@ -51,32 +64,58 @@ function pickStart(durationMs) {
   return lo + Math.random() * Math.max(0, hi - lo);
 }
 
+// Smooth-mode output height. Videos are classed by their short side, so a
+// portrait 1080x1920 counts as 1080p. Auto takes the highest class that at
+// least half the (known) clips reach - a few 4K videos in a mostly-1080p
+// view don't make the whole compilation 4K.
+function classOf(w, h) {
+  const short = Math.min(w, h);
+  return short >= 2000 ? 2160 : short >= 1300 ? 1440 : 1080;
+}
+
+function pickHeight(mode, pool) {
+  if (mode !== 'auto') return Number(mode);
+  const known = pool.filter(c => c.w > 0 && c.h > 0).map(c => classOf(c.w, c.h));
+  for (const h of [2160, 1440]) {
+    if (known.length && known.filter(k => k >= h).length * 2 >= known.length) return h;
+  }
+  return 1080;
+}
+
 async function createSession(req) {
   if (!(await isAuthorized(req))) return json({ error: 'unauthorized' }, 401);
-  let clips;
+  let body;
   try {
-    clips = (await req.json()).clips;
+    body = await req.json();
   } catch (err) {
     return json({ error: 'bad json' }, 400);
   }
+  const { clips } = body;
+  const mode = MODES.has(body.mode) ? body.mode : 'original';
   if (!Array.isArray(clips) || !clips.length || clips.length > MAX_INPUT) {
     return json({ error: 'bad clips' }, 400);
   }
 
   // Dedupe, validate, shuffle, cap.
+  const num = v => (Number.isFinite(v) && v > 0 ? v : 0);
   const seen = new Set();
   const pool = [];
   for (const c of clips) {
     if (!c || typeof c.id !== 'string' || !ID_RE.test(c.id) || seen.has(c.id)) continue;
     seen.add(c.id);
-    pool.push({ id: c.id, d: Number.isFinite(c.d) ? c.d : 0 });
+    pool.push({ id: c.id, d: num(c.d), w: num(c.w), h: num(c.h) });
   }
   if (!pool.length) return json({ error: 'bad clips' }, 400);
   for (let i = pool.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
     [pool[i], pool[j]] = [pool[j], pool[i]];
   }
-  const session = pool.slice(0, MAX_CLIPS).map(c => ({ id: c.id, s: Math.round(pickStart(c.d) * 10) / 10 }));
+  const picked = pool.slice(0, MAX_CLIPS);
+  const session = {
+    mode:   mode === 'original' ? 'original' : 'smooth',
+    height: mode === 'original' ? null : pickHeight(mode, picked),
+    clips:  picked.map(c => ({ id: c.id, s: Math.round(pickStart(c.d) * 10) / 10 })),
+  };
 
   const sid = b64url(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))));
   await kvCommand(['SET', `rvp:comp:${sid}`, JSON.stringify(session), 'EX', SESSION_TTL_S]);
@@ -84,7 +123,12 @@ async function createSession(req) {
 
   const base = new URL(req.url);
   const proto = req.headers.get('x-forwarded-proto') || base.protocol.replace(':', '');
-  return json({ url: `${proto}://${base.host}/api/compile/playlist.m3u8?s=${sid}`, clips: session.length });
+  return json({
+    url:    `${proto}://${base.host}/api/compile/playlist.m3u8?s=${sid}`,
+    clips:  session.clips.length,
+    mode:   session.mode,
+    height: session.height,
+  });
 }
 
 // Sessions are read on every segment request; keep recent ones in memory.
@@ -94,24 +138,27 @@ async function loadSession(sid) {
   if (sessions.has(sid)) return sessions.get(sid);
   const raw = await kvCommand(['GET', `rvp:comp:${sid}`]);
   if (!raw) return null;
-  const session = JSON.parse(raw);
+  let session = JSON.parse(raw);
+  if (Array.isArray(session)) session = { mode: 'original', height: null, clips: session }; // pre-modes format
   if (sessions.size > 20) sessions.delete(sessions.keys().next().value);
   sessions.set(sid, session);
   return session;
 }
 
 function playlist(sid, session) {
+  const smooth = session.mode === 'smooth';
   const lines = [
     '#EXTM3U',
     '#EXT-X-VERSION:3',
     '#EXT-X-PLAYLIST-TYPE:VOD',
     // Stream copy starts each cut on the keyframe before the chosen point,
-    // so segments can run a few seconds over CLIP_S.
-    `#EXT-X-TARGETDURATION:${CLIP_S * 2}`,
+    // so original-mode segments can run a few seconds over CLIP_S.
+    `#EXT-X-TARGETDURATION:${smooth ? CLIP_S : CLIP_S * 2}`,
     '#EXT-X-MEDIA-SEQUENCE:0',
   ];
-  session.forEach((_, n) => {
-    lines.push('#EXT-X-DISCONTINUITY', `#EXTINF:${CLIP_S}.0,`, `seg.ts?s=${sid}&n=${n}`);
+  session.clips.forEach((_, n) => {
+    if (!smooth) lines.push('#EXT-X-DISCONTINUITY');
+    lines.push(`#EXTINF:${CLIP_S}.000,`, `seg.ts?s=${sid}&n=${n}`);
   });
   lines.push('#EXT-X-ENDLIST', '');
   return new Response(lines.join('\n'), {
@@ -119,6 +166,18 @@ function playlist(sid, session) {
   });
 }
 
+// The clip at n first, then a couple of random others from the session to
+// fall back on if its source won't cut.
+function fallbackOrder(clips, n) {
+  const order = [n];
+  while (order.length < SEGMENT_TRIES && order.length < clips.length) {
+    const alt = Math.floor(Math.random() * clips.length);
+    if (!order.includes(alt)) order.push(alt);
+  }
+  return order;
+}
+
+// ─── ORIGINAL MODE ────────────────────────────────────────────────────────────
 // Video codecs that stream-copy cleanly into MPEG-TS as-is. MPEG-4 Part 2
 // (older DivX/Xvid-style files) also works but needs its headers repeated
 // in-band (dump_extra) - a filter that would corrupt H.264/HEVC, so it is
@@ -187,18 +246,13 @@ async function openClip(clip, token, signal) {
   throw new Error(`unsupported codec ${cut.codec}`);
 }
 
-async function segment(session, n, signal) {
+async function originalSegment(clips, n, signal) {
   const token = await getServiceAccountToken();
   // Try the clip at n; if its source won't cut, fall back to other clips
   // from the same session so playback keeps going.
-  const order = [n];
-  while (order.length < SEGMENT_TRIES && order.length < session.length) {
-    const alt = Math.floor(Math.random() * session.length);
-    if (!order.includes(alt)) order.push(alt);
-  }
-  for (const i of order) {
+  for (const i of fallbackOrder(clips, n)) {
     try {
-      const { chunks, rest, kill } = await openClip(session[i], token, signal);
+      const { chunks, rest, kill } = await openClip(clips[i], token, signal);
       // Once the viewer disconnects (VLC seeks or closes) the stream is
       // cancelled; ffmpeg's remaining output must not touch it after that.
       let open = true;
@@ -219,6 +273,175 @@ async function segment(session, n, signal) {
     }
   }
   return new Response('clip unavailable', { status: 502 });
+}
+
+// ─── SMOOTH MODE ──────────────────────────────────────────────────────────────
+const SMOOTH_FPS     = 30;
+const MIN_SEGMENT_B  = 128 * 1024; // less than this from an encode = it failed
+const audioCache     = new Map();  // file id -> has an audio stream
+
+// Whether a file has audio, from ffmpeg's stream listing (reads only the
+// container header). Clips without audio get silence instead, so every
+// segment has the same tracks.
+function probeAudio(id, token) {
+  if (audioCache.has(id)) return Promise.resolve(audioCache.get(id));
+  return new Promise((resolve, reject) => {
+    const ff = spawn(FFMPEG, ['-hide_banner', '-headers', `Authorization: Bearer ${token}\r\n`, '-i', driveUrl(id)],
+      { stdio: ['ignore', 'ignore', 'pipe'] });
+    let stderr = '';
+    ff.stderr.on('data', d => { if (stderr.length < 20000) stderr += d; });
+    ff.on('error', reject);
+    ff.on('close', () => {
+      if (!/Stream #0:\d+[^:]*: Video:/.test(stderr)) return reject(new Error('no video stream'));
+      const hasAudio = /Stream #0:\d+[^:]*: Audio:/.test(stderr);
+      if (audioCache.size > 500) audioCache.delete(audioCache.keys().next().value);
+      audioCache.set(id, hasAudio);
+      resolve(hasAudio);
+    });
+  });
+}
+
+function smoothArgs(clip, n, height, token, hasAudio) {
+  const width = Math.round(height * 16 / 9);
+  // Fit inside the frame (letterbox/pillarbox, never crop), fixed fps, and
+  // pad short sources with their last frame / silence so every segment is
+  // exactly CLIP_S long.
+  const video = `[0:v:0]scale=${width}:${height}:force_original_aspect_ratio=decrease,`
+    + `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=${SMOOTH_FPS},`
+    + `format=yuv420p,tpad=stop_mode=clone:stop_duration=${CLIP_S}[v]`;
+  const audio = `[${hasAudio ? '0:a:0' : '1:a'}]aresample=48000,aformat=channel_layouts=stereo,apad[a]`;
+  return [
+    '-hide_banner', '-nostats', '-loglevel', 'error',
+    '-headers', `Authorization: Bearer ${token}\r\n`,
+    '-ss', String(clip.s),
+    '-i', driveUrl(clip.id),
+    ...(hasAudio ? [] : ['-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo']),
+    '-filter_complex', `${video};${audio}`,
+    '-map', '[v]', '-map', '[a]',
+    '-t', String(CLIP_S),
+    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-profile:v', 'high',
+    '-g', String(SMOOTH_FPS * 2),
+    '-c:a', 'aac', '-b:a', '160k',
+    // Segment n sits at n*CLIP_S on one shared timeline - no discontinuities.
+    '-output_ts_offset', String(n * CLIP_S),
+    '-f', 'mpegts',
+    'pipe:1',
+  ];
+}
+
+// One encode job per segment, shared between the request that wants it and
+// the encode-ahead that started it early. Output is kept in memory (a 10s
+// segment is ~10-35 MB) so a request arriving mid-encode gets what's done so
+// far and then the rest as it comes.
+const jobs = new Map(); // `${sid}:${n}` -> job
+
+function startJob(sid, session, n) {
+  const key = `${sid}:${n}`;
+  if (jobs.has(key)) return jobs.get(key);
+  const job = { chunks: [], done: false, failed: false, listeners: new Set(), kill: () => {} };
+  jobs.set(key, job);
+  const emit = () => job.listeners.forEach(fn => fn());
+
+  (async () => {
+    const token = await getServiceAccountToken();
+    for (const i of fallbackOrder(session.clips, n)) {
+      if (job.cancelled) break;
+      const clip = session.clips[i];
+      try {
+        const hasAudio = await probeAudio(clip.id, token);
+        const ok = await new Promise(resolve => {
+          const ff = spawn(FFMPEG, smoothArgs(clip, n, session.height, token, hasAudio),
+            { stdio: ['ignore', 'pipe', 'pipe'] });
+          job.kill = () => ff.kill('SIGKILL');
+          let stderr = '';
+          let size = 0;
+          const pending = [];
+          let released = false;
+          ff.stderr.on('data', d => { if (stderr.length < 4000) stderr += d; });
+          ff.stdout.on('data', c => {
+            size += c.length;
+            // Hold output back until it's clearly a real encode, so a failed
+            // source can still be swapped without the viewer seeing it.
+            if (released) { job.chunks.push(c); emit(); return; }
+            pending.push(c);
+            if (size >= MIN_SEGMENT_B) { released = true; job.chunks.push(...pending); emit(); }
+          });
+          ff.on('error', () => resolve(false));
+          ff.on('close', code => {
+            if (!released && code === 0 && size > 0) { released = true; job.chunks.push(...pending); }
+            if (!released) console.log(`compile smooth clip ${i} failed: exit ${code} ${stderr.trim().slice(0, 200)}`);
+            resolve(released);
+          });
+        });
+        if (ok) { job.done = true; emit(); return; }
+      } catch (err) {
+        console.log(`compile smooth clip ${i} failed: ${err.message}`);
+      }
+    }
+    job.failed = true;
+    job.done = true;
+    emit();
+  })().catch(err => {
+    console.log(`compile smooth job failed: ${err.message}`);
+    job.failed = true;
+    job.done = true;
+    emit();
+  });
+  return job;
+}
+
+// Keep only jobs near where this viewer is now; a seek abandons the rest.
+function pruneJobs(sid, n) {
+  for (const [key, job] of jobs) {
+    const [jsid, jn] = key.split(':');
+    const stale = jsid === sid ? (Number(jn) < n - 1 || Number(jn) > n + 1) : jobs.size > 8;
+    if (stale) {
+      job.cancelled = true;
+      if (!job.done) job.kill();
+      jobs.delete(key);
+    }
+  }
+}
+
+function smoothSegment(sid, session, n) {
+  pruneJobs(sid, n);
+  const job = startJob(sid, session, n);
+  if (n + 1 < session.clips.length) startJob(sid, session, n + 1); // encode ahead
+
+  return new Promise(resolve => {
+    let answered = false;
+    const answer = () => {
+      if (answered) return;
+      if (job.failed) {
+        answered = true;
+        job.listeners.delete(answer);
+        return resolve(new Response('clip unavailable', { status: 502 }));
+      }
+      if (!job.chunks.length) return;
+      answered = true;
+      job.listeners.delete(answer);
+      let sent = 0;
+      let open = true;
+      let listener = null;
+      const body = new ReadableStream({
+        start(ctrl) {
+          listener = () => {
+            if (!open) return;
+            while (sent < job.chunks.length) ctrl.enqueue(new Uint8Array(job.chunks[sent++]));
+            if (job.done) { open = false; job.listeners.delete(listener); ctrl.close(); }
+          };
+          job.listeners.add(listener);
+          listener();
+        },
+        // The encode keeps going if the viewer drops: a retry or the next
+        // request can still use it, and pruneJobs bounds what's kept.
+        cancel() { open = false; job.listeners.delete(listener); },
+      });
+      resolve(new Response(body, { headers: { 'Content-Type': 'video/mp2t', 'Cache-Control': 'no-store' } }));
+    };
+    job.listeners.add(answer);
+    answer();
+  });
 }
 
 export default async function handler(req) {
@@ -246,9 +469,11 @@ export default async function handler(req) {
   if (path === '/api/compile/playlist.m3u8') return playlist(sid, session);
   if (path === '/api/compile/seg.ts') {
     const n = Number(url.searchParams.get('n'));
-    if (!Number.isInteger(n) || n < 0 || n >= session.length) return new Response('bad segment', { status: 400 });
+    if (!Number.isInteger(n) || n < 0 || n >= session.clips.length) return new Response('bad segment', { status: 400 });
     if (req.method === 'HEAD') return new Response(null, { headers: { 'Content-Type': 'video/mp2t' } });
-    return segment(session, n, req.signal);
+    return session.mode === 'smooth'
+      ? smoothSegment(sid, session, n)
+      : originalSegment(session.clips, n, req.signal);
   }
   return new Response('not found', { status: 404 });
 }
