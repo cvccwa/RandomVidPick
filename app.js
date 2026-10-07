@@ -7,7 +7,7 @@ const VIDEO_MIME_TYPES = [
   'video/quicktime', 'video/x-msvideo', 'video/mpeg',
   'video/3gpp', 'video/x-flv', 'video/x-ms-wmv'
 ];
-const APP_VERSION = 'v31';
+const APP_VERSION = 'v32';
 const BROWSE_BATCH = 50;
 // Where api/ (stream, thumbnails, tags) is served from.
 const API_BASE = 'https://randomvidpick-139266625585.us-east1.run.app';
@@ -394,7 +394,30 @@ function isCreatorTag(name) {
   return name.startsWith(CREATOR_PREFIX);
 }
 
+// Quality tags ("quality:4K" ...) are worked out from Drive's resolution,
+// never stored: always right, nothing to back-fill, and the tag editor and
+// manager can't change them. They only take part in filtering and search.
+const QUALITY_PREFIX = 'quality:';
+
+function isQualityTag(name) {
+  return name.startsWith(QUALITY_PREFIX);
+}
+
+function qualityTag(video) {
+  const short = Math.min(video.width || 0, video.height || 0);
+  if (!short) return null;
+  const label = short >= 2000 ? '4K' : short >= 1300 ? '1440p' : short >= 1000 ? '1080p' : short >= 700 ? '720p' : 'SD';
+  return QUALITY_PREFIX + label;
+}
+
+// Stored tags plus the video's quality tag - for filters and search only.
+function filterTagsOf(video) {
+  const quality = qualityTag(video);
+  return quality ? { ...tagsOf(video.id), [quality]: 'q' } : tagsOf(video.id);
+}
+
 function tagLabel(name) {
+  if (isQualityTag(name)) return name.slice(QUALITY_PREFIX.length);
   return isCreatorTag(name) ? name.slice(CREATOR_PREFIX.length) : name;
 }
 
@@ -413,6 +436,22 @@ function tagCounts(kind) {
     }
   }
   return new Map([...counts].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])));
+}
+
+// tagCounts plus quality tags, for the filter picker: quality first, best
+// first, then the stored tags.
+const QUALITY_ORDER = ['4K', '1440p', '1080p', '720p', 'SD'];
+function filterTagCounts(kind) {
+  const stored = tagCounts(kind);
+  if (kind === 'creator') return stored;
+  const quality = new Map();
+  for (const v of videoCache || []) {
+    const q = qualityTag(v);
+    if (q) quality.set(q, (quality.get(q) || 0) + 1);
+  }
+  const ordered = [...quality].sort((a, b) =>
+    QUALITY_ORDER.indexOf(tagLabel(a[0])) - QUALITY_ORDER.indexOf(tagLabel(b[0])));
+  return new Map([...ordered, ...stored]);
 }
 
 // Tidies a typed name into a full tag (adding the creator prefix if asked)
@@ -635,17 +674,17 @@ function filterVideos(query) {
 
   // Creators: a video matches if it has any of the chosen creators.
   const creators = browsePrefs.creators;
-  if (creators.length) list = list.filter(v => creators.some(c => c in tagsOf(v.id)));
+  if (creators.length) list = list.filter(v => creators.some(c => c in filterTagsOf(v)));
 
   // Exclusions (creators or tags): hide any video carrying one.
   const excluded = browsePrefs.excluded || [];
-  if (excluded.length) list = list.filter(v => !excluded.some(t => t in tagsOf(v.id)));
+  if (excluded.length) list = list.filter(v => !excluded.some(t => t in filterTagsOf(v)));
 
   // Tags: videos must carry all chosen tags (or any, if toggled).
   const wanted = browsePrefs.tags;
   if (wanted.length) {
     list = list.filter(v => {
-      const tags = tagsOf(v.id);
+      const tags = filterTagsOf(v);
       return browsePrefs.tagMode === 'any'
         ? wanted.some(t => t in tags)
         : wanted.every(t => t in tags);
@@ -677,7 +716,7 @@ function searchMatcher(query) {
   const compact = words.join('');
   return v => {
     const hay = searchNormalize([
-      v.name, displayName(v.name), v.path || '', ...tagNames(v.id).map(tagLabel),
+      v.name, displayName(v.name), v.path || '', ...Object.keys(filterTagsOf(v)).map(tagLabel),
     ].join(' '));
     const hayCompact = hay.replace(/ /g, '');
     return hayCompact.includes(compact)
@@ -1193,7 +1232,7 @@ async function openBrowseView() {
     populateFolderFilter();
     await migrateCreatorTags();
     // Drop remembered filters for tags/creators that no longer exist.
-    const known = tagCounts();
+    const known = filterTagCounts();
     browsePrefs.creators = (browsePrefs.creators || []).filter(t => known.has(t) && isCreatorTag(t));
     browsePrefs.tags     = (browsePrefs.tags || []).filter(t => known.has(t) && !isCreatorTag(t));
     browsePrefs.excluded = (browsePrefs.excluded || []).filter(t => known.has(t));
@@ -1348,7 +1387,7 @@ function matchesQuery(name, query) {
 function openFilterPicker(kind) {
   const isCreator = kind === 'creator';
   const prefKey   = isCreator ? 'creators' : 'tags';
-  const counts    = tagCounts(kind);
+  const counts    = filterTagCounts(kind);
   const state     = new Map(); // name -> 'include' | 'exclude'
   for (const n of browsePrefs[prefKey]) state.set(n, 'include');
   for (const n of browsePrefs.excluded || []) if (tagKind(n) === kind) state.set(n, 'exclude');
@@ -1787,40 +1826,62 @@ browseRandomBtn.addEventListener('click', () => {
 // as one stream in VLC. The server picks, orders and cuts the clips (see
 // api/compile.js); durations help it cut from the middle of each video.
 // Long-press 🎬 to choose how compilations are made; the choice is remembered.
-const COMPILE_MODES = [
-  { id: 'original', label: 'Original', note: 'Untouched quality · brief flash between clips' },
-  { id: 'auto',     label: 'Smooth · Auto', note: 'Seamless · resolution most of the clips have' },
-  { id: '2160',     label: 'Smooth · 4K', note: 'Seamless · most data' },
-  { id: '1440',     label: 'Smooth · 1440p', note: 'Seamless' },
-  { id: '1080',     label: 'Smooth · 1080p', note: 'Seamless · least data' },
-];
-let compileMode = 'auto';
+// Long-press 🎬 to choose how compilations are made; the choice is remembered.
+// Smooth has its own resolution and frame rate, each with Auto (what most of
+// the clips in the view are - decided by the server).
+const COMPILE_RES = [['auto', 'Auto'], ['2160', '4K'], ['1440', '1440p'], ['1080', '1080p']];
+const COMPILE_FPS = [['auto', 'Auto'], ['60', '60 fps'], ['30', '30 fps']];
+let compilePrefs = { mode: 'smooth', res: 'auto', fps: 'auto' };
 try {
   const saved = localStorage.getItem('rvp_compile_mode');
-  if (COMPILE_MODES.some(m => m.id === saved)) compileMode = saved;
-} catch (err) { /* private mode - keep default */ }
+  if (saved && saved.startsWith('{')) {
+    const p = JSON.parse(saved);
+    compilePrefs = {
+      mode: p.mode === 'original' ? 'original' : 'smooth',
+      res:  COMPILE_RES.some(r => r[0] === p.res) ? p.res : 'auto',
+      fps:  COMPILE_FPS.some(f => f[0] === p.fps) ? p.fps : 'auto',
+    };
+  } else if (saved === 'original') {
+    compilePrefs.mode = 'original';
+  } else if (COMPILE_RES.some(r => r[0] === saved)) {
+    compilePrefs.res = saved; // pre-fps setting: smooth at that resolution
+  }
+} catch (err) { /* private mode or corrupt value - keep defaults */ }
+
+function saveCompilePrefs() {
+  try { localStorage.setItem('rvp_compile_mode', JSON.stringify(compilePrefs)); } catch (err) { /* ignore */ }
+}
 
 function openCompileMenu() {
-  const rows = COMPILE_MODES.map(m => el('div', {
-    className: 'tri-row' + (m.id === compileMode ? ' include' : ''),
-    onclick: () => {
-      compileMode = m.id;
-      try { localStorage.setItem('rvp_compile_mode', m.id); } catch (err) { /* ignore */ }
-      closeSheet();
-    },
+  const modeRow = (id, label, note) => el('div', {
+    className: 'tri-row' + (compilePrefs.mode === id ? ' include' : ''),
+    onclick: () => { compilePrefs.mode = id; saveCompilePrefs(); openCompileMenu(); },
   },
-    el('span', { className: 'tri-box', textContent: m.id === compileMode ? '✓' : '' }),
-    el('span', { className: 'sheet-list-name' }, m.label, el('div', { className: 'sheet-note', textContent: m.note }))));
+    el('span', { className: 'tri-box', textContent: compilePrefs.mode === id ? '✓' : '' }),
+    el('span', { className: 'sheet-list-name' }, label, el('div', { className: 'sheet-note', textContent: note })));
+  const choiceRow = (title, options, key) => el('div', { className: 'sheet-section' },
+    el('div', { className: 'sheet-section-title', textContent: title }),
+    el('div', { className: 'sheet-chips' }, ...options.map(([value, label]) =>
+      chipButton(label, compilePrefs[key] === value ? 'active' : '', () => {
+        compilePrefs[key] = value; saveCompilePrefs(); openCompileMenu();
+      }))));
+  const smooth = compilePrefs.mode === 'smooth';
   openSheet(
     el('div', { className: 'sheet-title', textContent: 'Compilation mode' }),
-    el('div', { className: 'sheet-section' }, ...rows),
-    el('div', { className: 'sheet-note', textContent: 'Smooth re-encodes every clip to one format so playback and seeking run straight through. Auto uses 4K or 1440p only when most clips in the view are.' }));
+    el('div', { className: 'sheet-section' },
+      modeRow('original', 'Original', 'Untouched quality · brief flash between clips'),
+      modeRow('smooth', 'Smooth', 'Seamless playback and seeking · every clip re-encoded to one format')),
+    smooth ? choiceRow('Resolution', COMPILE_RES, 'res') : null,
+    smooth ? choiceRow('Frame rate', COMPILE_FPS, 'fps') : null,
+    smooth ? el('div', { className: 'sheet-note', textContent: 'Auto picks what most clips in the view are. Auto frame rate stays at 30 for 4K; 4K at 60 fps will likely stall.' }) : null,
+    el('div', { className: 'sheet-row sheet-actions' },
+      el('button', { type: 'button', className: 'sheet-btn primary', textContent: 'Done', onclick: closeSheet })));
 }
 attachLongPress(browseCompileBtn, openCompileMenu);
 
-function compileModeLabel(mode, height) {
+function compileModeLabel(mode, height, fps) {
   if (mode !== 'smooth') return 'Original';
-  return height === 2160 ? 'Smooth 4K' : `Smooth ${height}p`;
+  return `Smooth ${height === 2160 ? '4K' : `${height}p`}${fps || 30}`;
 }
 
 browseCompileBtn.addEventListener('click', async () => {
@@ -1836,13 +1897,15 @@ browseCompileBtn.addEventListener('click', async () => {
       method:  'POST',
       headers: metaHeaders({ 'Content-Type': 'application/json' }),
       body:    JSON.stringify({
-        mode:  compileMode,
+        mode:  compilePrefs.mode,
+        res:   compilePrefs.res,
+        fps:   compilePrefs.fps,
         clips: browseFiltered.map(v => ({ id: v.id, d: v.durationMs || 0, w: v.width || 0, h: v.height || 0 })),
       }),
     });
     if (!res.ok) throw new Error(`compile ${res.status}`);
-    const { url, clips, mode, height } = await res.json();
-    const title = `Compilation · ${clips} clips · ${compileModeLabel(mode, height)}`;
+    const { url, clips, mode, height, fps } = await res.json();
+    const title = `Compilation · ${clips} clips · ${compileModeLabel(mode, height, fps)}`;
     nowPlayingAction = () => launchVlc(url, title);
     nowPlayingAction();
     nowPlayingTitle.textContent = title;
