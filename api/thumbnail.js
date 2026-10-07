@@ -1,7 +1,5 @@
 import { getServiceAccountToken } from './_lib/serviceAccount.js';
 
-export const config = { runtime: 'edge' };
-
 const ALLOWED_ORIGIN = 'https://cvccwa.github.io';
 
 // Tags which branch a thumbnail miss came from (Drive had no thumbnailLink

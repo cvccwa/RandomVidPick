@@ -1,8 +1,6 @@
 import { isAuthorized, ID_RE } from './_lib/auth.js';
 import { signStream, STREAM_LINK_TTL_S } from './_lib/streamSig.js';
 
-export const config = { runtime: 'edge' };
-
 const ALLOWED_ORIGIN = 'https://cvccwa.github.io';
 const MAX_IDS        = 200;
 

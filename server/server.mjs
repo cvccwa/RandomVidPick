@@ -1,6 +1,6 @@
-// Cloud Run entry point. Serves the same handlers Vercel runs from api/:
-// each one takes a web-standard Request and returns a Response, so this
-// file only converts between those and Node's http objects.
+// Cloud Run entry point. Serves the handlers in api/: each one takes a
+// web-standard Request and returns a Response, so this file only converts
+// between those and Node's http objects.
 import http from 'node:http';
 import { Readable } from 'node:stream';
 import stream from '../api/stream.js';

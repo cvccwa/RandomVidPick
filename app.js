@@ -967,7 +967,7 @@ function pumpFrameThumbQueue() {
 }
 
 // The grab runs on the phone with no devtools, so send the failure reason
-// to the server where it shows up in Vercel runtime logs.
+// to the server where it shows up in the Cloud Run logs.
 // Asks the stream for its first byte. A healthy response means the earlier
 // failure was the video itself; an error status or no answer means the
 // stream was the problem and a retry may succeed.
