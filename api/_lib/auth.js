@@ -1,6 +1,6 @@
 import { kvCommand } from './serviceAccount.js';
 
-const ROOT_FOLDER = '1JBAz8KFVSHfnzojWnhECD7gtBRkLBCk9';
+export const ROOT_FOLDER = '1JBAz8KFVSHfnzojWnhECD7gtBRkLBCk9';
 const AUTH_TTL_S  = 3000; // re-verify a user token at most every ~50 min
 export const ID_RE = /^[\w-]{10,100}$/;
 

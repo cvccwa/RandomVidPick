@@ -1,11 +1,12 @@
 import { spawn } from 'node:child_process';
 import { getServiceAccountToken, kvCommand, b64url } from './_lib/serviceAccount.js';
 import { isAuthorized, ID_RE } from './_lib/auth.js';
+import { FFMPEG, driveUrl, probeInfo } from './_lib/media.js';
 
 // Compilation mode: random ~10s clips from many videos, played back to back
 // in VLC as one HLS stream.
 //
-//   POST /api/compile   {clips: [{id, d, w, h}], mode, res, fps}  -> {url}   (owner only)
+//   POST /api/compile   {clips: [{id, d, w, h}], mode, res, fps, pick}  -> {url}   (owner only)
 //   GET  /api/compile/playlist.m3u8?s=SESSION
 //   GET  /api/compile/seg.ts?s=SESSION&n=INDEX
 //
@@ -31,8 +32,6 @@ const MAX_CLIPS      = 360;        // one hour of clips per session
 const MAX_INPUT      = 5000;
 const SESSION_TTL_S  = 12 * 3600;
 const SEGMENT_TRIES  = 3;          // a broken source is swapped for another clip
-const DRIVE_API      = process.env.DRIVE_API_BASE || 'https://www.googleapis.com';
-const FFMPEG         = process.env.FFMPEG_PATH || 'ffmpeg';
 const SID_RE         = /^[\w-]{40,64}$/;
 const RES_OPTIONS    = new Set(['auto', '2160', '1440', '1080']);
 const FPS_OPTIONS    = new Set(['auto', '60', '30']);
@@ -51,10 +50,6 @@ function json(body, status = 200) {
   });
 }
 
-function driveUrl(id) {
-  return `${DRIVE_API}/drive/v3/files/${encodeURIComponent(id)}?alt=media`;
-}
-
 // Where in a video to cut: somewhere in the middle 80%, so intros/outros are
 // skipped. Unknown durations get an early-ish guess; a cut past the end just
 // fails and gets replaced by another clip.
@@ -64,6 +59,28 @@ function pickStart(durationMs) {
   if (d < CLIP_S * 3) return 0;
   const lo = d * 0.1, hi = d * 0.9 - CLIP_S;
   return lo + Math.random() * Math.max(0, hi - lo);
+}
+
+// pick: 'highlights' cuts around a video's analysed peaks (api/analyze.js),
+// choosing randomly among its best few so repeat compilations still vary;
+// videos not analysed yet fall back to pickStart.
+const PEAKS_KEY = 'rvp:peaks';
+const PEAK_CHOICES = 3;
+const PEAK_LEAD_S = 3; // start a little before the measured moment
+const PEAK_SCORE_SPREAD = 0.25;
+
+function highlightStart(raw) {
+  try {
+    // Best first; only moments close to the video's best are candidates, so
+    // an uneventful video's middling "peaks" aren't treated as highlights.
+    const all = JSON.parse(raw).peaks || [];
+    if (!all.length) return null;
+    const peaks = all.filter(p => p[1] >= all[0][1] - PEAK_SCORE_SPREAD).slice(0, PEAK_CHOICES);
+    const [t] = peaks[Math.floor(Math.random() * peaks.length)];
+    return Math.max(0, t - PEAK_LEAD_S);
+  } catch (err) {
+    return null;
+  }
 }
 
 // Smooth-mode output height. Videos are classed by their short side, so a
@@ -131,12 +148,18 @@ async function createSession(req) {
     [pool[i], pool[j]] = [pool[j], pool[i]];
   }
   const picked = pool.slice(0, MAX_CLIPS);
+  const pick = body.pick === 'highlights' ? 'highlights' : 'random';
+  const starts = picked.map(() => null);
+  if (pick === 'highlights') {
+    const raw = await kvCommand(['HMGET', PEAKS_KEY, ...picked.map(c => c.id)]).catch(() => []);
+    (raw || []).forEach((r, i) => { if (r) starts[i] = highlightStart(r); });
+  }
   const height = smooth ? pickHeight(res, picked) : null;
   const session = {
     mode:  smooth ? 'smooth' : 'original',
     height,
     fps:   smooth ? await pickFps(fpsChoice, height, picked) : null,
-    clips: picked.map(c => ({ id: c.id, s: Math.round(pickStart(c.d) * 10) / 10 })),
+    clips: picked.map((c, i) => ({ id: c.id, s: Math.round((starts[i] ?? pickStart(c.d)) * 10) / 10 })),
   };
 
   const sid = b64url(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))));
@@ -152,6 +175,8 @@ async function createSession(req) {
     mode:   session.mode,
     height: session.height,
     fps:    session.fps,
+    pick,
+    highlights: starts.filter(s => s !== null).length,
   });
 }
 
@@ -220,7 +245,7 @@ function cutClip(clip, token, signal, dumpExtra) {
       '-hide_banner', '-nostats', '-loglevel', 'info',
       '-headers', `Authorization: Bearer ${token}\r\n`,
       '-ss', String(clip.s),
-      '-i', `${DRIVE_API}/drive/v3/files/${encodeURIComponent(clip.id)}?alt=media`,
+      '-i', driveUrl(clip.id),
       '-t', String(CLIP_S),
       '-map', '0:v:0', '-map', '0:a:0?',
       '-c', 'copy',
@@ -301,31 +326,6 @@ async function originalSegment(clips, n, signal) {
 
 // ─── SMOOTH MODE ──────────────────────────────────────────────────────────────
 const MIN_SEGMENT_B  = 128 * 1024; // less than this from an encode = it failed
-const probeCache     = new Map();  // file id -> { hasAudio, fps }
-
-// A file's audio presence and frame rate, from ffmpeg's stream listing
-// (reads only the container header). Clips without audio get silence
-// instead, so every segment has the same tracks.
-function probeInfo(id, token) {
-  if (probeCache.has(id)) return Promise.resolve(probeCache.get(id));
-  return new Promise((resolve, reject) => {
-    const ff = spawn(FFMPEG, ['-hide_banner', '-headers', `Authorization: Bearer ${token}\r\n`, '-i', driveUrl(id)],
-      { stdio: ['ignore', 'ignore', 'pipe'] });
-    let stderr = '';
-    ff.stderr.on('data', d => { if (stderr.length < 20000) stderr += d; });
-    ff.on('error', reject);
-    ff.on('close', () => {
-      const videoLine = (/Stream #0:\d+[^:]*: Video:.*/.exec(stderr) || [])[0];
-      if (!videoLine) return reject(new Error('no video stream'));
-      const rate = /([\d.]+) fps/.exec(videoLine) || /([\d.]+) tbr/.exec(videoLine);
-      const info = { hasAudio: /Stream #0:\d+[^:]*: Audio:/.test(stderr), fps: rate ? Number(rate[1]) : 0 };
-      if (probeCache.size > 500) probeCache.delete(probeCache.keys().next().value);
-      probeCache.set(id, info);
-      resolve(info);
-    });
-  });
-}
-
 // Encoder speed/size by workload (pixels per second). veryfast keeps
 // 1080p30 well ahead of real time; heavier outputs use faster presets so
 // the encode keeps up, at the cost of more bits - capped by maxrate so
