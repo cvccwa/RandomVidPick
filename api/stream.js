@@ -1,15 +1,13 @@
 import { getServiceAccountToken } from './_lib/serviceAccount.js';
 import { verifyStream } from './_lib/streamSig.js';
 
-export const config = { runtime: 'edge' };
-
 const ALLOWED_ORIGIN = 'https://cvccwa.github.io';
 
-// Cap how much of a Range we ever relay to Drive in one invocation. Without
-// this, a large/open-ended VLC Range request (e.g. "bytes=X-" = rest of
-// file) ties one invocation's lifetime to the whole remaining transfer,
-// which was hitting Vercel's 300s execution ceiling and its memory ceiling
-// on real requests. Tunable via env var without a redeploy.
+// Cap how much of a Range we ever relay to Drive in one request. Without
+// this, an open-ended VLC Range request (e.g. "bytes=X-" = rest of file)
+// ties one request's lifetime to the whole remaining transfer, which would
+// run into the request timeout on multi-GB files. VLC simply asks for the
+// next chunk. Tunable via env var without a code change.
 const CHUNK_SIZE = parseInt(process.env.STREAM_CHUNK_BYTES) || 8 * 1024 * 1024;
 
 function buildCappedRange(clientRangeHeader) {

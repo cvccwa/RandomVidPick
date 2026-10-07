@@ -1,8 +1,6 @@
 import { kvCommand } from './_lib/serviceAccount.js';
 import { isAuthorized, ID_RE } from './_lib/auth.js';
 
-export const config = { runtime: 'edge' };
-
 const ALLOWED_ORIGIN = 'https://cvccwa.github.io';
 const DUR_KEY        = 'rvp:dur';     // hash: fileId -> duration ms
 const WATCHED_KEY    = 'rvp:watched'; // hash: fileId -> last-watched epoch ms
