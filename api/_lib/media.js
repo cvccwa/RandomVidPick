@@ -19,7 +19,7 @@ const probeCache = new Map(); // file id -> { hasAudio, fps, duration }
 // Why ffmpeg couldn't read a file. HTTP / network trouble (Drive refusing
 // or rate-limiting, timeouts) is marked transient - worth retrying later -
 // as opposed to a file that genuinely has no readable video.
-const TRANSIENT_RE = /HTTP error|Server returned|4\d\d |5\d\d |Connection|timed out|Input\/output error|Network is unreachable|Temporary failure/i;
+export const TRANSIENT_RE = /HTTP error|Server returned|4\d\d |5\d\d |Connection|timed out|Input\/output error|Network is unreachable|Temporary failure/i;
 function probeError(stderr) {
   const lines = stderr.trim().split('\n').filter(l => !/^\s*(built with|configuration:|lib\w+ )/.test(l));
   const detail = (lines.filter(l => /error|returned|failed|invalid/i.test(l)).pop() || lines.pop() || '').trim().slice(0, 200);
