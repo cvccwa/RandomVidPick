@@ -7,10 +7,11 @@ const VIDEO_MIME_TYPES = [
   'video/quicktime', 'video/x-msvideo', 'video/mpeg',
   'video/3gpp', 'video/x-flv', 'video/x-ms-wmv'
 ];
-const APP_VERSION = 'v26';
+const APP_VERSION = 'v27';
 const BROWSE_BATCH = 50;
-const THUMBNAIL_HOST = 'https://random-vid-pick.vercel.app';
-const META_URL       = `${THUMBNAIL_HOST}/api/meta`;
+// Where api/ (stream, thumbnails, tags) is served from.
+const API_BASE = 'https://random-vid-pick.vercel.app';
+const META_URL = `${API_BASE}/api/meta`;
 const RECENT_MS      = 30 * 24 * 3600 * 1000; // "recently watched" = past month
 
 // Display-only cleanup of filenames (Drive names and search are untouched):
@@ -484,7 +485,7 @@ async function saveTags(updates) {
 
 // ─── VLC LAUNCH ───────────────────────────────────────────────────────────────
 function prewarmStream(fileId) {
-  return fetch(`https://random-vid-pick.vercel.app/api/stream?id=${encodeURIComponent(fileId)}`, {
+  return fetch(`${API_BASE}/api/stream?id=${encodeURIComponent(fileId)}`, {
     method: 'HEAD',
   }).catch(() => {});
 }
@@ -494,7 +495,7 @@ function openInVlc() {
   markWatched(lastPicked.id);
   const title = encodeURIComponent(displayName(lastPicked.name));
   const id    = encodeURIComponent(lastPicked.id);
-  const host  = `random-vid-pick.vercel.app/api/stream?id=${id}`;
+  const host  = `${API_BASE.replace(/^https:\/\//, '')}/api/stream?id=${id}`;
   window.location.href =
     `intent://${host}` +
     `#Intent;scheme=https;package=org.videolan.vlc;type=video%2F*` +
@@ -768,7 +769,7 @@ function buildCard(video) {
   img.loading  = 'lazy';
   img.decoding = 'async';
   img.draggable = false; // no image drag/save menu getting in the way of long-press
-  img.src      = `${THUMBNAIL_HOST}/api/thumbnail?id=${encodeURIComponent(video.id)}`;
+  img.src      = `${API_BASE}/api/thumbnail?id=${encodeURIComponent(video.id)}`;
   img.onerror  = () => {
     img.classList.add('thumb-fallback');
     queueFrameThumb(video.id, img);
@@ -922,7 +923,7 @@ async function streamLooksDown(id) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 15000);
   try {
-    const res = await fetch(`${THUMBNAIL_HOST}/api/stream?id=${encodeURIComponent(id)}`, {
+    const res = await fetch(`${API_BASE}/api/stream?id=${encodeURIComponent(id)}`, {
       headers: { Range: 'bytes=0-0' },
       signal:  ctrl.signal,
     });
@@ -936,7 +937,7 @@ async function streamLooksDown(id) {
 }
 
 function reportFrameThumbMiss(id, reason) {
-  fetch(`${THUMBNAIL_HOST}/api/thumbnail?id=${encodeURIComponent(id)}`
+  fetch(`${API_BASE}/api/thumbnail?id=${encodeURIComponent(id)}`
     + `&report=${encodeURIComponent(reason)}`).catch(() => {});
 }
 
@@ -984,7 +985,7 @@ function captureFrame(id) {
       }
     };
 
-    video.src = `${THUMBNAIL_HOST}/api/stream?id=${encodeURIComponent(id)}`;
+    video.src = `${API_BASE}/api/stream?id=${encodeURIComponent(id)}`;
   });
 }
 
@@ -1020,7 +1021,7 @@ function pumpDurationProbes() {
   const timer = setTimeout(done, 20000);
   el.onloadedmetadata = () => { recordDuration(job.video.id, el.duration); done(); };
   el.onerror = done;
-  el.src = `${THUMBNAIL_HOST}/api/stream?id=${encodeURIComponent(job.video.id)}`;
+  el.src = `${API_BASE}/api/stream?id=${encodeURIComponent(job.video.id)}`;
 }
 
 // id -> badge elements of the currently rendered card, so a duration learned
