@@ -46,10 +46,9 @@ const SID_RE         = /^[\w-]{40,64}$/;
 const RES_OPTIONS    = new Set(['auto', '2160', '1440', '1080']);
 const FPS_OPTIONS    = new Set(['auto', '60', '30']);
 // Smooth frame: 'fit' letterboxes every clip into one 16:9 frame (seamless
-// everywhere); 'native' (experimental) keeps each clip's own shape, scaled so
-// its short side is the chosen height - the stream then changes shape between
-// clips, which VLC may or may not follow cleanly. Remove this and the
-// 'native' branch in smoothArgs to drop the experiment.
+// everywhere); 'native' keeps each clip's own shape, scaled so its short side
+// is the chosen height - the stream then changes shape between clips, which
+// VLC follows with a brief black frame.
 const FRAME_OPTIONS  = new Set(['fit', 'native']);
 
 const CORS = {
@@ -405,7 +404,7 @@ function smoothArgs(source, n, session, token, hasAudio) {
   // pad short sources with their last frame / silence so every segment is
   // exactly its slot's length.
   const shape = session.frame === 'native'
-    // Experimental: own shape, short side = height (even dimensions).
+    // Own shape, short side = height (even dimensions).
     ? `scale=w='if(gte(iw\\,ih)\\,-2\\,${height})':h='if(gte(iw\\,ih)\\,${height}\\,-2)',`
     : `scale=${width}:${height}:force_original_aspect_ratio=decrease,`
       + `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black,`;
@@ -436,6 +435,11 @@ function smoothArgs(source, n, session, token, hasAudio) {
 // far and then the rest as it comes.
 const jobs = new Map(); // `${sid}:${n}` -> job
 const ENCODE_AHEAD = 2;
+// VLC holds only a few clips of buffer, so a source that hasn't started
+// producing output in this long (sparse keyframes that make the seek decode
+// minutes of video, a stalled Drive read) is swapped for another clip rather
+// than freezing playback. Normal encodes start well inside these.
+const FIRST_OUTPUT_S = { 1080: 20, 1440: 30, 2160: 45 };
 
 // At most two encodes run at once so they don't starve each other; the
 // segment VLC is waiting for jumps the queue ahead of encode-ahead work.
@@ -494,20 +498,33 @@ function startJob(sid, session, n, urgent) {
 
 async function runJob(job, session, n, emit) {
   const token = await getServiceAccountToken();
+  const limitS = FIRST_OUTPUT_S[session.height] || FIRST_OUTPUT_S[1080];
   for (const i of fallbackOrder(session.clips, n)) {
     if (job.cancelled) break;
     const clip = session.clips[i];
+    // One attempt = probe + encode of this source. If it hasn't produced
+    // real output within the limit it is dropped for another clip.
+    const attempt = new AbortController();
+    job.kill = () => attempt.abort();
+    let released = false;
+    const started = Date.now();
+    const timer = setTimeout(() => {
+      if (released || job.cancelled) return;
+      console.log(`compile smooth clip ${i} too slow: no output after ${limitS} s (${clip.id.slice(0, 6)}… at ${clip.s} s), trying another`);
+      attempt.abort();
+    }, limitS * 1000);
     try {
-      const { hasAudio } = await probeInfo(clip.id, token);
+      const { hasAudio } = await probeInfo(clip.id, token, 'compile', attempt.signal);
       if (job.cancelled) break;
       const ok = await new Promise(resolve => {
         const ff = spawn(FFMPEG, smoothArgs(clip, n, session, token, hasAudio),
           { stdio: ['ignore', 'pipe', 'pipe'] });
-        job.kill = () => ff.kill('SIGKILL');
+        const kill = () => ff.kill('SIGKILL');
+        attempt.signal.addEventListener('abort', kill, { once: true });
+        if (attempt.signal.aborted) kill();
         let stderr = '';
         let size = 0;
         const pending = [];
-        let released = false;
         ff.stderr.on('data', d => { if (stderr.length < 4000) stderr += d; });
         ff.stdout.on('data', c => {
           size += c.length;
@@ -519,14 +536,19 @@ async function runJob(job, session, n, emit) {
         });
         ff.on('error', () => resolve(false));
         ff.on('close', code => {
+          attempt.signal.removeEventListener('abort', kill);
           if (!released && code === 0 && size > 0) { released = true; job.chunks.push(...pending); }
-          if (!released && !job.cancelled) console.log(`compile smooth clip ${i} failed: exit ${code} ${stderr.trim().slice(0, 200)}`);
+          if (!released && !attempt.signal.aborted) console.log(`compile smooth clip ${i} failed: exit ${code} ${stderr.trim().slice(0, 200)}`);
           resolve(released);
         });
       });
+      const tookS = (Date.now() - started) / 1000;
+      if (ok && tookS > limitS / 2) console.log(`compile smooth clip ${i} slow: ${tookS.toFixed(1)} s (${clip.id.slice(0, 6)}… at ${clip.s} s)`);
       if (ok) { job.done = true; emit(); return; }
     } catch (err) {
-      console.log(`compile smooth clip ${i} failed: ${err.message}`);
+      if (!attempt.signal.aborted) console.log(`compile smooth clip ${i} failed: ${err.message}`);
+    } finally {
+      clearTimeout(timer);
     }
   }
   job.failed = true;

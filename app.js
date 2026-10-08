@@ -7,7 +7,7 @@ const VIDEO_MIME_TYPES = [
   'video/quicktime', 'video/x-msvideo', 'video/mpeg',
   'video/3gpp', 'video/x-flv', 'video/x-ms-wmv'
 ];
-const APP_VERSION = 'v40';
+const APP_VERSION = 'v41';
 const BROWSE_BATCH = 50;
 // Where api/ (stream, thumbnails, tags) is served from.
 const API_BASE = 'https://randomvidpick-139266625585.us-east1.run.app';
@@ -1975,9 +1975,9 @@ const COMPILE_PICK = [['highlights', 'Highlights'], ['random', 'Random']];
 // Auto: with highlights, each clip lasts about as long as the action it was
 // cut from (6-20 s); otherwise 10 s.
 const COMPILE_LEN  = [['auto', 'Auto'], ['5', '5 s'], ['10', '10 s'], ['15', '15 s'], ['20', '20 s']];
-// Smooth only. Native (experimental) keeps each clip's own shape instead of
-// fitting all of them into one 16:9 frame; see FRAME_OPTIONS in api/compile.js.
-const COMPILE_FRAME = [['fit', 'Fit 16:9'], ['native', 'Native (experimental)']];
+// Smooth only. Native keeps each clip's own shape instead of fitting all of
+// them into one 16:9 frame; see FRAME_OPTIONS in api/compile.js.
+const COMPILE_FRAME = [['fit', 'Fit 16:9'], ['native', 'Native']];
 let compilePrefs = { mode: 'smooth', res: 'auto', fps: 'auto', pick: 'highlights', len: 'auto', frame: 'fit' };
 try {
   const saved = localStorage.getItem('rvp_compile_mode');
@@ -2027,7 +2027,7 @@ function openCompileMenu() {
     smooth ? choiceRow('Frame rate', COMPILE_FPS, 'fps') : null,
     smooth ? el('div', { className: 'sheet-note', textContent: 'Auto picks what most clips in the view are. Auto frame rate stays at 30 for 4K; 4K at 60 fps will likely stall.' }) : null,
     smooth ? choiceRow('Frame', COMPILE_FRAME, 'frame') : null,
-    smooth ? el('div', { className: 'sheet-note', textContent: 'Fit puts every clip in one 16:9 frame (black bars on other shapes). Native keeps each clip\'s own shape; VLC may not adjust cleanly between shapes. Switch back to Fit if it misbehaves.' }) : null,
+    smooth ? el('div', { className: 'sheet-note', textContent: 'Fit puts every clip in one 16:9 frame (black bars on other shapes). Native keeps each clip\'s own shape; VLC resizes to match (a brief black flash when the shape changes).' }) : null,
     choiceRow('Clip picks', COMPILE_PICK, 'pick'),
     highlightNote,
     choiceRow('Clip length', COMPILE_LEN, 'len'),
