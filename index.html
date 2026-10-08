@@ -267,15 +267,73 @@
     /* The four header buttons (sign out, manage, random, compile): same width. */
     .browse-header > button { width: 2.75rem; padding: 0.5rem 0; display: inline-flex; align-items: center; justify-content: center; }
 
+    /* Active filters: two rows that each scroll sideways - search, creators
+       and the rest; then the tags. */
     .browse-tagbar {
       display: flex;
+      flex-direction: column;
       gap: 0.4rem;
-      padding: 0.6rem 1rem 0;
-      overflow-x: auto;
+      padding: 0.6rem 0 0 1rem;
       flex-shrink: 0;
-      scrollbar-width: none;
     }
-    .browse-tagbar::-webkit-scrollbar { display: none; }
+    .browse-tagbar[hidden] { display: none; }
+    .filter-row { display: flex; gap: 0.4rem; overflow-x: auto; padding-right: 1rem; scrollbar-width: none; align-items: center; }
+    .filter-row::-webkit-scrollbar { display: none; }
+
+    /* Split pills: sort field | direction, and Filters | clear. */
+    .split-pill { display: flex; min-width: 0; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); overflow: hidden; }
+    /* Two classes so it beats the rounded corners the controls get later on:
+       inside a pill only the pill itself is rounded, the divider is straight. */
+    .split-pill > * { background: transparent; border: none; border-radius: 0; color: var(--text); font-family: inherit; font-size: 0.85rem; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+    .split-pill > .browse-select, .split-pill > .browse-dir { border-radius: 0; border: none; }
+    .split-pill > * + *, .split-pill > .browse-dir { border-left: 1px solid var(--border); }
+    .sort-pill { flex: 1; }
+    .sort-pill .browse-select { flex: 1; min-width: 0; padding: 0.5rem 0.75rem; -webkit-appearance: none; appearance: none; }
+    .sort-pill .browse-dir { flex-shrink: 0; padding: 0.5rem 0.7rem; }
+    .filters-pill { flex-shrink: 0; }
+    .filters-pill-main { font-weight: 600; padding: 0.5rem 0.9rem; }
+    .filters-pill-clear { padding: 0.5rem 0.7rem; }
+    .filters-pill-clear[hidden] { display: none; }
+    .filters-pill.filtering { background: var(--accent); border-color: var(--accent); }
+    .filters-pill.filtering > * { color: var(--on-accent); }
+    .filters-pill.filtering > * + * { border-left-color: rgba(11, 18, 32, 0.35); }
+    .browse-select-btn { flex-shrink: 0; width: 2.75rem; padding: 0.5rem 0; font-size: 1rem; display: inline-flex; align-items: center; justify-content: center; }
+    .browse-select-btn.active { background: var(--danger); border-color: var(--danger); color: #fff; }
+
+    /* Filters sheet */
+    .filter-top { display: flex; align-items: center; justify-content: space-between; }
+    .filter-title { font-size: 1rem; font-weight: 600; }
+    .filter-tabs { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0.25rem; background: var(--surface); border-radius: 8px; padding: 0.25rem; }
+    .filter-tab { background: transparent; border: none; border-radius: 6px; color: var(--muted); font-family: inherit; font-size: 0.8rem; padding: 0.55rem 0.25rem; cursor: pointer; display: flex; justify-content: center; gap: 0.3rem; }
+    .filter-tab.active { background: var(--border); color: var(--text); font-weight: 600; }
+    .filter-tab-count { color: var(--accent); font-size: 0.7rem; }
+    .filter-body { display: flex; flex-direction: column; gap: 1rem; min-height: 40dvh; }
+    .filter-head { display: flex; justify-content: space-between; align-items: baseline; }
+    .filter-value { font-size: 0.85rem; font-weight: 600; color: var(--text); }
+    .filter-scale { display: flex; justify-content: space-between; font-size: 0.7rem; color: var(--muted); }
+    .filter-actions .filter-show { flex: 1; }
+    .segmented { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: 0.25rem; background: var(--surface); border-radius: 8px; padding: 0.25rem; flex: 1; }
+    .segmented button { background: transparent; border: none; border-radius: 6px; color: var(--muted); font-family: inherit; font-size: 0.78rem; padding: 0.55rem 0.25rem; cursor: pointer; }
+    .segmented button.active { background: var(--border); color: var(--text); font-weight: 600; }
+    .segmented.fit { flex: 0 0 auto; grid-auto-columns: auto; }
+    .segmented.fit button { padding: 0.55rem 0.75rem; }
+    .segmented button.on { background: var(--accent); color: var(--on-accent); font-weight: 600; }
+    .filter-body .sheet-input { border-radius: 8px; padding: 0.6rem 0.75rem; }
+    .filter-group { border: 1px solid var(--border); border-radius: 10px; padding: 0 0.85rem; }
+    .filter-group summary { list-style: none; display: flex; justify-content: space-between; align-items: center; gap: 0.5rem; padding: 0.8rem 0; cursor: pointer; font-size: 0.9rem; font-weight: 600; }
+    .filter-group summary::-webkit-details-marker { display: none; }
+    .filter-group summary .filter-value { color: var(--accent); font-size: 0.75rem; font-weight: 500; }
+    .filter-group .sheet-chips { padding-bottom: 0.85rem; }
+    .chip-count { margin-left: 0.4rem; opacity: 0.65; font-size: 0.85em; }
+    .dual-range { position: relative; height: 1.75rem; }
+    .dual-track, .dual-fill { position: absolute; top: 0.75rem; height: 4px; border-radius: 2px; }
+    .dual-track { left: 0; right: 0; background: var(--border); }
+    .dual-fill { background: var(--accent); }
+    .dual-range input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; background: none; pointer-events: none; -webkit-appearance: none; appearance: none; }
+    .dual-range input::-webkit-slider-runnable-track { background: none; }
+    .dual-range input::-moz-range-track { background: none; }
+    .dual-range input::-webkit-slider-thumb { pointer-events: auto; -webkit-appearance: none; width: 1.4rem; height: 1.4rem; border-radius: 50%; background: var(--text); border: none; box-shadow: 0 1px 3px rgba(0,0,0,.5); cursor: pointer; }
+    .dual-range input::-moz-range-thumb { pointer-events: auto; width: 1.4rem; height: 1.4rem; border-radius: 50%; background: var(--text); border: none; cursor: pointer; }
 
     .tag-chip {
       flex-shrink: 0;
@@ -516,8 +574,8 @@
     .sheet-title { font-size: 0.8rem; color: var(--text); word-break: break-word; }
     .sheet-note { font-size: 0.65rem; color: var(--muted); }
     .sheet-chips { display: flex; flex-wrap: wrap; gap: 0.4rem; }
-    .sheet-details { display: grid; grid-template-columns: auto 1fr; gap: 0.3rem 0.9rem; font-size: 0.85rem; overflow-wrap: anywhere; }
-    .sheet-details-label { color: var(--muted); }
+    .video-facts { display: grid; grid-template-columns: auto 1fr; gap: 0.3rem 0.9rem; font-size: 0.85rem; overflow-wrap: anywhere; }
+    .video-facts-label { color: var(--muted); }
     .sheet-row { display: flex; gap: 0.5rem; align-items: center; }
     .sheet-actions { justify-content: flex-end; flex-wrap: wrap; }
     .sheet-input {
@@ -694,6 +752,7 @@
     <button class="browse-dir browse-random" id="browseCompileBtn" type="button" aria-label="Play a compilation of clips from this view (long-press for options)" title="Compilation from this view - long-press for options">🎬</button>
   </div>
   <div class="browse-controls">
+    <div class="split-pill sort-pill">
     <select class="browse-select" id="browseSort" aria-label="Sort by">
       <option value="name">Name</option>
       <option value="created">Upload date</option>
@@ -703,9 +762,14 @@
       <option value="random">Random</option>
     </select>
     <button class="browse-dir" id="browseDir" type="button" aria-label="Sort direction">↑ Asc</button>
-    <select class="browse-select" id="browseFilter" aria-label="Filter"></select>
+    </div>
+    <button class="browse-dir browse-select-btn" id="browseSelectBtn" type="button" aria-label="Select videos to tag" title="Select videos to tag">☑</button>
+    <div class="split-pill filters-pill" id="browseFiltersPill">
+      <button class="filters-pill-main" id="browseFiltersBtn" type="button">Filters</button>
+      <button class="filters-pill-clear" id="browseFiltersClear" type="button" aria-label="Clear all filters and the search" title="Clear all filters and the search" hidden>✕</button>
+    </div>
   </div>
-  <div class="browse-tagbar" id="browseTagBar"></div>
+  <div class="browse-tagbar" id="browseTagBar" hidden></div>
   <div class="browse-count" id="browseCount"></div>
   <div class="browse-grid" id="browseGrid">
     <div class="browse-sentinel" id="browseSentinel"></div>
