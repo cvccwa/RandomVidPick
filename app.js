@@ -455,14 +455,33 @@ function qualityTag(video) {
   return QUALITY_PREFIX + label;
 }
 
-// Stored tags plus the video's quality tag - for filters and search only.
+// Shape tags ("shape:Portrait" ...) work the same way, from Drive's width and
+// height: filter to one shape and a Smooth compilation has no mixed frames.
+const SHAPE_PREFIX = 'shape:';
+const SHAPE_ORDER  = ['Portrait', 'Landscape', 'Square'];
+
+function isShapeTag(name) {
+  return name.startsWith(SHAPE_PREFIX);
+}
+
+function shapeTag(video) {
+  const w = video.width || 0, h = video.height || 0;
+  if (!w || !h) return null;
+  const label = w > h * 1.1 ? 'Landscape' : h > w * 1.1 ? 'Portrait' : 'Square';
+  return SHAPE_PREFIX + label;
+}
+
+// Stored tags plus the video's quality and shape tags - for filters and
+// search only.
 function filterTagsOf(video) {
-  const quality = qualityTag(video);
-  return quality ? { ...tagsOf(video.id), [quality]: 'q' } : tagsOf(video.id);
+  const computed = {};
+  for (const t of [qualityTag(video), shapeTag(video)]) if (t) computed[t] = 'q';
+  return { ...tagsOf(video.id), ...computed };
 }
 
 function tagLabel(name) {
   if (isQualityTag(name)) return name.slice(QUALITY_PREFIX.length);
+  if (isShapeTag(name)) return name.slice(SHAPE_PREFIX.length);
   return isCreatorTag(name) ? name.slice(CREATOR_PREFIX.length) : name;
 }
 
@@ -490,13 +509,18 @@ function filterTagCounts(kind) {
   const stored = tagCounts(kind);
   if (kind === 'creator') return stored;
   const quality = new Map();
+  const shape = new Map();
   for (const v of videoCache || []) {
     const q = qualityTag(v);
     if (q) quality.set(q, (quality.get(q) || 0) + 1);
+    const sh = shapeTag(v);
+    if (sh) shape.set(sh, (shape.get(sh) || 0) + 1);
   }
   const ordered = [...quality].sort((a, b) =>
     QUALITY_ORDER.indexOf(tagLabel(a[0])) - QUALITY_ORDER.indexOf(tagLabel(b[0])));
-  return new Map([...ordered, ...stored]);
+  const shapes = [...shape].sort((a, b) =>
+    SHAPE_ORDER.indexOf(tagLabel(a[0])) - SHAPE_ORDER.indexOf(tagLabel(b[0])));
+  return new Map([...ordered, ...shapes, ...stored]);
 }
 
 // Tidies a typed name into a full tag (adding the creator prefix if asked)
