@@ -281,9 +281,12 @@
     .filter-row::-webkit-scrollbar { display: none; }
 
     /* Split pills: sort field | direction, and Filters | clear. */
-    .split-pill { display: flex; min-width: 0; border: 1px solid var(--border); border-radius: 4px; background: var(--surface); overflow: hidden; }
+    .split-pill { display: flex; min-width: 0; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); overflow: hidden; }
+    /* Two classes so it beats the rounded corners the controls get later on:
+       inside a pill only the pill itself is rounded, the divider is straight. */
     .split-pill > * { background: transparent; border: none; border-radius: 0; color: var(--text); font-family: inherit; font-size: 0.85rem; cursor: pointer; -webkit-tap-highlight-color: transparent; }
-    .split-pill > * + * { border-left: 1px solid var(--border); }
+    .split-pill > .browse-select, .split-pill > .browse-dir { border-radius: 0; border: none; }
+    .split-pill > * + *, .split-pill > .browse-dir { border-left: 1px solid var(--border); }
     .sort-pill { flex: 1; }
     .sort-pill .browse-select { flex: 1; min-width: 0; padding: 0.5rem; }
     .sort-pill .browse-dir { flex-shrink: 0; padding: 0.5rem 0.7rem; }
