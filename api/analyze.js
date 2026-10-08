@@ -175,7 +175,8 @@ class OutOfTime extends Error {}
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 export async function analyzeVideo(id, durationMs, token, stopAt = Infinity) {
-  const info = await probeInfo(id, token, 'analyze');
+  // Time-limited: a damaged file can keep ffmpeg reconnecting indefinitely.
+  const info = await probeInfo(id, token, 'analyze', AbortSignal.timeout(MEASURE_TIMEOUT_MS));
   const d = durationMs > 0 ? durationMs / 1000 : info.duration;
   if (!(d >= MIN_DURATION_S)) return { v: VERSION, d: Math.round(d || 0), peaks: [] };
 
