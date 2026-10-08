@@ -7,7 +7,7 @@ const VIDEO_MIME_TYPES = [
   'video/quicktime', 'video/x-msvideo', 'video/mpeg',
   'video/3gpp', 'video/x-flv', 'video/x-ms-wmv'
 ];
-const APP_VERSION = 'v43';
+const APP_VERSION = 'v44';
 const BROWSE_BATCH = 50;
 // Where api/ (stream, thumbnails, tags) is served from.
 const API_BASE = 'https://randomvidpick-139266625585.us-east1.run.app';
@@ -412,6 +412,10 @@ function markWatched(id) {
 
 function isRecentlyWatched(id) {
   return metaWatched[id] && Date.now() - metaWatched[id] < RECENT_MS;
+}
+
+function formatBytes(bytes) {
+  return bytes >= 1e9 ? `${(bytes / 1e9).toFixed(1)} GB` : `${Math.max(1, Math.round(bytes / 1e6))} MB`;
 }
 
 function formatDuration(ms) {
@@ -1320,7 +1324,7 @@ function renderNextBatch() {
 }
 
 function updateBrowseCount() {
-  const update = pendingLibrary ? ' · Library updated, tap to refresh' : ' · Long-press a video to tag it';
+  const update = pendingLibrary ? ' · Library updated, tap to refresh' : ' · Long-press a video for details & tags';
   browseCount.textContent = `Showing ${browseRendered} of ${browseFiltered.length}${update}`;
   browseCount.classList.toggle('has-update', Boolean(pendingLibrary));
 }
@@ -1436,9 +1440,12 @@ function closeBrowseView() {
   }
 }
 
+document.getElementById('browseManageBtn').addEventListener('click', () => openTagManager());
+
 browseSearch.addEventListener('input', () => {
   clearTimeout(browseSearchDebounce);
   browseSearchDebounce = setTimeout(() => {
+    refreshTagBar();
     refreshBrowse();
   }, 150);
 });
@@ -1473,8 +1480,7 @@ function refreshTagBar() {
     chipButton(creatorCount ? `👤 Creator · ${creatorCount}` : '👤 Creator ▾',
       'tag-chip-action' + (creatorCount ? ' filtering' : ''), () => openFilterPicker('creator')),
     chipButton(tagCount ? `🏷 Tags · ${tagCount}` : '🏷 Tags ▾',
-      'tag-chip-action' + (tagCount ? ' filtering' : ''), () => openFilterPicker('tag')),
-    chipButton('⚙', 'tag-chip-action', () => openTagManager(), 'Manage creators and tags')
+      'tag-chip-action' + (tagCount ? ' filtering' : ''), () => openFilterPicker('tag'))
   );
   const removeFilter = name => () => {
     browsePrefs.creators = browsePrefs.creators.filter(t => t !== name);
@@ -1484,6 +1490,17 @@ function refreshTagBar() {
     refreshTagBar();
     refreshBrowse();
   };
+  // The search text shows as a chip too, so it can be cleared with one tap
+  // after scrolling away from the search box.
+  const query = browseSearch.value.trim();
+  if (query) {
+    const shown = query.length > 24 ? `${query.slice(0, 23)}…` : query;
+    browseTagBar.append(chipButton(`🔍 "${shown}" ✕`, 'active', () => {
+      browseSearch.value = '';
+      refreshTagBar();
+      refreshBrowse();
+    }, 'Clear the search'));
+  }
   for (const name of [...creators, ...tags]) {
     browseTagBar.append(chipButton(`${isCreatorTag(name) ? '👤 ' : ''}${tagLabel(name)} ✕`, 'active',
       removeFilter(name), 'Remove this filter'));
@@ -1640,7 +1657,38 @@ function openFilterPicker(kind) {
   );
 }
 
+// Read-only facts about one video, for the top of its long-press sheet:
+// what the computed tags are worked out from, plus length, size and folder.
+
+function detailsSection(video) {
+  const m = metaMedia[video.id];
+  const [w, h] = sizeOf(video);
+  const rows = [];
+  if (m && m[6]) {
+    rows.push(['Picture', 'None (audio only)']);
+  } else if (w && h) {
+    const q = qualityTag(video);
+    rows.push(['Resolution', `${w}×${h}${q ? ` · ${tagLabel(q)}` : ''}`]);
+    rows.push(['Orientation', tagLabel(shapeTag(video))]);
+  }
+  if (m && m[2]) rows.push(['Frame rate', `${Number(m[2].toFixed(2))} fps`]);
+  if (video.durationMs) rows.push(['Length', formatDuration(video.durationMs)]);
+  if (video.size) rows.push(['File size', formatBytes(video.size)]);
+  if (m) rows.push(['Audio', m[3] ? 'Yes' : 'None']);
+  if (video.path) rows.push(['Folder', video.path]);
+  const grid = el('div', { className: 'sheet-details' });
+  for (const [label, value] of rows) {
+    grid.append(el('span', { className: 'sheet-details-label', textContent: label }),
+      el('span', { textContent: value }));
+  }
+  return el('div', { className: 'sheet-section' },
+    el('div', { className: 'sheet-section-title', textContent: 'ℹ️ Details' }),
+    grid,
+    m ? null : el('div', { className: 'sheet-note', textContent: 'Frame rate and audio show once the server has read this file.' }));
+}
+
 // Tag editor for one or many videos, split into Creator and Tags sections.
+// For a single video it opens with its details (detailsSection) on top.
 // Each tag is in one of three states:
 //   'all'  - every chosen video has it (or will, once saved)
 //   'none' - no chosen video has it (or will lose it)
@@ -1737,6 +1785,7 @@ function openTagEditor(ids) {
   const title = ids.length === 1 ? displayName(findVideo(ids[0]).name) : `${ids.length} videos`;
   openSheet(
     el('div', { className: 'sheet-title', textContent: title }),
+    ids.length === 1 ? detailsSection(findVideo(ids[0])) : null,
     section('creator'),
     section('tag'),
     el('div', { className: 'sheet-row sheet-actions' },
