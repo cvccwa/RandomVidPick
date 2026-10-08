@@ -7,7 +7,7 @@ const VIDEO_MIME_TYPES = [
   'video/quicktime', 'video/x-msvideo', 'video/mpeg',
   'video/3gpp', 'video/x-flv', 'video/x-ms-wmv'
 ];
-const APP_VERSION = 'v46';
+const APP_VERSION = 'v47';
 const BROWSE_BATCH = 50;
 // Where api/ (stream, thumbnails, tags) is served from.
 const API_BASE = 'https://randomvidpick-139266625585.us-east1.run.app';
@@ -88,9 +88,9 @@ const sheetBackdrop    = document.getElementById('sheetBackdrop');
 const sheet            = document.getElementById('sheet');
 
 // ─── AUTH ─────────────────────────────────────────────────────────────────────
-function signInUrl(state) {
+function signIn() {
   const redirectUri = encodeURIComponent(window.location.href.split('?')[0].split('#')[0]);
-  return `https://accounts.google.com/o/oauth2/v2/auth`
+  const authUrl = `https://accounts.google.com/o/oauth2/v2/auth`
     + `?client_id=${encodeURIComponent(CLIENT_ID)}`
     + `&redirect_uri=${redirectUri}`
     + `&response_type=token`
@@ -98,70 +98,8 @@ function signInUrl(state) {
     // No prompt=consent: once access is granted, Google skips the consent
     // screen (and the "unverified app" warning shown with it) on later
     // sign-ins instead of forcing it every time.
-    + `&prompt=select_account`
-    + (state ? `&state=${state}` : '');
-}
-
-// Google's sign-in opens in its own window, so the app page never leaves
-// itself: a browser setting that applies to Google's pages (e.g. "Desktop
-// site" for google.com) can't carry back into the app the way it did when
-// the app navigated there and back. The window hands the token over
-// through localStorage (shared with this page) and closes. If the window
-// can't open, sign-in falls back to navigating there as before.
-const SIGN_IN_POPUP_STATE = 'rvp_popup';
-
-function signIn() {
-  const popup = window.open(signInUrl(SIGN_IN_POPUP_STATE), 'rvp_signin', 'popup,width=480,height=680');
-  if (!popup) {
-    window.location.href = signInUrl();
-    return;
-  }
-  setStatus('Finish signing in in the Google window…', 'loading');
-  waitForSignInWindow();
-}
-
-function waitForSignInWindow() {
-  const before = localStorage.getItem('rvp_token');
-  const check = () => {
-    const token  = localStorage.getItem('rvp_token');
-    const expiry = Number(localStorage.getItem('rvp_token_expiry') || 0);
-    if (!token || token === before || Date.now() >= expiry) return;
-    stop();
-    accessToken = token;
-    updateUI(true);
-    scheduleRefresh();
-  };
-  const onMessage = e => { if (e.origin === window.location.origin && e.data && e.data.type === 'rvp_signed_in') check(); };
-  const timer = setInterval(check, 1000);
-  const giveUp = setTimeout(() => { stop(); if (!accessToken) updateUI(false); }, 10 * 60e3);
-  function stop() {
-    clearInterval(timer);
-    clearTimeout(giveUp);
-    window.removeEventListener('message', onMessage);
-    window.removeEventListener('storage', check);
-    window.removeEventListener('focus', check);
-    document.removeEventListener('visibilitychange', check);
-  }
-  window.addEventListener('message', onMessage);
-  window.addEventListener('storage', check);
-  window.addEventListener('focus', check);
-  document.addEventListener('visibilitychange', check);
-}
-
-// In the sign-in window: nothing left to do but close.
-function showSignedInWindow() {
-  document.body.innerHTML = '';
-  const box = document.createElement('div');
-  box.style.cssText = 'min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1rem;font-family:inherit;color:#e8eaed;background:#0f1115;padding:2rem;text-align:center';
-  const text = document.createElement('div');
-  text.textContent = 'Signed in. You can close this window and go back to the app.';
-  const btn = document.createElement('button');
-  btn.textContent = 'Close';
-  btn.className = 'btn btn-primary';
-  btn.style.width = 'auto';
-  btn.onclick = () => window.close();
-  box.append(text, btn);
-  document.body.append(box);
+    + `&prompt=select_account`;
+  window.location.href = authUrl;
 }
 
 // The library's top-left button sits where BACK used to be, so ask first
@@ -181,8 +119,6 @@ function signOut() {
   updateUI(false);
 }
 
-// Returns 'window' when this page is the sign-in window (see signIn) and
-// should do nothing else.
 function handleAuthCallback() {
   const hash = window.location.hash;
   if (!hash) return;
@@ -197,22 +133,11 @@ function handleAuthCallback() {
     return;
   }
 
+  accessToken = token;
   const expiry = Date.now() + (parseInt(expiresIn) * 1000);
   localStorage.setItem('rvp_token', token);
   localStorage.setItem('rvp_token_expiry', expiry.toString());
   history.replaceState(null, '', window.location.pathname);
-
-  // The sign-in window: hand over and close. (If the phone instead brought
-  // the reply back into the installed app itself, just carry on there.)
-  const standalone = window.matchMedia && window.matchMedia('(display-mode: standalone)').matches;
-  if (params.get('state') === SIGN_IN_POPUP_STATE && !standalone) {
-    try { if (window.opener) window.opener.postMessage({ type: 'rvp_signed_in' }, window.location.origin); } catch (err) {}
-    window.close();
-    showSignedInWindow(); // still open: the browser didn't let it close itself
-    return 'window';
-  }
-
-  accessToken = token;
   updateUI(true);
   scheduleRefresh();
 }
@@ -1694,6 +1619,7 @@ let sheetOpenedAt = 0;
 
 function openSheet(...content) {
   sheet.innerHTML = '';
+  sheet.className = 'sheet'; // drop a layout class a previous sheet added (filter-sheet)
   // Skipped parts (e.g. Smooth-only rows in Original mode) are null; append
   // would print them as the text "null".
   sheet.append(...content.filter(c => c != null));
@@ -1918,6 +1844,9 @@ function openFilters(tab = 'general') {
         onclick: () => { Object.assign(draft, filterPrefs(FILTER_DEFAULTS)); render(); },
       }),
       showBtn));
+  // One fixed height for every tab, with only the middle scrolling, so the
+  // title, tabs and buttons stay put and switching tabs doesn't jump.
+  sheet.classList.add('filter-sheet');
 }
 
 // Read-only facts about one video, for the top of its long-press sheet:
@@ -2471,9 +2400,8 @@ async function playVideo(video) {
 
 // ─── INIT ─────────────────────────────────────────────────────────────────────
 appVersion.textContent = APP_VERSION;
-if (handleAuthCallback() === 'window') {
-  // the sign-in window - the app itself runs in the window that opened it
-} else if (!accessToken) {
+handleAuthCallback();
+if (!accessToken) {
   if (restoreSession()) {
     updateUI(true);
     scheduleRefresh();
