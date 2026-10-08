@@ -7,7 +7,7 @@ const VIDEO_MIME_TYPES = [
   'video/quicktime', 'video/x-msvideo', 'video/mpeg',
   'video/3gpp', 'video/x-flv', 'video/x-ms-wmv'
 ];
-const APP_VERSION = 'v37';
+const APP_VERSION = 'v38';
 const BROWSE_BATCH = 50;
 // Where api/ (stream, thumbnails, tags) is served from.
 const API_BASE = 'https://randomvidpick-139266625585.us-east1.run.app';
@@ -20,17 +20,31 @@ const RECENT_MS      = 30 * 24 * 3600 * 1000; // "recently watched" = past month
 // Display-only cleanup of filenames (Drive names and search are untouched):
 // - trailing video extensions, including doubled ones like "name.mp4.mp4"
 // - a "_Downloaded_YYYY_MM_DD_HH_MM_SS" stamp some download tools append
+// - an "_original" suffix some downloads carry
+// - resolution labels ("1080p", "720p", "1080HD", "4K", "UHD"...) - the
+//   quality tags show resolution, from Drive's own metadata
 // - underscores used as word separators
 const VIDEO_EXT_RE      = /(\.(mp4|m4v|mkv|webm|mov|avi|mpe?g|3gp|flv|wmv))+$/i;
 const DOWNLOAD_STAMP_RE = /[_\s]*downloaded(?:_\d{1,4}){6}$/i;
+const ORIGINAL_RE       = /[_\s]+original$/i;
+// A label standing alone between separators (start/end, space, _ - . brackets).
+const RESOLUTION_RE     = /(^|[\s_\-.(\[])(?:\d{3,4}[pi](?:HD)?|\d{3,4}HD|[2-8]K|UHD|FHD|QHD)(?=$|[\s_\-.)\],])/gi;
+const GLUED_4K_RE       = /(?<=[a-z])[4-8]K$/i; // "...Tease4K" at the very end
 function displayName(name) {
   const cleaned = name
     .replace(VIDEO_EXT_RE, '')
     .replace(DOWNLOAD_STAMP_RE, '')
+    .replace(ORIGINAL_RE, '')
+    .replace(RESOLUTION_RE, '$1')
+    .replace(GLUED_4K_RE, '')
     .replace(/_+/g, ' ')
+    .replace(/\(\s*\)|\[\s*\]/g, '')         // brackets left empty
+    .replace(/\s+([,.])/g, '$1')
+    .replace(/^[\s\-–—.,]+|[\s\-–—.,]+$/g, '') // separators left dangling at either end
     .replace(/\s+/g, ' ')
     .trim();
-  return cleaned || name;
+  // A name that was nothing but labels keeps them rather than going blank.
+  return cleaned || name.replace(VIDEO_EXT_RE, '') || name;
 }
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
