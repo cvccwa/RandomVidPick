@@ -5,6 +5,7 @@ const ALLOWED_ORIGIN = 'https://cvccwa.github.io';
 const DUR_KEY        = 'rvp:dur';     // hash: fileId -> duration ms
 const WATCHED_KEY    = 'rvp:watched'; // hash: fileId -> last-watched epoch ms
 const TAGS_KEY       = 'rvp:tags';    // hash: fileId -> JSON {tagName: source}
+const SHAPE_FIX_KEY  = 'rvp:shapefix'; // hash: fileId -> "WxH" as shown, where Drive's shape is wrong (api/analyze.js)
 const TAG_SOURCES    = new Set(['m', 'f', 'i']); // manual, filename-derived, imported
 const MAX_TAGS       = 50;
 const MAX_TAG_LEN    = 60;            // 40-char name + 'creator:' prefix, with margin
@@ -60,16 +61,22 @@ export default async function handler(req) {
   if (!(await isAuthorized(req))) return json({ error: 'unauthorized' }, 401);
 
   if (req.method === 'GET') {
-    const [dur, watched, tagPairs] = await Promise.all([
+    const [dur, watched, tagPairs, shapePairs] = await Promise.all([
       kvCommand(['HGETALL', DUR_KEY]),
       kvCommand(['HGETALL', WATCHED_KEY]),
       kvCommand(['HGETALL', TAGS_KEY]),
+      kvCommand(['HGETALL', SHAPE_FIX_KEY]),
     ]);
     const tags = {};
     for (let i = 0; i + 1 < (tagPairs || []).length; i += 2) {
       try { tags[tagPairs[i]] = JSON.parse(tagPairs[i + 1]); } catch (err) { /* skip corrupt row */ }
     }
-    return json({ durations: pairsToObject(dur), watched: pairsToObject(watched), tags });
+    const shapes = {};
+    for (let i = 0; i + 1 < (shapePairs || []).length; i += 2) {
+      const m = /^(\d+)x(\d+)$/.exec(shapePairs[i + 1]);
+      if (m) shapes[shapePairs[i]] = [Number(m[1]), Number(m[2])];
+    }
+    return json({ durations: pairsToObject(dur), watched: pairsToObject(watched), tags, shapes });
   }
 
   if (req.method === 'POST') {
