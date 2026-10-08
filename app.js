@@ -324,7 +324,7 @@ function librarySignature(videos) {
 // ─── META (durations + watched history, stored in KV via /api/meta) ──────────
 let metaWatched  = {};   // fileId -> last-watched epoch ms
 let metaTags     = {};   // fileId -> {tagName: source}  (m manual, f filename, i imported)
-let metaMedia    = {};   // fileId -> [width, height (as shown), fps, has audio 1/0, duration ms], from the server's header check
+let metaMedia    = {};   // fileId -> [width, height (as shown), fps, has audio 1/0, duration ms, stored short side, audio only 1/0], from the server's header check
 let metaPromise  = null; // load once per page
 const pendingDurations = {};
 const pendingWatched   = new Set();
@@ -451,9 +451,10 @@ function sizeOf(video) {
   return m && m[0] && m[1] ? [m[0], m[1]] : [video.width || 0, video.height || 0];
 }
 
-// Quality tags ("quality:4K" ...) are worked out from the resolution,
-// never stored: always right, nothing to back-fill, and the tag editor and
-// manager can't change them. They only take part in filtering and search.
+// Quality tags ("quality:4K" ...) are worked out from the resolution - the
+// stored size's short side, before any pixel-aspect stretch - never stored:
+// always right, nothing to back-fill, and the tag editor and manager can't
+// change them. They only take part in filtering and search.
 const QUALITY_PREFIX = 'quality:';
 
 function isQualityTag(name) {
@@ -461,7 +462,8 @@ function isQualityTag(name) {
 }
 
 function qualityTag(video) {
-  const short = Math.min(...sizeOf(video));
+  const m = metaMedia[video.id];
+  const short = m && m[5] ? m[5] : Math.min(video.width || 0, video.height || 0);
   if (!short) return null;
   const label = short >= 2000 ? '4K' : short >= 1300 ? '1440p' : short >= 1000 ? '1080p' : short >= 700 ? '720p' : 'SD';
   return QUALITY_PREFIX + label;
@@ -483,10 +485,12 @@ function shapeTag(video) {
   return SHAPE_PREFIX + label;
 }
 
-// Frame rate ("fps:60", shown "60 fps") and "audio:none" ("No audio") come
-// only from the header check, so videos it hasn't read yet have neither.
-const FPS_PREFIX   = 'fps:';
-const NO_AUDIO_TAG = 'audio:none';
+// Frame rate ("fps:60", shown "60 fps"), "audio:none" ("No audio") and
+// "audio:only" ("Audio only" - no picture at all) come only from the
+// header check, so videos it hasn't read yet have none of them.
+const FPS_PREFIX     = 'fps:';
+const NO_AUDIO_TAG   = 'audio:none';
+const AUDIO_ONLY_TAG = 'audio:only';
 
 function isFpsTag(name) {
   return name.startsWith(FPS_PREFIX);
@@ -499,7 +503,7 @@ function fpsTag(video) {
 
 function audioTag(video) {
   const m = metaMedia[video.id];
-  return m && !m[3] ? NO_AUDIO_TAG : null;
+  return !m ? null : m[6] ? AUDIO_ONLY_TAG : !m[3] ? NO_AUDIO_TAG : null;
 }
 
 // Stored tags plus the video's computed tags (quality, shape, frame rate,
@@ -519,6 +523,7 @@ function tagLabel(name) {
   if (isShapeTag(name)) return name.slice(SHAPE_PREFIX.length);
   if (isFpsTag(name)) return `${name.slice(FPS_PREFIX.length)} fps`;
   if (name === NO_AUDIO_TAG) return 'No audio';
+  if (name === AUDIO_ONLY_TAG) return 'Audio only';
   return isCreatorTag(name) ? name.slice(CREATOR_PREFIX.length) : name;
 }
 
@@ -540,7 +545,8 @@ function tagCounts(kind) {
 }
 
 // tagCounts plus the computed tags, for the filter picker: quality (best
-// first), shape, frame rate (highest first), no audio, then the stored tags.
+// first), shape, frame rate (highest first), no audio / audio only, then
+// the stored tags.
 const QUALITY_ORDER = ['4K', '1440p', '1080p', '720p', 'SD'];
 function filterTagCounts(kind) {
   const stored = tagCounts(kind);
@@ -554,7 +560,7 @@ function filterTagCounts(kind) {
     ...group(isQualityTag, t => QUALITY_ORDER.indexOf(tagLabel(t))),
     ...group(isShapeTag, t => SHAPE_ORDER.indexOf(tagLabel(t))),
     ...group(isFpsTag, t => -Number(t.slice(FPS_PREFIX.length))),
-    ...group(t => t === NO_AUDIO_TAG, () => 0),
+    ...group(t => t === NO_AUDIO_TAG || t === AUDIO_ONLY_TAG, t => (t === NO_AUDIO_TAG ? 0 : 1)),
     ...stored,
   ]);
 }

@@ -71,12 +71,14 @@ export default async function handler(req) {
     for (let i = 0; i + 1 < (tagPairs || []).length; i += 2) {
       try { tags[tagPairs[i]] = JSON.parse(tagPairs[i + 1]); } catch (err) { /* skip corrupt row */ }
     }
-    // Compact for the app: [width, height (as shown), fps, has audio 1/0, duration ms].
+    // Compact for the app: [width, height (as shown), fps, has audio 1/0,
+    // duration ms, stored short side (resolution), audio only 1/0].
     const media = {};
     for (let i = 0; i + 1 < (mediaPairs || []).length; i += 2) {
       let m;
       try { m = JSON.parse(mediaPairs[i + 1]); } catch (err) { continue; }
-      if (!m.err) media[mediaPairs[i]] = [m.w || 0, m.h || 0, m.fps || 0, m.ac ? 1 : 0, m.d || 0];
+      if (m.audioOnly) media[mediaPairs[i]] = [0, 0, 0, 1, m.d || 0, 0, 1];
+      else if (!m.err) media[mediaPairs[i]] = [m.w || 0, m.h || 0, m.fps || 0, m.ac ? 1 : 0, m.d || 0, Math.min(m.sw || 0, m.sh || 0), 0];
     }
     return json({ durations: pairsToObject(dur), watched: pairsToObject(watched), tags, media });
   }

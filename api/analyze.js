@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { getServiceAccountToken, kvCommand } from './_lib/serviceAccount.js';
 import { isAuthorized } from './_lib/auth.js';
-import { FFMPEG, TRANSIENT_RE, probeInfo } from './_lib/media.js';
+import { FFMPEG, isTransient, probeInfo } from './_lib/media.js';
 import { sourceUrl, pieceArgs, driveBytesRead, lastDriveRefusal } from './_lib/driveSource.js';
 import { listLibrary } from './_lib/library.js';
 import { libraryStats } from './_lib/libraryStats.js';
@@ -46,9 +46,10 @@ const TODO_KEY       = 'rvp:analyze:todo';
 const LISTED_KEY     = 'rvp:analyze:listedAt';
 const LOCK_KEY       = 'rvp:analyze:lock';
 const VERSION        = 1;
-// fileId -> JSON {w, h, rot, fps, vc, ac, d} (shown size, rotation, frame
-// rate, video / audio codec ('' = no audio), duration ms), or {err: 1} if
-// the header couldn't be read. Every file checked has an entry.
+// fileId -> JSON {w, h, sw, sh, rot, fps, vc, ac, d}: size as shown,
+// stored size, rotation, frame rate, video / audio codec ('' = no audio),
+// duration ms. An audio-only file is {audioOnly: 1, ac, d}; one whose
+// header couldn't be read is {err: <why>}. Every file checked has an entry.
 const MEDIA_KEY      = 'rvp:media';
 const MEDIA_TODO_KEY = 'rvp:media:todo';
 const MEDIA_PARALLEL = 4;
@@ -136,7 +137,7 @@ function measure(id, t, token, hasAudio) {
       const diffs = [...out.matchAll(/signalstats\.YAVG=([\d.]+)/g)].map(m => Number(m[1]));
       if (!diffs.length) {
         const e = new Error('no frames');
-        e.transient = TRANSIENT_RE.test(err);
+        e.transient = isTransient(err);
         return reject(e);
       }
       const vol = /mean_volume: (-?[\d.]+) dB/.exec(err);
@@ -278,7 +279,13 @@ async function loadTodo(token) {
   return { todo, mediaTodo };
 }
 
-// Same rule as shapeTag in app.js.
+// Same rules as qualityTag and shapeTag in app.js.
+function qualityOf(w, h) {
+  const short = Math.min(w || 0, h || 0);
+  if (!short) return null;
+  return short >= 2000 ? '4K' : short >= 1300 ? '1440p' : short >= 1000 ? '1080p' : short >= 700 ? '720p' : 'SD';
+}
+
 function shapeOf(w, h) {
   if (!w || !h) return null;
   return w > h * 1.1 ? 'Landscape' : h > w * 1.1 ? 'Portrait' : 'Square';
@@ -296,25 +303,35 @@ async function checkMedia(mediaTodo, token, deadline) {
     while (!stopReason && next < mediaTodo.length && Date.now() < deadline) {
       const [id, driveW, driveH] = mediaTodo[next++];
       let info = null;
+      let record;
       try {
         info = await probeInfo(id, token, 'analyze', AbortSignal.timeout(MEDIA_TIMEOUT_MS));
+        record = {
+          w: info.width, h: info.height, sw: info.storedWidth, sh: info.storedHeight, rot: info.rotation,
+          fps: Math.round(info.fps * 100) / 100, vc: info.videoCodec, ac: info.audioCodec,
+          d: Math.round(info.duration * 1000),
+        };
       } catch (err) {
         // Drive refusing: not marked, so the next hourly re-list retries it
         // (and analysis isn't held up behind it meanwhile). Anything else -
-        // unreadable header, too slow - is recorded as unreadable.
+        // audio only, unreadable header, too slow - is recorded as it is.
         if (err.transient) {
           if (++transientStreak >= STOP_AFTER_TRANSIENT && !stopReason) {
             stopReason = `${err.message} [Drive says: ${lastDriveRefusal('analyze') || 'no reason given'}]`;
           }
           continue;
         }
+        record = err.audioOnly
+          ? { audioOnly: 1, ac: err.audioCodec, d: Math.round(err.duration * 1000) }
+          : { err: err.message.slice(0, 120) };
+        console.log(`header check ${id.slice(0, 6)}…: ${err.audioOnly ? `audio only (${err.audioCodec})` : `unreadable: ${record.err}`}`);
       }
       transientStreak = 0;
-      const record = info ? {
-        w: info.width, h: info.height, rot: info.rotation,
-        fps: Math.round(info.fps * 100) / 100, vc: info.videoCodec, ac: info.audioCodec,
-        d: Math.round(info.duration * 1000),
-      } : { err: 1 };
+      const driveQuality = qualityOf(driveW, driveH);
+      const headerQuality = info ? qualityOf(info.storedWidth, info.storedHeight) : null;
+      if (driveQuality && headerQuality && driveQuality !== headerQuality) {
+        console.log(`header check ${id.slice(0, 6)}…: quality differs, Drive ${driveW}x${driveH} (${driveQuality}), stored ${info.storedWidth}x${info.storedHeight} (${headerQuality})`);
+      }
       const driveShape = shapeOf(driveW, driveH);
       const shownShape = info ? shapeOf(info.width, info.height) : null;
       if (shownShape && shownShape !== driveShape) {

@@ -12,12 +12,19 @@ const probeCache = new Map(); // file id -> { hasAudio, fps, duration }
 // Why ffmpeg couldn't read a file. HTTP / network trouble (Drive refusing
 // or rate-limiting, timeouts) is marked transient - worth retrying later -
 // as opposed to a file that genuinely has no readable video.
-export const TRANSIENT_RE = /HTTP error|Server returned|4\d\d |5\d\d |Connection|timed out|Input\/output error|Network is unreachable|Temporary failure/i;
+const TRANSIENT_RE = /HTTP error|Server returned|4\d\d |5\d\d |Connection|timed out|Input\/output error|Network is unreachable|Temporary failure/i;
+// Reading in small pieces (driveSource.js), ffmpeg logs "Will reconnect at
+// ... error=Input/output error" at the end of every piece; that's normal,
+// not trouble.
+const PIECE_END_RE = /Will reconnect at \d+.*error=(Input\/output error|End of file)/;
+export function isTransient(stderr) {
+  return TRANSIENT_RE.test(String(stderr).split('\n').filter(l => !PIECE_END_RE.test(l)).join('\n'));
+}
 function probeError(stderr) {
-  const lines = stderr.trim().split('\n').filter(l => !/^\s*(built with|configuration:|lib\w+ )/.test(l));
+  const lines = stderr.trim().split('\n').filter(l => !/^\s*(built with|configuration:|lib\w+ )/.test(l) && !PIECE_END_RE.test(l));
   const detail = (lines.filter(l => /error|returned|failed|invalid/i.test(l)).pop() || lines.pop() || '').trim().slice(0, 200);
   const err = new Error(`no video stream${detail ? `: ${detail}` : ''}`);
-  err.transient = TRANSIENT_RE.test(stderr);
+  err.transient = isTransient(stderr);
   return err;
 }
 
@@ -38,11 +45,22 @@ export function probeInfo(id, token, purpose = 'compile', signal) {
     ff.on('close', () => {
       signal?.removeEventListener('abort', kill);
       if (signal?.aborted) return reject(new Error('probe cancelled'));
-      const videoLine = (/Stream #0:\d+[^:]*: Video:.*/.exec(stderr) || [])[0];
-      if (!videoLine) return reject(probeError(stderr));
-      const rate = /([\d.]+) fps/.exec(videoLine) || /([\d.]+) tbr/.exec(videoLine);
+      // Cover art in an audio file shows up as an "attached pic" video stream.
+      const videoLine = (stderr.match(/Stream #0:\d+[^:]*: Video:.*/g) || []).find(l => !/attached pic/.test(l));
       const dur = /Duration: (\d+):(\d+):([\d.]+)/.exec(stderr);
       const audioLine = (/Stream #0:\d+[^:]*: Audio: (\w+)/.exec(stderr) || [])[1];
+      if (!videoLine) {
+        const err = probeError(stderr);
+        if (audioLine && !err.transient) {
+          // Readable, just no picture: an audio-only file.
+          err.message = 'audio only';
+          err.audioOnly = true;
+          err.audioCodec = audioLine;
+          err.duration = dur ? Number(dur[1]) * 3600 + Number(dur[2]) * 60 + Number(dur[3]) : 0;
+        }
+        return reject(err);
+      }
+      const rate = /([\d.]+) fps/.exec(videoLine) || /([\d.]+) tbr/.exec(videoLine);
       const info = {
         hasAudio: Boolean(audioLine),
         videoCodec: (/Video: (\w+)/.exec(videoLine) || [])[1] || '',
@@ -58,15 +76,17 @@ export function probeInfo(id, token, purpose = 'compile', signal) {
   });
 }
 
-// The stream line gives the stored size; players also apply the pixel
-// aspect (SAR) and any rotation flag - phones often store video sideways
-// and mark it "rotate 90". Drive reports the stored size, so its shape can
-// be wrong for those.
+// The stream line gives the stored size, which is what resolution (quality)
+// means; players also apply the pixel aspect (SAR) and any rotation flag -
+// phones often store video sideways and mark it "rotate 90". Drive reports
+// the stored size, so its shape can be wrong for those.
 function shownSize(stderr, videoLine) {
   const size = /, (\d{2,5})x(\d{2,5})[, ]/.exec(videoLine);
-  if (!size) return { width: 0, height: 0, rotation: 0 };
-  let width = Number(size[1]);
-  let height = Number(size[2]);
+  if (!size) return { width: 0, height: 0, storedWidth: 0, storedHeight: 0, rotation: 0 };
+  const storedWidth = Number(size[1]);
+  const storedHeight = Number(size[2]);
+  let width = storedWidth;
+  let height = storedHeight;
   const sar = /\[SAR (\d+):(\d+)/.exec(videoLine);
   if (sar && Number(sar[1]) > 0 && Number(sar[2]) > 0) width = Math.round(width * Number(sar[1]) / Number(sar[2]));
   // This stream's own block only (up to the next stream).
@@ -76,5 +96,5 @@ function shownSize(stderr, videoLine) {
   const rot = /displaymatrix: rotation of (-?[\d.]+) degrees/.exec(block) || /rotate\s*:\s*(-?\d+)/.exec(block);
   const rotation = rot ? ((Math.round(Number(rot[1])) % 360) + 360) % 360 : 0;
   if (rotation === 90 || rotation === 270) [width, height] = [height, width];
-  return { width, height, rotation };
+  return { width, height, storedWidth, storedHeight, rotation };
 }
