@@ -7,7 +7,7 @@ const VIDEO_MIME_TYPES = [
   'video/quicktime', 'video/x-msvideo', 'video/mpeg',
   'video/3gpp', 'video/x-flv', 'video/x-ms-wmv'
 ];
-const APP_VERSION = 'v44';
+const APP_VERSION = 'v45';
 const BROWSE_BATCH = 50;
 // Where api/ (stream, thumbnails, tags) is served from.
 const API_BASE = 'https://randomvidpick-139266625585.us-east1.run.app';
@@ -76,7 +76,8 @@ const browseGrid       = document.getElementById('browseGrid');
 const browseSentinel   = document.getElementById('browseSentinel');
 const browseSort       = document.getElementById('browseSort');
 const browseDir        = document.getElementById('browseDir');
-const browseFilter     = document.getElementById('browseFilter');
+const browseFiltersBtn = document.getElementById('browseFiltersBtn');
+const browseSelectBtn  = document.getElementById('browseSelectBtn');
 const browseTagBar     = document.getElementById('browseTagBar');
 const browseRandomBtn  = document.getElementById('browseRandomBtn');
 const browseCompileBtn = document.getElementById('browseCompileBtn');
@@ -476,7 +477,7 @@ function qualityTag(video) {
 // Shape tags ("shape:Portrait" ...) work the same way: filter to one shape
 // and a Smooth compilation has no mixed frames.
 const SHAPE_PREFIX = 'shape:';
-const SHAPE_ORDER  = ['Portrait', 'Landscape', 'Square'];
+const SHAPE_ORDER  = ['Landscape', 'Portrait', 'Square'];
 
 function isShapeTag(name) {
   return name.startsWith(SHAPE_PREFIX);
@@ -500,9 +501,23 @@ function isFpsTag(name) {
   return name.startsWith(FPS_PREFIX);
 }
 
+// Frame rates are grouped to the nearest common rate: 24 takes film and
+// PAL (23.98-26), 30 NTSC (27-36), 45 the odd 43-47, 60 takes 48-69 (50
+// included); faster ones snap to 90 / 120 / 144 / 240. The library has no
+// videos near the boundaries.
+function fpsBin(fps) {
+  if (!fps) return null;
+  if (fps < 27) return 24;
+  if (fps < 37) return 30;
+  if (fps < 48) return 45;
+  if (fps < 70) return 60;
+  return [90, 120, 144, 240].reduce((a, b) => (Math.abs(b - fps) < Math.abs(a - fps) ? b : a));
+}
+
 function fpsTag(video) {
   const m = metaMedia[video.id];
-  return m && m[2] ? FPS_PREFIX + Math.round(m[2]) : null;
+  const bin = m && fpsBin(m[2]);
+  return bin ? FPS_PREFIX + bin : null;
 }
 
 function audioTag(video) {
@@ -548,25 +563,15 @@ function tagCounts(kind) {
   return new Map([...counts].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])));
 }
 
-// tagCounts plus the computed tags, for the filter picker: quality (best
-// first), shape, frame rate (highest first), no audio / audio only, then
-// the stored tags.
 const QUALITY_ORDER = ['4K', '1440p', '1080p', '720p', 'SD'];
-function filterTagCounts(kind) {
-  const stored = tagCounts(kind);
-  if (kind === 'creator') return stored;
+
+// Videos per computed tag ('quality:1080p' -> 2363), for the Format tab.
+function formatCounts() {
   const counts = new Map();
   for (const v of videoCache || []) {
     for (const t of computedTags(v)) counts.set(t, (counts.get(t) || 0) + 1);
   }
-  const group = (test, rank) => [...counts].filter(([t]) => test(t)).sort((a, b) => rank(a[0]) - rank(b[0]));
-  return new Map([
-    ...group(isQualityTag, t => QUALITY_ORDER.indexOf(tagLabel(t))),
-    ...group(isShapeTag, t => SHAPE_ORDER.indexOf(tagLabel(t))),
-    ...group(isFpsTag, t => -Number(t.slice(FPS_PREFIX.length))),
-    ...group(t => t === NO_AUDIO_TAG || t === AUDIO_ONLY_TAG, t => (t === NO_AUDIO_TAG ? 0 : 1)),
-    ...stored,
-  ]);
+  return counts;
 }
 
 // Tidies a typed name into a full tag (adding the creator prefix if asked)
@@ -746,12 +751,49 @@ function launchOrOffer(tappedAt, title) {
 // ─── BROWSE ───────────────────────────────────────────────────────────────────
 // Sort/filter choices, remembered between visits.
 const SORT_DEFAULT_DIR = { name: 'asc', created: 'desc', duration: 'desc', size: 'desc', watched: 'desc', random: 'asc' };
-let browsePrefs = { sort: 'name', dir: 'asc', filter: 'all', creators: [], tags: [], excluded: [], tagMode: 'all' };
+// Filters (the Filters sheet, openFilters):
+//   watched   'any' | 'only' | 'hide'   - watched in the last 30 days
+//   folder    null (all) or one folder path
+//   uploaded  'any' | 'week' | 'month' | 'quarter'
+//   lenMin/lenMax  minutes; 0 / LEN_MAX mean no bound
+//   formats   computed tags picked in the Format tab ('quality:1080p',
+//             'fps:60', 'shape:Portrait'): any within a group, all groups
+//   creators  any of them; excluded: creators or tags to hide
+//   tags, tagMode ('all' | 'any'), untagged
+const LEN_MAX = 120;
+const FILTER_DEFAULTS = {
+  watched: 'any', folder: null, uploaded: 'any', lenMin: 0, lenMax: LEN_MAX,
+  formats: [], creators: [], tags: [], excluded: [], tagMode: 'all', untagged: false,
+};
+let browsePrefs = { sort: 'name', dir: 'asc', ...structuredClone(FILTER_DEFAULTS) };
 let randomRank  = new Map(); // fileId -> position, reshuffled on demand
 
 try {
   Object.assign(browsePrefs, JSON.parse(localStorage.getItem('rvp_browse_prefs') || '{}'));
 } catch (err) { /* private mode or corrupt value - keep defaults */ }
+migrateBrowsePrefs();
+
+// Before v45 one dropdown held watched / untagged / folder, and quality,
+// shape and frame-rate tags were picked among the ordinary tags.
+function migrateBrowsePrefs() {
+  const f = browsePrefs.filter;
+  if (f === 'recent') browsePrefs.watched = 'only';
+  else if (f === 'unwatched') browsePrefs.watched = 'hide';
+  else if (f === 'untagged') browsePrefs.untagged = true;
+  else if (typeof f === 'string' && f.startsWith('folder:')) browsePrefs.folder = f.slice('folder:'.length);
+  delete browsePrefs.filter;
+  const computed = t => isQualityTag(t) || isShapeTag(t) || isFpsTag(t) || t.startsWith('audio:');
+  browsePrefs.formats = [...new Set([...(browsePrefs.formats || []),
+    ...(browsePrefs.tags || []).filter(t => isQualityTag(t) || isShapeTag(t) || isFpsTag(t))])];
+  browsePrefs.tags = (browsePrefs.tags || []).filter(t => !computed(t));
+  browsePrefs.excluded = (browsePrefs.excluded || []).filter(t => !computed(t));
+}
+
+function filterPrefs(p = browsePrefs) {
+  const out = {};
+  for (const k of Object.keys(FILTER_DEFAULTS)) out[k] = structuredClone(p[k] ?? FILTER_DEFAULTS[k]);
+  return out;
+}
 
 function saveBrowsePrefs() {
   try { localStorage.setItem('rvp_browse_prefs', JSON.stringify(browsePrefs)); } catch (err) {}
@@ -793,34 +835,55 @@ function sortVideos(list) {
   return keyed.map(([, v]) => v);
 }
 
-function filterVideos(query) {
-  const { filter } = browsePrefs;
+const UPLOAD_DAYS = { week: 7, month: 30, quarter: 90 };
+
+// Format groups: the Format tab's sections, in order.
+const FORMAT_GROUPS = [
+  { id: 'quality', title: 'Resolution', test: t => isQualityTag(t), rank: t => QUALITY_ORDER.indexOf(tagLabel(t)) },
+  { id: 'fps', title: 'Frame rate', test: t => isFpsTag(t), rank: t => Number(t.slice(FPS_PREFIX.length)) },
+  { id: 'shape', title: 'Orientation', test: t => isShapeTag(t), rank: t => SHAPE_ORDER.indexOf(tagLabel(t)) },
+];
+
+function filterVideos(query, p = browsePrefs) {
   let list = videoCache || [];
 
-  if (filter === 'recent')        list = list.filter(v => isRecentlyWatched(v.id));
-  else if (filter === 'unwatched') list = list.filter(v => !isRecentlyWatched(v.id));
-  else if (filter === 'untagged') list = list.filter(v => !tagNames(v.id).length);
-  else if (filter.startsWith('folder:')) {
-    const folder = filter.slice('folder:'.length);
-    list = list.filter(v => v.path === folder);
+  if (p.watched === 'only') list = list.filter(v => isRecentlyWatched(v.id));
+  else if (p.watched === 'hide') list = list.filter(v => !isRecentlyWatched(v.id));
+  if (p.folder != null) list = list.filter(v => v.path === p.folder);
+  if (UPLOAD_DAYS[p.uploaded]) {
+    const since = Date.now() - UPLOAD_DAYS[p.uploaded] * 864e5;
+    list = list.filter(v => v.created >= since);
+  }
+  // Length: videos whose length isn't known yet are left out while it's set.
+  if (p.lenMin > 0 || p.lenMax < LEN_MAX) {
+    list = list.filter(v => {
+      const min = (v.durationMs || 0) / 60000;
+      return v.durationMs && min >= p.lenMin && (p.lenMax >= LEN_MAX || min <= p.lenMax);
+    });
   }
 
+  // Format: any picked value within a group, and every group that has one.
+  const groups = FORMAT_GROUPS.map(g => p.formats.filter(g.test)).filter(g => g.length);
+  if (groups.length) {
+    list = list.filter(v => {
+      const tags = computedTags(v);
+      return groups.every(g => g.some(t => tags.includes(t)));
+    });
+  }
+
+  if (p.untagged) list = list.filter(v => !tagNames(v.id).length);
+
   // Creators: a video matches if it has any of the chosen creators.
-  const creators = browsePrefs.creators;
-  if (creators.length) list = list.filter(v => creators.some(c => c in filterTagsOf(v)));
+  if (p.creators.length) list = list.filter(v => p.creators.some(c => c in tagsOf(v.id)));
 
   // Exclusions (creators or tags): hide any video carrying one.
-  const excluded = browsePrefs.excluded || [];
-  if (excluded.length) list = list.filter(v => !excluded.some(t => t in filterTagsOf(v)));
+  if (p.excluded.length) list = list.filter(v => !p.excluded.some(t => t in tagsOf(v.id)));
 
   // Tags: videos must carry all chosen tags (or any, if toggled).
-  const wanted = browsePrefs.tags;
-  if (wanted.length) {
+  if (p.tags.length) {
     list = list.filter(v => {
-      const tags = filterTagsOf(v);
-      return browsePrefs.tagMode === 'any'
-        ? wanted.some(t => t in tags)
-        : wanted.every(t => t in tags);
+      const tags = tagsOf(v.id);
+      return p.tagMode === 'any' ? p.tags.some(t => t in tags) : p.tags.every(t => t in tags);
     });
   }
 
@@ -869,31 +932,9 @@ function syncBrowseControls() {
     : browsePrefs.dir === 'asc' ? '↑ Asc' : '↓ Desc';
 }
 
-function populateFolderFilter() {
-  const folders = [...new Set((videoCache || []).map(v => v.path))]
+function libraryFolders() {
+  return [...new Set((videoCache || []).map(v => v.path))]
     .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
-  browseFilter.innerHTML = '';
-  const add = (parent, value, label) => {
-    const o = document.createElement('option');
-    o.value = value;
-    o.textContent = label;
-    parent.appendChild(o);
-  };
-  add(browseFilter, 'all', 'All videos');
-  add(browseFilter, 'recent', 'Watched in last 30 days');
-  add(browseFilter, 'unwatched', 'Not watched in last 30 days');
-  add(browseFilter, 'untagged', 'Untagged');
-  if (folders.length > 1) {
-    const group = document.createElement('optgroup');
-    group.label = 'Folder';
-    for (const f of folders) add(group, `folder:${f}`, f || '(root folder)');
-    browseFilter.appendChild(group);
-  }
-  // A remembered folder that no longer exists falls back to everything.
-  if (![...browseFilter.options].some(o => o.value === browsePrefs.filter)) {
-    browsePrefs.filter = 'all';
-  }
-  browseFilter.value = browsePrefs.filter;
 }
 
 browseSort.addEventListener('change', () => {
@@ -910,12 +951,6 @@ browseDir.addEventListener('click', () => {
   else browsePrefs.dir = browsePrefs.dir === 'asc' ? 'desc' : 'asc';
   saveBrowsePrefs();
   syncBrowseControls();
-  refreshBrowse();
-});
-
-browseFilter.addEventListener('change', () => {
-  browsePrefs.filter = browseFilter.value;
-  saveBrowsePrefs();
   refreshBrowse();
 });
 
@@ -1374,13 +1409,13 @@ async function openBrowseView() {
     await ensureMeta();
     if (!randomRank.size) reshuffle();
     browseSearch.value = '';
-    populateFolderFilter();
     await migrateCreatorTags();
-    // Drop remembered filters for tags/creators that no longer exist.
-    const known = filterTagCounts();
-    browsePrefs.creators = (browsePrefs.creators || []).filter(t => known.has(t) && isCreatorTag(t));
-    browsePrefs.tags     = (browsePrefs.tags || []).filter(t => known.has(t) && !isCreatorTag(t));
-    browsePrefs.excluded = (browsePrefs.excluded || []).filter(t => known.has(t));
+    // Drop remembered filters for tags, creators or folders that no longer exist.
+    const known = tagCounts();
+    browsePrefs.creators = browsePrefs.creators.filter(t => known.has(t) && isCreatorTag(t));
+    browsePrefs.tags     = browsePrefs.tags.filter(t => known.has(t) && !isCreatorTag(t));
+    browsePrefs.excluded = browsePrefs.excluded.filter(t => known.has(t));
+    if (browsePrefs.folder != null && !libraryFolders().includes(browsePrefs.folder)) browsePrefs.folder = null;
     syncBrowseControls();
     refreshTagBar();
     refreshBrowse();
@@ -1423,7 +1458,6 @@ function applyPendingLibrary() {
   videoCache = pendingLibrary;
   pendingLibrary = null;
   reshuffle();
-  populateFolderFilter();
   refreshTagBar();
   refreshBrowse();
 }
@@ -1441,6 +1475,8 @@ function closeBrowseView() {
 }
 
 document.getElementById('browseManageBtn').addEventListener('click', () => openTagManager());
+browseFiltersBtn.addEventListener('click', () => openFilters());
+browseSelectBtn.addEventListener('click', () => setSelectMode(!selectMode));
 
 browseSearch.addEventListener('input', () => {
   clearTimeout(browseSearchDebounce);
@@ -1468,47 +1504,85 @@ function chipButton(text, className, onclick, title) {
 // Bar under the sort controls: SELECT, a CREATOR and a TAGS filter button
 // (each opens a searchable picker), manage, then the active filters as
 // removable chips so it's clear what's narrowing the grid.
+// The active filters as chips under the controls, each tapped to remove:
+// row 1 the search, creators, then the General and Format filters; row 2
+// the tags. The ✕ before them clears everything, search included.
+const UPLOAD_LABELS = { week: 'Past week', month: 'Past month', quarter: 'Past 3 months' };
+
+function lengthLabel(p) {
+  if (p.lenMin <= 0 && p.lenMax >= LEN_MAX) return 'Any length';
+  if (p.lenMax >= LEN_MAX) return `${p.lenMin}+ min`;
+  if (p.lenMin <= 0) return `Up to ${p.lenMax} min`;
+  return `${p.lenMin}–${p.lenMax} min`;
+}
+
+function activeFilterCount(p = browsePrefs) {
+  return (p.watched !== 'any') + (p.folder != null) + (p.uploaded !== 'any')
+    + (p.lenMin > 0 || p.lenMax < LEN_MAX) + p.formats.length
+    + p.creators.length + p.tags.length + p.excluded.length + p.untagged;
+}
+
+function applyFilters(next) {
+  Object.assign(browsePrefs, filterPrefs(next));
+  saveBrowsePrefs();
+  refreshTagBar();
+  refreshBrowse();
+}
+
 function refreshTagBar() {
-  const { creators, tags } = browsePrefs;
-  const excluded = browsePrefs.excluded || [];
-  const creatorCount = creators.length + excluded.filter(isCreatorTag).length;
-  const tagCount     = tags.length + excluded.filter(t => !isCreatorTag(t)).length;
-  browseTagBar.innerHTML = '';
-  browseTagBar.append(
-    chipButton(selectMode ? '✕ Cancel' : '☑ Select',
-      'tag-chip-action' + (selectMode ? ' active' : ''), () => setSelectMode(!selectMode)),
-    chipButton(creatorCount ? `👤 Creator · ${creatorCount}` : '👤 Creator ▾',
-      'tag-chip-action' + (creatorCount ? ' filtering' : ''), () => openFilterPicker('creator')),
-    chipButton(tagCount ? `🏷 Tags · ${tagCount}` : '🏷 Tags ▾',
-      'tag-chip-action' + (tagCount ? ' filtering' : ''), () => openFilterPicker('tag'))
-  );
-  const removeFilter = name => () => {
-    browsePrefs.creators = browsePrefs.creators.filter(t => t !== name);
-    browsePrefs.tags     = browsePrefs.tags.filter(t => t !== name);
-    browsePrefs.excluded = excluded.filter(t => t !== name);
-    saveBrowsePrefs();
-    refreshTagBar();
-    refreshBrowse();
-  };
-  // The search text shows as a chip too, so it can be cleared with one tap
-  // after scrolling away from the search box.
+  const p = browsePrefs;
+  const count = activeFilterCount();
+  browseFiltersBtn.textContent = count ? `Filters · ${count}` : 'Filters';
+  browseFiltersBtn.classList.toggle('filtering', count > 0);
+
+  const chip = (label, className, change) => chipButton(`${label} ✕`, className, () => {
+    const next = filterPrefs();
+    change(next);
+    applyFilters(next);
+  }, 'Remove this filter');
+  const row1 = [];
+  const row2 = [];
   const query = browseSearch.value.trim();
   if (query) {
     const shown = query.length > 24 ? `${query.slice(0, 23)}…` : query;
-    browseTagBar.append(chipButton(`🔍 "${shown}" ✕`, 'active', () => {
+    row1.push(chipButton(`🔍 "${shown}" ✕`, 'active', () => {
       browseSearch.value = '';
       refreshTagBar();
       refreshBrowse();
     }, 'Clear the search'));
   }
-  for (const name of [...creators, ...tags]) {
-    browseTagBar.append(chipButton(`${isCreatorTag(name) ? '👤 ' : ''}${tagLabel(name)} ✕`, 'active',
-      removeFilter(name), 'Remove this filter'));
+  const remove = (key, name) => n => { n[key] = n[key].filter(t => t !== name); };
+  for (const c of p.creators) row1.push(chip(`👤 ${tagLabel(c)}`, 'active', remove('creators', c)));
+  for (const c of p.excluded.filter(isCreatorTag)) row1.push(chip(`− 👤 ${tagLabel(c)}`, 'excluded', remove('excluded', c)));
+  if (p.lenMin > 0 || p.lenMax < LEN_MAX) row1.push(chip(lengthLabel(p), 'active', n => { n.lenMin = 0; n.lenMax = LEN_MAX; }));
+  if (p.uploaded !== 'any') row1.push(chip(UPLOAD_LABELS[p.uploaded], 'active', n => { n.uploaded = 'any'; }));
+  if (p.folder != null) row1.push(chip(`📁 ${p.folder || '(root folder)'}`, 'active', n => { n.folder = null; }));
+  if (p.watched !== 'any') {
+    row1.push(chip(p.watched === 'only' ? 'Watched recently' : 'Not watched recently',
+      p.watched === 'only' ? 'active' : 'excluded', n => { n.watched = 'any'; }));
   }
-  for (const name of excluded) {
-    browseTagBar.append(chipButton(`− ${isCreatorTag(name) ? '👤 ' : ''}${tagLabel(name)} ✕`, 'excluded',
-      removeFilter(name), 'Excluded - tap to remove this filter'));
+  for (const g of FORMAT_GROUPS) {
+    for (const t of p.formats.filter(g.test).sort((a, b) => g.rank(a) - g.rank(b))) {
+      row1.push(chip(tagLabel(t), 'active', remove('formats', t)));
+    }
   }
+  for (const t of p.tags) row2.push(chip(tagLabel(t), 'active', remove('tags', t)));
+  for (const t of p.excluded.filter(t => !isCreatorTag(t))) row2.push(chip(`− ${tagLabel(t)}`, 'excluded', remove('excluded', t)));
+  if (p.untagged) row2.push(chip('Untagged', 'active', n => { n.untagged = false; }));
+
+  browseTagBar.innerHTML = '';
+  browseTagBar.hidden = !row1.length && !row2.length;
+  if (browseTagBar.hidden) return;
+  const rows = el('div', { className: 'filter-rows' });
+  if (row1.length) rows.append(el('div', { className: 'filter-row' }, ...row1));
+  if (row2.length) rows.append(el('div', { className: 'filter-row' }, ...row2));
+  browseTagBar.append(
+    el('button', {
+      type: 'button', className: 'filter-clear', textContent: '✕',
+      title: 'Clear all filters and the search', ariaLabel: 'Clear all filters and the search',
+      onclick: () => { browseSearch.value = ''; applyFilters(FILTER_DEFAULTS); },
+    }),
+    rows);
 }
 
 function setSelectMode(on) {
@@ -1518,8 +1592,10 @@ function setSelectMode(on) {
     browseGrid.querySelectorAll('.browse-card.selected').forEach(c => c.classList.remove('selected'));
   }
   browseView.classList.toggle('selecting', on);
+  browseSelectBtn.classList.toggle('active', on);
+  browseSelectBtn.textContent = on ? '✕' : '☑';
+  browseSelectBtn.title = on ? 'Stop selecting' : 'Select videos to tag';
   updateSelectBar();
-  if (browseView.classList.contains('visible')) refreshTagBar();
 }
 
 function toggleSelected(id, card) {
@@ -1581,80 +1657,199 @@ function matchesQuery(name, query) {
 // apply on DONE.
 // Searchable picker for the creator or tag filter. Tapping a row cycles
 // off -> include (✓) -> exclude (✕) -> off. Changes apply on Done.
-function openFilterPicker(kind) {
-  const isCreator = kind === 'creator';
-  const prefKey   = isCreator ? 'creators' : 'tags';
-  const counts    = filterTagCounts(kind);
-  const state     = new Map(); // name -> 'include' | 'exclude'
-  for (const n of browsePrefs[prefKey]) state.set(n, 'include');
-  for (const n of browsePrefs.excluded || []) if (tagKind(n) === kind) state.set(n, 'exclude');
-  let query  = '';
-  let byName = isCreator; // creators default to A-Z, tags to most-used
-  let mode   = browsePrefs.tagMode;
+// One Filters sheet with four tabs. Changes go into a draft that the
+// "Show N videos" button applies (the count updates as you go); closing the
+// sheet any other way leaves the filters as they were.
+const FILTER_TABS = [['general', 'General'], ['format', 'Format'], ['creator', 'Creator'], ['tag', 'Tags']];
 
-  const list = el('div', { className: 'sheet-list picker-list' });
-  const sortBtn = el('button', { type: 'button', className: 'sheet-btn small' });
-  const modeBtn = el('button', { type: 'button', className: 'sheet-btn small' });
+function openFilters(tab = 'general') {
+  const draft = filterPrefs();
+  const query = { creator: '', tag: '' };
+  const byName = { creator: true, tag: false }; // creators A-Z, tags most-used
+  const tabBar = el('div', { className: 'filter-tabs', role: 'tablist' });
+  const body = el('div', { className: 'filter-body' });
+  const showBtn = el('button', { type: 'button', className: 'sheet-btn primary filter-show', onclick: () => { closeSheet(); applyFilters(draft); } });
 
-  const render = () => {
-    sortBtn.textContent = byName ? 'Sort: A–Z' : 'Sort: Most videos';
-    modeBtn.textContent = mode === 'any' ? 'Match any' : 'Match all';
-    list.innerHTML = '';
-    let names = [...counts.keys()].filter(n => matchesQuery(n, query));
-    if (byName) names.sort((a, b) => tagLabel(a).localeCompare(tagLabel(b), undefined, { numeric: true }));
-    // Keep included/excluded ones on top so they're easy to change.
-    names.sort((a, b) => state.has(b) - state.has(a));
-    if (!names.length) {
-      list.append(el('div', { className: 'sheet-note',
-        textContent: counts.size ? 'No matches.' : `No ${isCreator ? 'creators' : 'tags'} yet.` }));
-    }
-    for (const name of names) {
-      const st = state.get(name);
-      list.append(el('button', {
-        type: 'button',
-        className: `sheet-list-row tri-row ${st || ''}`,
-        onclick: () => {
-          if (!st) state.set(name, 'include');
-          else if (st === 'include') state.set(name, 'exclude');
-          else state.delete(name);
-          render();
-        },
-      },
-        el('span', { className: 'tri-box', textContent: st === 'include' ? '✓' : st === 'exclude' ? '✕' : '' }),
-        el('span', { className: 'sheet-list-name', textContent: tagLabel(name) }),
-        el('span', { className: 'sheet-list-count', textContent: String(counts.get(name)) })));
-    }
-  };
-  sortBtn.onclick = () => { byName = !byName; render(); };
-  modeBtn.onclick = () => { mode = mode === 'any' ? 'all' : 'any'; render(); };
+  const tabCount = t => t === 'general'
+    ? (draft.watched !== 'any') + (draft.folder != null) + (draft.uploaded !== 'any') + (draft.lenMin > 0 || draft.lenMax < LEN_MAX)
+    : t === 'format' ? draft.formats.length
+    : t === 'creator' ? draft.creators.length + draft.excluded.filter(isCreatorTag).length
+    : draft.tags.length + draft.excluded.filter(n => !isCreatorTag(n)).length + draft.untagged;
 
-  const done = () => {
-    browsePrefs[prefKey] = [...state].filter(([, st]) => st === 'include').map(([n]) => n);
-    browsePrefs.excluded = [
-      ...(browsePrefs.excluded || []).filter(n => tagKind(n) !== kind),
-      ...[...state].filter(([, st]) => st === 'exclude').map(([n]) => n),
+  const segmented = (options, value, onPick) => el('div', { className: 'segmented' },
+    ...options.map(([v, label]) => el('button', {
+      type: 'button', className: v === value ? 'active' : '', textContent: label,
+      onclick: () => { onPick(v); render(); },
+    })));
+  const sectionTitle = text => el('div', { className: 'sheet-section-title', textContent: text });
+
+  const general = () => {
+    const lenValue = el('span', { className: 'filter-value', textContent: lengthLabel(draft) });
+    const fill = el('div', { className: 'dual-fill' });
+    const paint = () => {
+      lenValue.textContent = lengthLabel(draft);
+      fill.style.left = `${(draft.lenMin / LEN_MAX) * 100}%`;
+      fill.style.width = `${((draft.lenMax - draft.lenMin) / LEN_MAX) * 100}%`;
+      renderTabs();
+      updateCount();
+    };
+    const slider = (key, label) => {
+      const input = el('input', { type: 'range', min: '0', max: String(LEN_MAX), step: '1', value: String(draft[key]), ariaLabel: label });
+      input.addEventListener('input', () => {
+        const v = Number(input.value);
+        if (key === 'lenMin') draft.lenMin = Math.min(v, draft.lenMax - 1);
+        else draft.lenMax = Math.max(v, draft.lenMin + 1);
+        input.value = String(draft[key]);
+        paint();
+      });
+      return input;
+    };
+    const dual = el('div', { className: 'dual-range' }, el('div', { className: 'dual-track' }), fill,
+      slider('lenMin', 'Shortest length in minutes'), slider('lenMax', 'Longest length in minutes'));
+    paint();
+
+    const folder = el('select', { className: 'sheet-input', ariaLabel: 'Folder' });
+    folder.append(el('option', { value: '', textContent: 'All folders' }));
+    for (const f of libraryFolders()) folder.append(el('option', { value: `f:${f}`, textContent: f || '(root folder)' }));
+    folder.value = draft.folder == null ? '' : `f:${draft.folder}`;
+    folder.addEventListener('change', () => { draft.folder = folder.value ? folder.value.slice(2) : null; render(); });
+
+    return [
+      el('div', { className: 'sheet-section' },
+        el('div', { className: 'filter-head' }, sectionTitle('Length'), lenValue),
+        dual,
+        el('div', { className: 'filter-scale' }, el('span', { textContent: '0 min' }), el('span', { textContent: `${LEN_MAX}+ min` }))),
+      el('div', { className: 'sheet-section' }, sectionTitle('Uploaded'),
+        segmented([['any', 'Any'], ['week', 'Week'], ['month', 'Month'], ['quarter', '3 months']], draft.uploaded, v => { draft.uploaded = v; })),
+      el('div', { className: 'sheet-section' }, sectionTitle('Folder'), folder),
+      el('div', { className: 'sheet-section' }, sectionTitle('Watched in the last 30 days'),
+        segmented([['any', 'Any'], ['only', 'Only these'], ['hide', 'Hide these']], draft.watched, v => { draft.watched = v; })),
     ];
-    if (!isCreator) browsePrefs.tagMode = mode;
-    saveBrowsePrefs();
-    closeSheet();
-    refreshTagBar();
-    refreshBrowse();
   };
+
+  const format = () => {
+    const counts = formatCounts();
+    return FORMAT_GROUPS.map(g => {
+      const names = [...counts.keys()].filter(g.test).sort((a, b) => g.rank(a) - g.rank(b));
+      const picked = names.filter(n => draft.formats.includes(n));
+      return el('details', { className: 'filter-group', open: true },
+        el('summary', {},
+          el('span', { textContent: g.title }),
+          el('span', { className: 'filter-value', textContent: picked.length ? picked.map(tagLabel).join(', ') : 'Any' })),
+        el('div', { className: 'sheet-chips' },
+          ...names.map(n => {
+            const on = draft.formats.includes(n);
+            return el('button', {
+              type: 'button', className: `tag-chip${on ? ' active' : ''}`, ariaPressed: String(on),
+              onclick: () => {
+                draft.formats = on ? draft.formats.filter(t => t !== n) : [...draft.formats, n];
+                render();
+              },
+            }, tagLabel(n), el('span', { className: 'chip-count', textContent: counts.get(n).toLocaleString() }));
+          }),
+          names.length ? null : el('div', { className: 'sheet-note', textContent: 'Shows once the server has read the files.' })));
+    });
+  };
+
+  const picker = kind => {
+    const isCreator = kind === 'creator';
+    const counts = tagCounts(kind);
+    const list = el('div', { className: 'sheet-list' });
+    const stateOf = n => (isCreator ? draft.creators : draft.tags).includes(n) ? 'include'
+      : draft.excluded.includes(n) ? 'exclude' : null;
+    const fill = () => {
+      list.innerHTML = '';
+      let names = [...counts.keys()].filter(n => matchesQuery(n, query[kind]));
+      if (byName[kind]) names.sort((a, b) => tagLabel(a).localeCompare(tagLabel(b), undefined, { numeric: true }));
+      names.sort((a, b) => !!stateOf(b) - !!stateOf(a)); // chosen ones on top
+      if (!names.length) {
+        list.append(el('div', { className: 'sheet-note',
+          textContent: counts.size ? 'No matches.' : `No ${isCreator ? 'creators' : 'tags'} yet.` }));
+      }
+      for (const name of names) {
+        const st = stateOf(name);
+        list.append(el('button', {
+          type: 'button',
+          className: `sheet-list-row tri-row ${st || ''}`,
+          onclick: () => {
+            const key = isCreator ? 'creators' : 'tags';
+            draft[key] = draft[key].filter(t => t !== name);
+            draft.excluded = draft.excluded.filter(t => t !== name);
+            if (!st) draft[key].push(name);
+            else if (st === 'include') draft.excluded.push(name);
+            renderTabs();
+            fill();
+            updateCount();
+          },
+        },
+          el('span', { className: 'tri-box', textContent: st === 'include' ? '✓' : st === 'exclude' ? '✕' : '' }),
+          el('span', { className: 'sheet-list-name', textContent: tagLabel(name) }),
+          el('span', { className: 'sheet-list-count', textContent: String(counts.get(name)) })));
+      }
+    };
+    const search = searchInput(isCreator ? 'Search creators…' : 'Search tags…', e => {
+      query[kind] = e.target.value.trim().toLowerCase();
+      fill();
+    });
+    search.value = query[kind];
+    const sortBtn = el('button', {
+      type: 'button', className: 'sheet-btn small', textContent: byName[kind] ? 'A–Z' : 'Most videos',
+      onclick: () => { byName[kind] = !byName[kind]; render(); },
+    });
+    fill();
+    return [
+      el('div', { className: 'sheet-row' }, search, sortBtn),
+      isCreator ? null : el('div', { className: 'sheet-row' },
+        segmented([['all', 'Match all'], ['any', 'Match any']], draft.tagMode, v => { draft.tagMode = v; }),
+        el('button', {
+          type: 'button', className: `sheet-btn small${draft.untagged ? ' primary' : ''}`, textContent: 'Untagged only',
+          ariaPressed: String(draft.untagged), onclick: () => { draft.untagged = !draft.untagged; render(); },
+        })),
+      el('div', { className: 'sheet-note', textContent: (isCreator
+        ? 'Shows videos by any ✓ creator. '
+        : draft.tagMode === 'any' ? 'Videos with at least one ✓ tag. ' : 'Videos with every ✓ tag. ')
+        + 'Tap once to include (✓), twice to exclude (✕), again to clear.' }),
+      list,
+    ];
+  };
+
+  function updateCount() {
+    const n = filterVideos(browseSearch.value.trim(), draft).length;
+    showBtn.textContent = `Show ${n.toLocaleString()} video${n === 1 ? '' : 's'}`;
+  }
+
+  function renderTabs() {
+    tabBar.innerHTML = '';
+    for (const [id, label] of FILTER_TABS) {
+      const n = tabCount(id);
+      tabBar.append(el('button', {
+        type: 'button', role: 'tab', ariaSelected: String(id === tab),
+        className: `filter-tab${id === tab ? ' active' : ''}`,
+        onclick: () => { tab = id; render(); },
+      }, label, n ? el('span', { className: 'filter-tab-count', textContent: String(n) }) : null));
+    }
+  }
+
+  function render() {
+    renderTabs();
+    body.innerHTML = '';
+    body.append(...(tab === 'general' ? general() : tab === 'format' ? format() : picker(tab)).filter(Boolean));
+    updateCount();
+  }
 
   render();
   openSheet(
-    el('div', { className: 'sheet-title', textContent: isCreator ? 'Filter by creator' : 'Filter by tag' }),
-    el('div', { className: 'sheet-note', textContent: (isCreator
-      ? 'Shows videos by any of the ✓ creators. '
-      : 'Match all: videos with every ✓ tag. Match any: videos with at least one. ')
-      + 'Tap once to include (✓), twice to exclude (✕), again to clear.' }),
-    searchInput(isCreator ? 'Search creators…' : 'Search tags…', e => { query = e.target.value.trim().toLowerCase(); render(); }),
-    el('div', { className: 'sheet-row' }, sortBtn, isCreator ? null : modeBtn),
-    list,
-    el('div', { className: 'sheet-row sheet-actions' },
-      el('button', { type: 'button', className: 'sheet-btn', textContent: 'Clear', onclick: () => { state.clear(); render(); } }),
-      el('button', { type: 'button', className: 'sheet-btn primary', textContent: 'Done', onclick: done }))
-  );
+    el('div', { className: 'filter-top' },
+      el('div', { className: 'sheet-title filter-title', textContent: 'Filters' }),
+      el('button', { type: 'button', className: 'sheet-btn small', textContent: 'Close', onclick: closeSheet })),
+    tabBar,
+    body,
+    el('div', { className: 'sheet-row sheet-actions filter-actions' },
+      el('button', {
+        type: 'button', className: 'sheet-btn', textContent: 'Clear all',
+        onclick: () => { Object.assign(draft, filterPrefs(FILTER_DEFAULTS)); render(); },
+      }),
+      showBtn));
 }
 
 // Read-only facts about one video, for the top of its long-press sheet:
@@ -1676,9 +1871,9 @@ function detailsSection(video) {
   if (video.size) rows.push(['File size', formatBytes(video.size)]);
   if (m) rows.push(['Audio', m[3] ? 'Yes' : 'None']);
   if (video.path) rows.push(['Folder', video.path]);
-  const grid = el('div', { className: 'sheet-details' });
+  const grid = el('div', { className: 'video-facts' });
   for (const [label, value] of rows) {
-    grid.append(el('span', { className: 'sheet-details-label', textContent: label }),
+    grid.append(el('span', { className: 'video-facts-label', textContent: label }),
       el('span', { textContent: value }));
   }
   return el('div', { className: 'sheet-section' },
