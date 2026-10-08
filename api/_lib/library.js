@@ -2,7 +2,7 @@ import { DRIVE_API } from './media.js';
 import { ROOT_FOLDER } from './auth.js';
 
 // Every video in the library folder tree, as the service account sees it:
-// [{ id, durationMs }]. Same walk as the app's collectVideos - each
+// [{ id, durationMs, width, height, size }]. Same walk as the app's collectVideos - each
 // folder's videos and subfolders listed together, siblings in parallel.
 const PARALLEL = 8;
 // Same list as VIDEO_MIME_TYPES in app.js.
@@ -41,8 +41,12 @@ export async function listLibrary(token) {
     const subfolders = [];
     await Promise.all([
       listAll(`(${mimeQuery}) and '${folderId}' in parents and trashed=false`,
-        'nextPageToken,files(id,videoMediaMetadata(durationMillis))',
-        f => videos.push({ id: f.id, durationMs: Number(f.videoMediaMetadata && f.videoMediaMetadata.durationMillis) || 0 })),
+        'nextPageToken,files(id,size,videoMediaMetadata(durationMillis,width,height))',
+        f => {
+          const m = f.videoMediaMetadata || {};
+          videos.push({ id: f.id, durationMs: Number(m.durationMillis) || 0,
+            width: Number(m.width) || 0, height: Number(m.height) || 0, size: Number(f.size) || 0 });
+        }),
       listAll(`mimeType='application/vnd.google-apps.folder' and '${folderId}' in parents and trashed=false`,
         'nextPageToken,files(id)', f => subfolders.push(f.id)),
     ]);
