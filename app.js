@@ -1506,7 +1506,8 @@ function chipButton(text, className, onclick, title) {
 // removable chips so it's clear what's narrowing the grid.
 // The active filters as chips under the controls, each tapped to remove:
 // row 1 the search, creators, then the General and Format filters; row 2
-// the tags. The ✕ before them clears everything, search included.
+// the tags. The ✕ before row 1 clears everything, search included; the
+// select button always sits before row 2.
 const UPLOAD_LABELS = { week: 'Past week', month: 'Past month', quarter: 'Past 3 months' };
 
 function lengthLabel(p) {
@@ -1571,18 +1572,16 @@ function refreshTagBar() {
   if (p.untagged) row2.push(chip('Untagged', 'active', n => { n.untagged = false; }));
 
   browseTagBar.innerHTML = '';
-  browseTagBar.hidden = !row1.length && !row2.length;
-  if (browseTagBar.hidden) return;
-  const rows = el('div', { className: 'filter-rows' });
-  if (row1.length) rows.append(el('div', { className: 'filter-row' }, ...row1));
-  if (row2.length) rows.append(el('div', { className: 'filter-row' }, ...row2));
-  browseTagBar.append(
-    el('button', {
-      type: 'button', className: 'filter-clear', textContent: '✕',
-      title: 'Clear all filters and the search', ariaLabel: 'Clear all filters and the search',
-      onclick: () => { browseSearch.value = ''; applyFilters(FILTER_DEFAULTS); },
-    }),
-    rows);
+  if (row1.length || row2.length) {
+    browseTagBar.append(
+      el('button', {
+        type: 'button', className: 'filter-round filter-clear', textContent: '✕',
+        title: 'Clear all filters and the search', ariaLabel: 'Clear all filters and the search',
+        onclick: () => { browseSearch.value = ''; applyFilters(FILTER_DEFAULTS); },
+      }),
+      el('div', { className: 'filter-row' }, ...row1));
+  }
+  browseTagBar.append(browseSelectBtn, el('div', { className: 'filter-row' }, ...row2));
 }
 
 function setSelectMode(on) {
@@ -1792,19 +1791,18 @@ function openFilters(tab = 'general') {
       fill();
     });
     search.value = query[kind];
-    const sortBtn = el('button', {
-      type: 'button', className: 'sheet-btn small', textContent: byName[kind] ? 'A–Z' : 'Most videos',
-      onclick: () => { byName[kind] = !byName[kind]; render(); },
-    });
+    const sort = segmented([['count', 'Most'], ['name', 'A–Z']], byName[kind] ? 'name' : 'count', v => { byName[kind] = v === 'name'; });
+    sort.classList.add('fit');
+    sort.ariaLabel = 'Sort';
     fill();
     return [
-      el('div', { className: 'sheet-row' }, search, sortBtn),
+      el('div', { className: 'sheet-row' }, search, sort),
       isCreator ? null : el('div', { className: 'sheet-row' },
         segmented([['all', 'Match all'], ['any', 'Match any']], draft.tagMode, v => { draft.tagMode = v; }),
-        el('button', {
-          type: 'button', className: `sheet-btn small${draft.untagged ? ' primary' : ''}`, textContent: 'Untagged only',
+        el('div', { className: 'segmented fit' }, el('button', {
+          type: 'button', className: draft.untagged ? 'on' : '', textContent: 'Untagged only',
           ariaPressed: String(draft.untagged), onclick: () => { draft.untagged = !draft.untagged; render(); },
-        })),
+        }))),
       el('div', { className: 'sheet-note', textContent: (isCreator
         ? 'Shows videos by any ✓ creator. '
         : draft.tagMode === 'any' ? 'Videos with at least one ✓ tag. ' : 'Videos with every ✓ tag. ')

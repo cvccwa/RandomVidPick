@@ -267,18 +267,18 @@
     /* The four header buttons (sign out, manage, random, compile): same width. */
     .browse-header > button { width: 2.75rem; padding: 0.5rem 0; display: inline-flex; align-items: center; justify-content: center; }
 
-    /* Active filters: a clear-all button, then one or two rows that each
-       scroll sideways (search, creators and the rest; then tags). */
+    /* Active filters: two rows that each scroll sideways (search, creators
+       and the rest; then tags), with clear-all before the first and the
+       select button before the second. */
     .browse-tagbar {
-      display: flex;
+      display: grid;
+      grid-template-columns: 2rem minmax(0, 1fr);
       align-items: center;
-      gap: 0.5rem;
+      gap: 0.4rem 0.5rem;
       padding: 0.6rem 0 0 1rem;
       flex-shrink: 0;
     }
-    .browse-tagbar[hidden] { display: none; }
-    .filter-clear {
-      flex-shrink: 0;
+    .filter-round {
       width: 2rem;
       height: 2rem;
       border-radius: 50%;
@@ -287,13 +287,12 @@
       color: var(--muted);
       font-family: inherit;
       font-size: 0.85rem;
+      padding: 0;
       cursor: pointer;
     }
-    .filter-rows { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 0.4rem; }
-    .filter-row { display: flex; gap: 0.4rem; overflow-x: auto; padding-right: 1rem; scrollbar-width: none; }
+    .filter-round.active { background: var(--danger); border-color: var(--danger); color: #fff; }
+    .filter-row { display: flex; gap: 0.4rem; overflow-x: auto; padding-right: 1rem; scrollbar-width: none; min-height: 2rem; align-items: center; }
     .filter-row::-webkit-scrollbar { display: none; }
-    .browse-select-btn { font-size: 1rem; width: 2.75rem; padding: 0.5rem 0; }
-    .browse-select-btn.active { background: var(--danger); border-color: var(--danger); color: #fff; }
     .browse-filters-btn { font-weight: 600; padding: 0.5rem 0.9rem; }
     .browse-filters-btn.filtering { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 
@@ -312,6 +311,10 @@
     .segmented { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: 0.25rem; background: var(--surface); border-radius: 8px; padding: 0.25rem; flex: 1; }
     .segmented button { background: transparent; border: none; border-radius: 6px; color: var(--muted); font-family: inherit; font-size: 0.78rem; padding: 0.55rem 0.25rem; cursor: pointer; }
     .segmented button.active { background: var(--border); color: var(--text); font-weight: 600; }
+    .segmented.fit { flex: 0 0 auto; grid-auto-columns: auto; }
+    .segmented.fit button { padding: 0.55rem 0.75rem; }
+    .segmented button.on { background: var(--accent); color: var(--on-accent); font-weight: 600; }
+    .filter-body .sheet-input { border-radius: 8px; padding: 0.6rem 0.75rem; }
     .filter-group { border: 1px solid var(--border); border-radius: 10px; padding: 0 0.85rem; }
     .filter-group summary { list-style: none; display: flex; justify-content: space-between; align-items: center; gap: 0.5rem; padding: 0.8rem 0; cursor: pointer; font-size: 0.9rem; font-weight: 600; }
     .filter-group summary::-webkit-details-marker { display: none; }
@@ -754,10 +757,11 @@
       <option value="random">Random</option>
     </select>
     <button class="browse-dir" id="browseDir" type="button" aria-label="Sort direction">↑ Asc</button>
-    <button class="browse-dir browse-select-btn" id="browseSelectBtn" type="button" aria-label="Select videos to tag" title="Select videos to tag">☑</button>
     <button class="browse-dir browse-filters-btn" id="browseFiltersBtn" type="button">Filters</button>
   </div>
-  <div class="browse-tagbar" id="browseTagBar"></div>
+  <div class="browse-tagbar" id="browseTagBar">
+    <button class="filter-round" id="browseSelectBtn" type="button" aria-label="Select videos to tag" title="Select videos to tag">☑</button>
+  </div>
   <div class="browse-count" id="browseCount"></div>
   <div class="browse-grid" id="browseGrid">
     <div class="browse-sentinel" id="browseSentinel"></div>
