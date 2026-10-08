@@ -220,11 +220,6 @@
       flex-shrink: 0;
     }
 
-    .browse-back {
-      width: auto;
-      flex-shrink: 0;
-    }
-
     .browse-search {
       flex: 1;
       min-width: 0;
@@ -268,6 +263,7 @@
     }
 
     .browse-random { font-size: 1rem; padding: 0.5rem 0.75rem; }
+    .browse-icon { font-size: 1rem; padding: 0.5rem 0.55rem; display: inline-flex; align-items: center; justify-content: center; color: var(--muted); }
 
     .browse-tagbar {
       display: flex;
@@ -689,7 +685,8 @@
 <!-- Browse view -->
 <div class="browse-view" id="browseView">
   <div class="browse-header">
-    <button class="btn btn-secondary browse-back" id="browseSignOutBtn" onclick="confirmSignOut()">Sign out</button>
+    <button class="browse-dir browse-icon" id="browseSignOutBtn" type="button" onclick="confirmSignOut()" aria-label="Sign out" title="Sign out"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><circle cx="12" cy="8" r="4" fill="currentColor"/><path d="M4 21c0-4.4 3.6-7 8-7s8 2.6 8 7" fill="currentColor"/></svg></button>
+    <button class="browse-dir browse-icon" id="browseManageBtn" type="button" aria-label="Manage creators and tags" title="Manage creators &amp; tags">⚙</button>
     <input type="text" class="browse-search" id="browseSearch" placeholder="Search..." />
     <button class="browse-dir browse-random" id="browseRandomBtn" type="button" aria-label="Play a random video from this view" title="Random from this view">🎲</button>
     <button class="browse-dir browse-random" id="browseCompileBtn" type="button" aria-label="Play a compilation of clips from this view (long-press for options)" title="Compilation from this view - long-press for options">🎬</button>

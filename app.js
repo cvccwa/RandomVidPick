@@ -1440,6 +1440,8 @@ function closeBrowseView() {
   }
 }
 
+document.getElementById('browseManageBtn').addEventListener('click', () => openTagManager());
+
 browseSearch.addEventListener('input', () => {
   clearTimeout(browseSearchDebounce);
   browseSearchDebounce = setTimeout(() => {
@@ -1478,8 +1480,7 @@ function refreshTagBar() {
     chipButton(creatorCount ? `👤 Creator · ${creatorCount}` : '👤 Creator ▾',
       'tag-chip-action' + (creatorCount ? ' filtering' : ''), () => openFilterPicker('creator')),
     chipButton(tagCount ? `🏷 Tags · ${tagCount}` : '🏷 Tags ▾',
-      'tag-chip-action' + (tagCount ? ' filtering' : ''), () => openFilterPicker('tag')),
-    chipButton('⚙', 'tag-chip-action', () => openTagManager(), 'Manage creators and tags')
+      'tag-chip-action' + (tagCount ? ' filtering' : ''), () => openFilterPicker('tag'))
   );
   const removeFilter = name => () => {
     browsePrefs.creators = browsePrefs.creators.filter(t => t !== name);
