@@ -435,11 +435,40 @@ function smoothArgs(source, n, session, token, hasAudio) {
 // far and then the rest as it comes.
 const jobs = new Map(); // `${sid}:${n}` -> job
 const ENCODE_AHEAD = 2;
-// VLC holds only a few clips of buffer, so a source that hasn't started
-// producing output in this long (sparse keyframes that make the seek decode
-// minutes of video, a stalled Drive read) is swapped for another clip rather
-// than freezing playback. Normal encodes start well inside these.
-const FIRST_OUTPUT_S = { 1080: 20, 1440: 30, 2160: 45 };
+// VLC holds only a few clips of buffer, so a source that is slow to start
+// producing output is swapped for another clip rather than freezing
+// playback. While a segment is still being encoded ahead it gets
+// FIRST_OUTPUT_S (sparse keyframes or a slow Drive read can make a fine
+// clip start slowly); once VLC is actually waiting for it, only
+// WAITING_GRACE_S more - a short pause instead of a long one.
+const FIRST_OUTPUT_S  = { 1080: 20, 1440: 30, 2160: 45 };
+const WAITING_GRACE_S = { 1080: 5, 1440: 7, 2160: 10 };
+// Video formats too slow to decode in software for a live compilation
+// (seen: a 4K AV1 clip took 99 s for 5 s of output). Skipped as soon as
+// the header shows them.
+const SLOW_CODECS = new Set(['av1', 'prores']);
+
+// How long sources take to start producing output, logged every few
+// minutes, to tune the limits above from real numbers.
+const START_REPORT_MS = 5 * 60e3;
+let startTimes = [];
+let startSwaps = 0;
+let startReportTimer = null;
+function noteStart(seconds, swapped) {
+  if (swapped) startSwaps++; else startTimes.push(seconds);
+  if (startReportTimer) return;
+  startReportTimer = setTimeout(() => {
+    startReportTimer = null;
+    const t = startTimes.sort((a, b) => a - b);
+    const at = q => t[Math.min(t.length - 1, Math.floor(q * t.length))].toFixed(1);
+    console.log(`smooth start times (${START_REPORT_MS / 60e3} min): ${t.length} clips`
+      + (t.length ? `, median ${at(0.5)} s, 90% ${at(0.9)} s, max ${t[t.length - 1].toFixed(1)} s` : '')
+      + `, ${startSwaps} swapped for being slow`);
+    startTimes = [];
+    startSwaps = 0;
+  }, START_REPORT_MS);
+  startReportTimer.unref?.();
+}
 
 // At most two encodes run at once so they don't starve each other; the
 // segment VLC is waiting for jumps the queue ahead of encode-ahead work.
@@ -474,7 +503,7 @@ function startJob(sid, session, n, urgent) {
     if (urgent) promoteWaiter(existing);
     return existing;
   }
-  const job = { chunks: [], done: false, failed: false, listeners: new Set(), kill: () => {}, waiter: null };
+  const job = { chunks: [], done: false, failed: false, listeners: new Set(), kill: () => {}, waiter: null, waitingSince: null };
   jobs.set(key, job);
   const emit = () => job.listeners.forEach(fn => fn());
 
@@ -499,23 +528,35 @@ function startJob(sid, session, n, urgent) {
 async function runJob(job, session, n, emit) {
   const token = await getServiceAccountToken();
   const limitS = FIRST_OUTPUT_S[session.height] || FIRST_OUTPUT_S[1080];
+  const graceS = WAITING_GRACE_S[session.height] || WAITING_GRACE_S[1080];
   for (const i of fallbackOrder(session.clips, n)) {
     if (job.cancelled) break;
     const clip = session.clips[i];
+    const label = `${clip.id.slice(0, 6)}… at ${clip.s} s`;
     // One attempt = probe + encode of this source. If it hasn't produced
-    // real output within the limit it is dropped for another clip.
+    // real output in time (see FIRST_OUTPUT_S) it is dropped for another.
     const attempt = new AbortController();
     job.kill = () => attempt.abort();
     let released = false;
     const started = Date.now();
-    const timer = setTimeout(() => {
+    const timer = setInterval(() => {
       if (released || job.cancelled) return;
-      console.log(`compile smooth clip ${i} too slow: no output after ${limitS} s (${clip.id.slice(0, 6)}… at ${clip.s} s), trying another`);
+      const now = Date.now();
+      const waitedS = job.waitingSince ? (now - Math.max(job.waitingSince, started)) / 1000 : 0;
+      const ranS = (now - started) / 1000;
+      if (ranS < limitS && waitedS < graceS) return;
+      console.log(`compile smooth clip ${i} too slow: no output after ${ranS.toFixed(1)} s`
+        + `${waitedS >= graceS ? ` (VLC waiting ${waitedS.toFixed(1)} s)` : ''} (${label}), trying another`);
+      noteStart(ranS, true);
       attempt.abort();
-    }, limitS * 1000);
+    }, 250);
     try {
-      const { hasAudio } = await probeInfo(clip.id, token, 'compile', attempt.signal);
+      const { hasAudio, videoCodec } = await probeInfo(clip.id, token, 'compile', attempt.signal);
       if (job.cancelled) break;
+      if (SLOW_CODECS.has(videoCodec)) {
+        console.log(`compile smooth clip ${i} skipped: ${videoCodec} is too slow to decode live (${label})`);
+        continue;
+      }
       const ok = await new Promise(resolve => {
         const ff = spawn(FFMPEG, smoothArgs(clip, n, session, token, hasAudio),
           { stdio: ['ignore', 'pipe', 'pipe'] });
@@ -525,6 +566,10 @@ async function runJob(job, session, n, emit) {
         let stderr = '';
         let size = 0;
         const pending = [];
+        const release = () => {
+          released = true;
+          noteStart((Date.now() - started) / 1000, false);
+        };
         ff.stderr.on('data', d => { if (stderr.length < 4000) stderr += d; });
         ff.stdout.on('data', c => {
           size += c.length;
@@ -532,23 +577,21 @@ async function runJob(job, session, n, emit) {
           // source can still be swapped without the viewer seeing it.
           if (released) { job.chunks.push(c); emit(); return; }
           pending.push(c);
-          if (size >= MIN_SEGMENT_B) { released = true; job.chunks.push(...pending); emit(); }
+          if (size >= MIN_SEGMENT_B) { release(); job.chunks.push(...pending); emit(); }
         });
         ff.on('error', () => resolve(false));
         ff.on('close', code => {
           attempt.signal.removeEventListener('abort', kill);
-          if (!released && code === 0 && size > 0) { released = true; job.chunks.push(...pending); }
+          if (!released && code === 0 && size > 0) { release(); job.chunks.push(...pending); }
           if (!released && !attempt.signal.aborted) console.log(`compile smooth clip ${i} failed: exit ${code} ${stderr.trim().slice(0, 200)}`);
           resolve(released);
         });
       });
-      const tookS = (Date.now() - started) / 1000;
-      if (ok && tookS > limitS / 2) console.log(`compile smooth clip ${i} slow: ${tookS.toFixed(1)} s (${clip.id.slice(0, 6)}… at ${clip.s} s)`);
       if (ok) { job.done = true; emit(); return; }
     } catch (err) {
       if (!attempt.signal.aborted) console.log(`compile smooth clip ${i} failed: ${err.message}`);
     } finally {
-      clearTimeout(timer);
+      clearInterval(timer);
     }
   }
   job.failed = true;
@@ -597,6 +640,9 @@ function warmStart(sid, session) {
 function smoothSegment(sid, session, n) {
   pruneJobs(sid, n);
   const job = startJob(sid, session, n, true);
+  // VLC is now waiting for this segment: a source still not producing
+  // output gets only WAITING_GRACE_S more (see runJob).
+  if (!job.done && !job.chunks.length) job.waitingSince ??= Date.now();
   for (let k = 1; k <= ENCODE_AHEAD && n + k < session.clips.length; k++) {
     startJob(sid, session, n + k, false); // encode ahead
   }
