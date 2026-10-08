@@ -324,7 +324,7 @@ function librarySignature(videos) {
 // ─── META (durations + watched history, stored in KV via /api/meta) ──────────
 let metaWatched  = {};   // fileId -> last-watched epoch ms
 let metaTags     = {};   // fileId -> {tagName: source}  (m manual, f filename, i imported)
-let metaMedia    = {};   // fileId -> [width, height (as shown), fps, has audio 1/0, duration ms, stored short side, audio only 1/0, video codec], from the server's header check
+let metaMedia    = {};   // fileId -> [width, height (as shown), fps, has audio 1/0, duration ms, stored short side, audio only 1/0], from the server's header check
 let metaPromise  = null; // load once per page
 const pendingDurations = {};
 const pendingWatched   = new Set();
@@ -1443,6 +1443,7 @@ function closeBrowseView() {
 browseSearch.addEventListener('input', () => {
   clearTimeout(browseSearchDebounce);
   browseSearchDebounce = setTimeout(() => {
+    refreshTagBar();
     refreshBrowse();
   }, 150);
 });
@@ -1488,6 +1489,17 @@ function refreshTagBar() {
     refreshTagBar();
     refreshBrowse();
   };
+  // The search text shows as a chip too, so it can be cleared with one tap
+  // after scrolling away from the search box.
+  const query = browseSearch.value.trim();
+  if (query) {
+    const shown = query.length > 24 ? `${query.slice(0, 23)}…` : query;
+    browseTagBar.append(chipButton(`🔍 "${shown}" ✕`, 'active', () => {
+      browseSearch.value = '';
+      refreshTagBar();
+      refreshBrowse();
+    }, 'Clear the search'));
+  }
   for (const name of [...creators, ...tags]) {
     browseTagBar.append(chipButton(`${isCreatorTag(name) ? '👤 ' : ''}${tagLabel(name)} ✕`, 'active',
       removeFilter(name), 'Remove this filter'));
@@ -1646,8 +1658,6 @@ function openFilterPicker(kind) {
 
 // Read-only facts about one video, for the top of its long-press sheet:
 // what the computed tags are worked out from, plus length, size and folder.
-const CODEC_NAMES = { h264: 'H.264', hevc: 'HEVC (H.265)', av1: 'AV1', vp9: 'VP9', vp8: 'VP8', prores: 'ProRes',
-  mpeg4: 'MPEG-4 (DivX/Xvid)', wmv1: 'WMV', wmv2: 'WMV', wmv3: 'WMV', vc1: 'VC-1', mpeg2video: 'MPEG-2' };
 
 function detailsSection(video) {
   const m = metaMedia[video.id];
@@ -1664,7 +1674,6 @@ function detailsSection(video) {
   if (video.durationMs) rows.push(['Length', formatDuration(video.durationMs)]);
   if (video.size) rows.push(['File size', formatBytes(video.size)]);
   if (m) rows.push(['Audio', m[3] ? 'Yes' : 'None']);
-  if (m && m[7]) rows.push(['Format', CODEC_NAMES[m[7]] || m[7].toUpperCase()]);
   if (video.path) rows.push(['Folder', video.path]);
   const grid = el('div', { className: 'sheet-details' });
   for (const [label, value] of rows) {
@@ -1674,7 +1683,7 @@ function detailsSection(video) {
   return el('div', { className: 'sheet-section' },
     el('div', { className: 'sheet-section-title', textContent: 'ℹ️ Details' }),
     grid,
-    m ? null : el('div', { className: 'sheet-note', textContent: 'Frame rate, audio and format show once the server has read this file.' }));
+    m ? null : el('div', { className: 'sheet-note', textContent: 'Frame rate and audio show once the server has read this file.' }));
 }
 
 // Tag editor for one or many videos, split into Creator and Tags sections.
