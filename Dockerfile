@@ -8,6 +8,7 @@ RUN apt-get update \
 WORKDIR /app
 COPY api ./api
 COPY server ./server
+COPY scripts ./scripts
 # api/ is written as ES modules.
 RUN echo '{"type":"module"}' > package.json
 ENV NODE_ENV=production
