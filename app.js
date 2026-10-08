@@ -7,7 +7,7 @@ const VIDEO_MIME_TYPES = [
   'video/quicktime', 'video/x-msvideo', 'video/mpeg',
   'video/3gpp', 'video/x-flv', 'video/x-ms-wmv'
 ];
-const APP_VERSION = 'v45';
+const APP_VERSION = 'v46';
 const BROWSE_BATCH = 50;
 // Where api/ (stream, thumbnails, tags) is served from.
 const API_BASE = 'https://randomvidpick-139266625585.us-east1.run.app';
@@ -1619,6 +1619,7 @@ let sheetOpenedAt = 0;
 
 function openSheet(...content) {
   sheet.innerHTML = '';
+  sheet.className = 'sheet'; // drop a layout class a previous sheet added (filter-sheet)
   // Skipped parts (e.g. Smooth-only rows in Original mode) are null; append
   // would print them as the text "null".
   sheet.append(...content.filter(c => c != null));
@@ -1843,6 +1844,9 @@ function openFilters(tab = 'general') {
         onclick: () => { Object.assign(draft, filterPrefs(FILTER_DEFAULTS)); render(); },
       }),
       showBtn));
+  // One fixed height for every tab, with only the middle scrolling, so the
+  // title, tabs and buttons stay put and switching tabs doesn't jump.
+  sheet.classList.add('filter-sheet');
 }
 
 // Read-only facts about one video, for the top of its long-press sheet:
