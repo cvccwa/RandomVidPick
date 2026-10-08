@@ -23,15 +23,19 @@ function probeError(stderr) {
 
 // A file's audio presence, frame rate and duration (seconds), from ffmpeg's
 // stream listing - reads only the container header.
-export function probeInfo(id, token, purpose = 'compile') {
+export function probeInfo(id, token, purpose = 'compile', signal) {
   if (probeCache.has(id)) return Promise.resolve(probeCache.get(id));
   return new Promise((resolve, reject) => {
     const ff = spawn(FFMPEG, ['-hide_banner', ...(purpose === 'analyze' ? pieceArgs() : []), '-i', sourceUrl(id, purpose)],
       { stdio: ['ignore', 'ignore', 'pipe'] });
+    const kill = () => ff.kill('SIGKILL');
+    signal?.addEventListener('abort', kill, { once: true });
     let stderr = '';
     ff.stderr.on('data', d => { if (stderr.length < 20000) stderr += d; });
     ff.on('error', reject);
     ff.on('close', () => {
+      signal?.removeEventListener('abort', kill);
+      if (signal?.aborted) return reject(new Error('probe cancelled'));
       const videoLine = (/Stream #0:\d+[^:]*: Video:.*/.exec(stderr) || [])[0];
       if (!videoLine) return reject(probeError(stderr));
       const rate = /([\d.]+) fps/.exec(videoLine) || /([\d.]+) tbr/.exec(videoLine);
