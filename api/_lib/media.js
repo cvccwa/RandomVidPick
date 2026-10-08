@@ -21,9 +21,10 @@ function probeError(stderr) {
   return err;
 }
 
-// A file's audio presence, frame rate, duration (seconds) and picture size
-// as players show it, from ffmpeg's stream listing - reads only the
-// container header. width/height are 0 when the header doesn't say.
+// A file's audio presence, frame rate, duration (seconds), codecs and
+// picture size as players show it, from ffmpeg's stream listing - reads
+// only the container header. width/height are 0 when the header doesn't
+// say.
 export function probeInfo(id, token, purpose = 'compile', signal) {
   if (probeCache.has(id)) return Promise.resolve(probeCache.get(id));
   return new Promise((resolve, reject) => {
@@ -41,8 +42,11 @@ export function probeInfo(id, token, purpose = 'compile', signal) {
       if (!videoLine) return reject(probeError(stderr));
       const rate = /([\d.]+) fps/.exec(videoLine) || /([\d.]+) tbr/.exec(videoLine);
       const dur = /Duration: (\d+):(\d+):([\d.]+)/.exec(stderr);
+      const audioLine = (/Stream #0:\d+[^:]*: Audio: (\w+)/.exec(stderr) || [])[1];
       const info = {
-        hasAudio: /Stream #0:\d+[^:]*: Audio:/.test(stderr),
+        hasAudio: Boolean(audioLine),
+        videoCodec: (/Video: (\w+)/.exec(videoLine) || [])[1] || '',
+        audioCodec: audioLine || '',
         fps:      rate ? Number(rate[1]) : 0,
         duration: dur ? Number(dur[1]) * 3600 + Number(dur[2]) * 60 + Number(dur[3]) : 0,
         ...shownSize(stderr, videoLine),

@@ -30,14 +30,15 @@ import { libraryStats } from './_lib/libraryStats.js';
 // The library is re-listed from Drive at most hourly to catch new uploads,
 // so a run with nothing to do ends in milliseconds.
 //
-// Shape check: before analysing, each run reads just the header of videos
-// not yet checked (~0.5-1 MB each) for the size players actually show -
-// rotation flag and pixel aspect applied. Drive reports the stored size,
-// which is sideways for many phone recordings. Where the shape (portrait /
-// landscape / square) differs from Drive's, the shown size goes in
-// SHAPE_FIX_KEY for the app's shape tags. While checks are left, runs do only
-// that, and don't count towards the daily analysis minutes; once the
-// library is done, only new uploads are checked.
+// Header check: before analysing, each run reads just the header of videos
+// not yet checked (~0.5-1 MB each) and keeps what it says in MEDIA_KEY: the
+// picture size players actually show (rotation flag and pixel aspect
+// applied - Drive reports the stored size, sideways for many phone
+// recordings, and none at all for some files), frame rate, codecs, audio
+// and duration. The app's quality, shape, frame-rate and no-audio tags and
+// missing lengths come from it (via /api/meta). While checks are left, runs
+// do only that, and don't count towards the daily analysis minutes; once
+// the library is done, only new uploads are checked.
 
 const ALLOWED_ORIGIN = 'https://cvccwa.github.io';
 const PEAKS_KEY      = 'rvp:peaks';
@@ -45,11 +46,13 @@ const TODO_KEY       = 'rvp:analyze:todo';
 const LISTED_KEY     = 'rvp:analyze:listedAt';
 const LOCK_KEY       = 'rvp:analyze:lock';
 const VERSION        = 1;
-const DIMS_KEY       = 'rvp:dims';        // fileId -> shown "WxH" ("?" if unreadable), every file checked
-const SHAPE_FIX_KEY  = 'rvp:shapefix';    // fileId -> shown "WxH", only where Drive's shape is wrong
-const DIMS_TODO_KEY  = 'rvp:dims:todo';
-const DIMS_PARALLEL  = 4;
-const DIMS_TIMEOUT_MS = 30e3;
+// fileId -> JSON {w, h, rot, fps, vc, ac, d} (shown size, rotation, frame
+// rate, video / audio codec ('' = no audio), duration ms), or {err: 1} if
+// the header couldn't be read. Every file checked has an entry.
+const MEDIA_KEY      = 'rvp:media';
+const MEDIA_TODO_KEY = 'rvp:media:todo';
+const MEDIA_PARALLEL = 4;
+const MEDIA_TIMEOUT_MS = 30e3;
 // Density is tunable without a code change: denser catches short bursts
 // (a 3 s burst is caught about (3 + WINDOW_S) / spacing of the time) at
 // proportionally more Drive reads.
@@ -249,13 +252,13 @@ function scoreSamples(samples) {
 }
 
 async function loadTodo(token) {
-  const [raw, dimsRaw, listedAt] = await Promise.all([
-    kvCommand(['GET', TODO_KEY]), kvCommand(['GET', DIMS_TODO_KEY]), kvCommand(['GET', LISTED_KEY])]);
-  if (raw && dimsRaw && Date.now() - Number(listedAt || 0) < RELIST_MS) {
-    return { todo: JSON.parse(raw), dimsTodo: JSON.parse(dimsRaw) };
+  const [raw, mediaRaw, listedAt] = await Promise.all([
+    kvCommand(['GET', TODO_KEY]), kvCommand(['GET', MEDIA_TODO_KEY]), kvCommand(['GET', LISTED_KEY])]);
+  if (raw && mediaRaw && Date.now() - Number(listedAt || 0) < RELIST_MS) {
+    return { todo: JSON.parse(raw), mediaTodo: JSON.parse(mediaRaw) };
   }
   const [library, stored, checked] = await Promise.all([
-    listLibrary(token), kvCommand(['HGETALL', PEAKS_KEY]), kvCommand(['HKEYS', DIMS_KEY])]);
+    listLibrary(token), kvCommand(['HGETALL', PEAKS_KEY]), kvCommand(['HKEYS', MEDIA_KEY])]);
   const doneSet = new Set();
   for (let i = 0; i + 1 < (stored || []).length; i += 2) {
     let entry = {};
@@ -266,13 +269,13 @@ async function loadTodo(token) {
   }
   const checkedSet = new Set(checked || []);
   const todo = library.filter(v => !doneSet.has(v.id)).map(v => [v.id, v.durationMs]);
-  const dimsTodo = library.filter(v => !checkedSet.has(v.id)).map(v => [v.id, v.width, v.height]);
+  const mediaTodo = library.filter(v => !checkedSet.has(v.id)).map(v => [v.id, v.width, v.height]);
   await Promise.all([
     kvCommand(['SET', TODO_KEY, JSON.stringify(todo)]),
-    kvCommand(['SET', DIMS_TODO_KEY, JSON.stringify(dimsTodo)]),
+    kvCommand(['SET', MEDIA_TODO_KEY, JSON.stringify(mediaTodo)]),
     kvCommand(['SET', LISTED_KEY, String(Date.now())]),
   ]);
-  return { todo, dimsTodo };
+  return { todo, mediaTodo };
 }
 
 // Same rule as shapeTag in app.js.
@@ -281,7 +284,7 @@ function shapeOf(w, h) {
   return w > h * 1.1 ? 'Landscape' : h > w * 1.1 ? 'Portrait' : 'Square';
 }
 
-async function checkDims(dimsTodo, token, deadline) {
+async function checkMedia(mediaTodo, token, deadline) {
   const started = Date.now();
   const startBytes = driveBytesRead('analyze');
   let checkedCount = 0;
@@ -290,15 +293,15 @@ async function checkDims(dimsTodo, token, deadline) {
   let stopReason = null;
   let next = 0;
   async function lane() {
-    while (!stopReason && next < dimsTodo.length && Date.now() < deadline) {
-      const [id, driveW, driveH] = dimsTodo[next++];
+    while (!stopReason && next < mediaTodo.length && Date.now() < deadline) {
+      const [id, driveW, driveH] = mediaTodo[next++];
       let info = null;
       try {
-        info = await probeInfo(id, token, 'analyze', AbortSignal.timeout(DIMS_TIMEOUT_MS));
+        info = await probeInfo(id, token, 'analyze', AbortSignal.timeout(MEDIA_TIMEOUT_MS));
       } catch (err) {
         // Drive refusing: not marked, so the next hourly re-list retries it
         // (and analysis isn't held up behind it meanwhile). Anything else -
-        // unreadable header, too slow - is recorded as "?" and not retried.
+        // unreadable header, too slow - is recorded as unreadable.
         if (err.transient) {
           if (++transientStreak >= STOP_AFTER_TRANSIENT && !stopReason) {
             stopReason = `${err.message} [Drive says: ${lastDriveRefusal('analyze') || 'no reason given'}]`;
@@ -307,26 +310,28 @@ async function checkDims(dimsTodo, token, deadline) {
         }
       }
       transientStreak = 0;
-      const shown = info && info.width && info.height ? `${info.width}x${info.height}` : '?';
-      const writes = [kvCommand(['HSET', DIMS_KEY, id, shown])];
+      const record = info ? {
+        w: info.width, h: info.height, rot: info.rotation,
+        fps: Math.round(info.fps * 100) / 100, vc: info.videoCodec, ac: info.audioCodec,
+        d: Math.round(info.duration * 1000),
+      } : { err: 1 };
       const driveShape = shapeOf(driveW, driveH);
       const shownShape = info ? shapeOf(info.width, info.height) : null;
       if (shownShape && shownShape !== driveShape) {
         fixed++;
-        writes.push(kvCommand(['HSET', SHAPE_FIX_KEY, id, shown]));
-        console.log(`shape check ${id.slice(0, 6)}…: Drive ${driveW}x${driveH} (${driveShape}), shown ${shown} (${shownShape}), rotation ${info.rotation}`);
+        console.log(`header check ${id.slice(0, 6)}…: Drive ${driveW}x${driveH} (${driveShape}), shown ${info.width}x${info.height} (${shownShape}), rotation ${info.rotation}`);
       }
-      await Promise.all(writes);
+      await kvCommand(['HSET', MEDIA_KEY, id, JSON.stringify(record)]);
       checkedCount++;
     }
   }
-  await Promise.all(Array.from({ length: DIMS_PARALLEL }, lane));
-  const remaining = dimsTodo.slice(next); // everything not yet attempted
-  await kvCommand(['SET', DIMS_TODO_KEY, JSON.stringify(remaining)]);
+  await Promise.all(Array.from({ length: MEDIA_PARALLEL }, lane));
+  const remaining = mediaTodo.slice(next); // everything not yet attempted
+  await kvCommand(['SET', MEDIA_TODO_KEY, JSON.stringify(remaining)]);
   return {
-    shapesChecked: checkedCount,
+    headersChecked: checkedCount,
     shapesFixed: fixed,
-    shapesLeft: remaining.length,
+    headersLeft: remaining.length,
     ranSeconds: Math.ceil((Date.now() - started) / 1000),
     readMB: Math.round((driveBytesRead('analyze') - startBytes) / 1e6),
     stopReason,
@@ -344,11 +349,11 @@ async function runBatch() {
   const budgetBytes = DAILY_GB * 1e9 - usedBytes;
   if (budgetBytes <= 0) return { analyzed: 0, capped: `${DAILY_GB} GB read from Drive` };
   const token = await getServiceAccountToken();
-  const { todo, dimsTodo } = await loadTodo(token);
+  const { todo, mediaTodo } = await loadTodo(token);
 
-  // Shape checks first: cheap, and not counted as analysis minutes.
-  if (dimsTodo.length) {
-    const result = await checkDims(dimsTodo, token, started + RUN_BUDGET_S * 1000);
+  // Header checks first: cheap, and not counted as analysis minutes.
+  if (mediaTodo.length) {
+    const result = await checkMedia(mediaTodo, token, started + RUN_BUDGET_S * 1000);
     await kvCommand(['INCRBY', bytesKey, String(result.readMB * 1e6)])
       .then(() => kvCommand(['EXPIRE', bytesKey, String(2 * 86400)]));
     return result;
@@ -459,9 +464,9 @@ export default async function handler(req) {
   if (!locked) return json({ busy: true });
   try {
     const result = await runBatch();
-    console.log(result.shapesChecked !== undefined
-      ? `shape check run: ${result.shapesChecked} checked in ${result.ranSeconds} s, ${result.shapesFixed} shapes corrected, `
-        + `${result.shapesLeft} left; read ${result.readMB} MB from Drive`
+    console.log(result.headersChecked !== undefined
+      ? `header check run: ${result.headersChecked} checked in ${result.ranSeconds} s, ${result.shapesFixed} shapes differ from Drive, `
+        + `${result.headersLeft} left; read ${result.readMB} MB from Drive`
         + (result.stopReason ? `; stopped early, Drive refusing: ${result.stopReason}` : '')
       : result.capped
       ? `analyze run: daily cap reached (${result.capped})`

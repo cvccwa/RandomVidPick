@@ -7,7 +7,7 @@ const VIDEO_MIME_TYPES = [
   'video/quicktime', 'video/x-msvideo', 'video/mpeg',
   'video/3gpp', 'video/x-flv', 'video/x-ms-wmv'
 ];
-const APP_VERSION = 'v42';
+const APP_VERSION = 'v43';
 const BROWSE_BATCH = 50;
 // Where api/ (stream, thumbnails, tags) is served from.
 const API_BASE = 'https://randomvidpick-139266625585.us-east1.run.app';
@@ -324,7 +324,7 @@ function librarySignature(videos) {
 // ─── META (durations + watched history, stored in KV via /api/meta) ──────────
 let metaWatched  = {};   // fileId -> last-watched epoch ms
 let metaTags     = {};   // fileId -> {tagName: source}  (m manual, f filename, i imported)
-let metaShapes   = {};   // fileId -> [width, height] as players show it, where Drive's shape is wrong
+let metaMedia    = {};   // fileId -> [width, height (as shown), fps, has audio 1/0, duration ms], from the server's header check
 let metaPromise  = null; // load once per page
 const pendingDurations = {};
 const pendingWatched   = new Set();
@@ -346,11 +346,12 @@ function ensureMeta() {
         metaWatched = { ...(meta.watched || {}), ...metaWatched };
         // Same for tags edited before the load returned.
         metaTags = { ...(meta.tags || {}), ...metaTags };
-        metaShapes = meta.shapes || {};
+        metaMedia = meta.media || {};
         for (const v of videoCache || []) {
           if (!v.durationMs && meta.durations && meta.durations[v.id]) {
             v.durationMs = meta.durations[v.id];
           }
+          if (!v.durationMs && metaMedia[v.id] && metaMedia[v.id][4]) v.durationMs = metaMedia[v.id][4];
         }
       })
       .catch(() => {});
@@ -441,7 +442,16 @@ function isCreatorTag(name) {
   return name.startsWith(CREATOR_PREFIX);
 }
 
-// Quality tags ("quality:4K" ...) are worked out from Drive's resolution,
+// Picture size as players show it: from the server's header check
+// (api/analyze.js, via /api/meta) once it has read the file, else Drive's.
+// Drive gives the stored size, which is sideways for phone videos marked
+// "rotate 90", and none at all for some files.
+function sizeOf(video) {
+  const m = metaMedia[video.id];
+  return m && m[0] && m[1] ? [m[0], m[1]] : [video.width || 0, video.height || 0];
+}
+
+// Quality tags ("quality:4K" ...) are worked out from the resolution,
 // never stored: always right, nothing to back-fill, and the tag editor and
 // manager can't change them. They only take part in filtering and search.
 const QUALITY_PREFIX = 'quality:';
@@ -451,17 +461,14 @@ function isQualityTag(name) {
 }
 
 function qualityTag(video) {
-  const short = Math.min(video.width || 0, video.height || 0);
+  const short = Math.min(...sizeOf(video));
   if (!short) return null;
   const label = short >= 2000 ? '4K' : short >= 1300 ? '1440p' : short >= 1000 ? '1080p' : short >= 700 ? '720p' : 'SD';
   return QUALITY_PREFIX + label;
 }
 
-// Shape tags ("shape:Portrait" ...) work the same way, from Drive's width and
-// height: filter to one shape and a Smooth compilation has no mixed frames.
-// Drive gives the stored size, which is sideways for phone videos marked
-// "rotate 90"; the server's shape check (api/analyze.js) supplies the size
-// as shown for those, via /api/meta.
+// Shape tags ("shape:Portrait" ...) work the same way: filter to one shape
+// and a Smooth compilation has no mixed frames.
 const SHAPE_PREFIX = 'shape:';
 const SHAPE_ORDER  = ['Portrait', 'Landscape', 'Square'];
 
@@ -470,23 +477,48 @@ function isShapeTag(name) {
 }
 
 function shapeTag(video) {
-  const [w, h] = metaShapes[video.id] || [video.width || 0, video.height || 0];
+  const [w, h] = sizeOf(video);
   if (!w || !h) return null;
   const label = w > h * 1.1 ? 'Landscape' : h > w * 1.1 ? 'Portrait' : 'Square';
   return SHAPE_PREFIX + label;
 }
 
-// Stored tags plus the video's quality and shape tags - for filters and
-// search only.
+// Frame rate ("fps:60", shown "60 fps") and "audio:none" ("No audio") come
+// only from the header check, so videos it hasn't read yet have neither.
+const FPS_PREFIX   = 'fps:';
+const NO_AUDIO_TAG = 'audio:none';
+
+function isFpsTag(name) {
+  return name.startsWith(FPS_PREFIX);
+}
+
+function fpsTag(video) {
+  const m = metaMedia[video.id];
+  return m && m[2] ? FPS_PREFIX + Math.round(m[2]) : null;
+}
+
+function audioTag(video) {
+  const m = metaMedia[video.id];
+  return m && !m[3] ? NO_AUDIO_TAG : null;
+}
+
+// Stored tags plus the video's computed tags (quality, shape, frame rate,
+// no audio) - for filters and search only.
+function computedTags(video) {
+  return [qualityTag(video), shapeTag(video), fpsTag(video), audioTag(video)].filter(Boolean);
+}
+
 function filterTagsOf(video) {
   const computed = {};
-  for (const t of [qualityTag(video), shapeTag(video)]) if (t) computed[t] = 'q';
+  for (const t of computedTags(video)) computed[t] = 'q';
   return { ...tagsOf(video.id), ...computed };
 }
 
 function tagLabel(name) {
   if (isQualityTag(name)) return name.slice(QUALITY_PREFIX.length);
   if (isShapeTag(name)) return name.slice(SHAPE_PREFIX.length);
+  if (isFpsTag(name)) return `${name.slice(FPS_PREFIX.length)} fps`;
+  if (name === NO_AUDIO_TAG) return 'No audio';
   return isCreatorTag(name) ? name.slice(CREATOR_PREFIX.length) : name;
 }
 
@@ -507,25 +539,24 @@ function tagCounts(kind) {
   return new Map([...counts].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])));
 }
 
-// tagCounts plus quality tags, for the filter picker: quality first, best
-// first, then the stored tags.
+// tagCounts plus the computed tags, for the filter picker: quality (best
+// first), shape, frame rate (highest first), no audio, then the stored tags.
 const QUALITY_ORDER = ['4K', '1440p', '1080p', '720p', 'SD'];
 function filterTagCounts(kind) {
   const stored = tagCounts(kind);
   if (kind === 'creator') return stored;
-  const quality = new Map();
-  const shape = new Map();
+  const counts = new Map();
   for (const v of videoCache || []) {
-    const q = qualityTag(v);
-    if (q) quality.set(q, (quality.get(q) || 0) + 1);
-    const sh = shapeTag(v);
-    if (sh) shape.set(sh, (shape.get(sh) || 0) + 1);
+    for (const t of computedTags(v)) counts.set(t, (counts.get(t) || 0) + 1);
   }
-  const ordered = [...quality].sort((a, b) =>
-    QUALITY_ORDER.indexOf(tagLabel(a[0])) - QUALITY_ORDER.indexOf(tagLabel(b[0])));
-  const shapes = [...shape].sort((a, b) =>
-    SHAPE_ORDER.indexOf(tagLabel(a[0])) - SHAPE_ORDER.indexOf(tagLabel(b[0])));
-  return new Map([...ordered, ...shapes, ...stored]);
+  const group = (test, rank) => [...counts].filter(([t]) => test(t)).sort((a, b) => rank(a[0]) - rank(b[0]));
+  return new Map([
+    ...group(isQualityTag, t => QUALITY_ORDER.indexOf(tagLabel(t))),
+    ...group(isShapeTag, t => SHAPE_ORDER.indexOf(tagLabel(t))),
+    ...group(isFpsTag, t => -Number(t.slice(FPS_PREFIX.length))),
+    ...group(t => t === NO_AUDIO_TAG, () => 0),
+    ...stored,
+  ]);
 }
 
 // Tidies a typed name into a full tag (adding the creator prefix if asked)
@@ -2087,7 +2118,7 @@ browseCompileBtn.addEventListener('click', async () => {
         pick:  compilePrefs.pick,
         len:   compilePrefs.len,
         frame: compilePrefs.frame,
-        clips: browseFiltered.map(v => ({ id: v.id, d: v.durationMs || 0, w: v.width || 0, h: v.height || 0 })),
+        clips: browseFiltered.map(v => { const [w, h] = sizeOf(v); return { id: v.id, d: v.durationMs || 0, w, h }; }),
       }),
     });
     if (!res.ok) throw new Error(`compile ${res.status}`);
