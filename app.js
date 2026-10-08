@@ -7,7 +7,7 @@ const VIDEO_MIME_TYPES = [
   'video/quicktime', 'video/x-msvideo', 'video/mpeg',
   'video/3gpp', 'video/x-flv', 'video/x-ms-wmv'
 ];
-const APP_VERSION = 'v41';
+const APP_VERSION = 'v42';
 const BROWSE_BATCH = 50;
 // Where api/ (stream, thumbnails, tags) is served from.
 const API_BASE = 'https://randomvidpick-139266625585.us-east1.run.app';
@@ -324,6 +324,7 @@ function librarySignature(videos) {
 // ─── META (durations + watched history, stored in KV via /api/meta) ──────────
 let metaWatched  = {};   // fileId -> last-watched epoch ms
 let metaTags     = {};   // fileId -> {tagName: source}  (m manual, f filename, i imported)
+let metaShapes   = {};   // fileId -> [width, height] as players show it, where Drive's shape is wrong
 let metaPromise  = null; // load once per page
 const pendingDurations = {};
 const pendingWatched   = new Set();
@@ -345,6 +346,7 @@ function ensureMeta() {
         metaWatched = { ...(meta.watched || {}), ...metaWatched };
         // Same for tags edited before the load returned.
         metaTags = { ...(meta.tags || {}), ...metaTags };
+        metaShapes = meta.shapes || {};
         for (const v of videoCache || []) {
           if (!v.durationMs && meta.durations && meta.durations[v.id]) {
             v.durationMs = meta.durations[v.id];
@@ -457,6 +459,9 @@ function qualityTag(video) {
 
 // Shape tags ("shape:Portrait" ...) work the same way, from Drive's width and
 // height: filter to one shape and a Smooth compilation has no mixed frames.
+// Drive gives the stored size, which is sideways for phone videos marked
+// "rotate 90"; the server's shape check (api/analyze.js) supplies the size
+// as shown for those, via /api/meta.
 const SHAPE_PREFIX = 'shape:';
 const SHAPE_ORDER  = ['Portrait', 'Landscape', 'Square'];
 
@@ -465,7 +470,7 @@ function isShapeTag(name) {
 }
 
 function shapeTag(video) {
-  const w = video.width || 0, h = video.height || 0;
+  const [w, h] = metaShapes[video.id] || [video.width || 0, video.height || 0];
   if (!w || !h) return null;
   const label = w > h * 1.1 ? 'Landscape' : h > w * 1.1 ? 'Portrait' : 'Square';
   return SHAPE_PREFIX + label;

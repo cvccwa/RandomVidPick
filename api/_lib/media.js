@@ -21,8 +21,9 @@ function probeError(stderr) {
   return err;
 }
 
-// A file's audio presence, frame rate and duration (seconds), from ffmpeg's
-// stream listing - reads only the container header.
+// A file's audio presence, frame rate, duration (seconds) and picture size
+// as players show it, from ffmpeg's stream listing - reads only the
+// container header. width/height are 0 when the header doesn't say.
 export function probeInfo(id, token, purpose = 'compile', signal) {
   if (probeCache.has(id)) return Promise.resolve(probeCache.get(id));
   return new Promise((resolve, reject) => {
@@ -44,10 +45,32 @@ export function probeInfo(id, token, purpose = 'compile', signal) {
         hasAudio: /Stream #0:\d+[^:]*: Audio:/.test(stderr),
         fps:      rate ? Number(rate[1]) : 0,
         duration: dur ? Number(dur[1]) * 3600 + Number(dur[2]) * 60 + Number(dur[3]) : 0,
+        ...shownSize(stderr, videoLine),
       };
       if (probeCache.size > 500) probeCache.delete(probeCache.keys().next().value);
       probeCache.set(id, info);
       resolve(info);
     });
   });
+}
+
+// The stream line gives the stored size; players also apply the pixel
+// aspect (SAR) and any rotation flag - phones often store video sideways
+// and mark it "rotate 90". Drive reports the stored size, so its shape can
+// be wrong for those.
+function shownSize(stderr, videoLine) {
+  const size = /, (\d{2,5})x(\d{2,5})[, ]/.exec(videoLine);
+  if (!size) return { width: 0, height: 0, rotation: 0 };
+  let width = Number(size[1]);
+  let height = Number(size[2]);
+  const sar = /\[SAR (\d+):(\d+)/.exec(videoLine);
+  if (sar && Number(sar[1]) > 0 && Number(sar[2]) > 0) width = Math.round(width * Number(sar[1]) / Number(sar[2]));
+  // This stream's own block only (up to the next stream).
+  const start = stderr.indexOf(videoLine);
+  const next = stderr.indexOf('Stream #', start + 1);
+  const block = stderr.slice(start, next === -1 ? undefined : next);
+  const rot = /displaymatrix: rotation of (-?[\d.]+) degrees/.exec(block) || /rotate\s*:\s*(-?\d+)/.exec(block);
+  const rotation = rot ? ((Math.round(Number(rot[1])) % 360) + 360) % 360 : 0;
+  if (rotation === 90 || rotation === 270) [width, height] = [height, width];
+  return { width, height, rotation };
 }
