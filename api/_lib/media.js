@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { sourceUrl, pieceArgs } from './driveSource.js';
+import { sourceUrl, pieceArgs, readDriveBytes } from './driveSource.js';
 
 // Shared by compilations (api/compile.js) and highlight analysis
 // (api/analyze.js). ffmpeg reads Drive files through driveSource.js so the
@@ -97,4 +97,37 @@ function shownSize(stderr, videoLine) {
   const rotation = rot ? ((Math.round(Number(rot[1])) % 360) + 360) % 360 : 0;
   if (rotation === 90 || rotation === 270) [width, height] = [height, width];
   return { width, height, storedWidth, storedHeight, rotation };
+}
+
+// MP4 / MOV files are a run of top-level boxes, each starting with its own
+// size, so a file cut short (an interrupted upload) has a last box that
+// claims to end past the end of the file. Walking them costs a few small
+// reads, mostly from pieces ffmpeg already read. Returns null when the file
+// isn't MP4-style (MKV, WebM, TS...) or has too many boxes to walk cheaply
+// (fragmented), { cut: bytes missing } otherwise (0 = complete), or
+// { bad: true } when the box structure itself is broken.
+const MP4_FIRST_BOXES = new Set(['ftyp', 'moov', 'mdat', 'free', 'skip', 'wide', 'pnot', 'uuid', 'styp', 'sidx']);
+const MAX_BOXES = 64;
+export async function mp4Truncation(id, signal) {
+  let at = 0;
+  let size = Infinity;
+  for (let n = 0; n < MAX_BOXES; n++) {
+    if (at >= size) return { cut: at - size };
+    const read = await readDriveBytes(id, at, 16, 'analyze', signal);
+    size = read.size;
+    const buf = read.buf;
+    if (buf.length < 8) return { bad: true };
+    const type = buf.toString('latin1', 4, 8);
+    if (n === 0 && !MP4_FIRST_BOXES.has(type)) return null;
+    if (!/^[\x20-\x7e]{4}$/.test(type)) return { bad: true };
+    let boxSize = buf.readUInt32BE(0);
+    if (boxSize === 0) return { cut: 0 }; // runs to the end of the file
+    if (boxSize === 1) {
+      if (buf.length < 16) return { bad: true };
+      boxSize = Number(buf.readBigUInt64BE(8));
+    }
+    if (boxSize < 8) return { bad: true };
+    at += boxSize;
+  }
+  return null;
 }

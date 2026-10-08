@@ -132,6 +132,30 @@ async function fetchPiece(id, start, signal, purpose) {
   return { ok: true, ...piece };
 }
 
+// `length` bytes from `start` (fewer at the end of the file) plus the file's
+// total size, through the same cached pieces - reading a few bytes near
+// where ffmpeg already read costs nothing more.
+export async function readDriveBytes(id, start, length, purpose = 'analyze', signal) {
+  const parts = [];
+  let size = 0;
+  for (let at = start; at < start + length;) {
+    const pieceStart = Math.floor(at / PIECE_BYTES) * PIECE_BYTES;
+    const p = await fetchPiece(id, pieceStart, signal, purpose);
+    if (!p.ok) {
+      const err = new Error(`Drive ${p.status}: ${refusalReason(p.status, p.text)}`);
+      err.transient = true;
+      throw err;
+    }
+    size = p.size;
+    if (at >= size) break;
+    const end = Math.min(start + length, pieceStart + p.buf.length, size);
+    parts.push(p.buf.subarray(at - pieceStart, end - pieceStart));
+    at = end;
+    if (end >= size) break;
+  }
+  return { buf: Buffer.concat(parts), size };
+}
+
 async function servePiece(req, res, id, purpose, signal) {
   const m = /^bytes=(\d+)-(\d*)$/.exec((req.headers.range || 'bytes=0-').trim());
   if (!m) { res.writeHead(416); return res.end(); }

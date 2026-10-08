@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { getServiceAccountToken, kvCommand } from './_lib/serviceAccount.js';
 import { isAuthorized } from './_lib/auth.js';
-import { FFMPEG, isTransient, probeInfo } from './_lib/media.js';
+import { FFMPEG, isTransient, probeInfo, mp4Truncation } from './_lib/media.js';
 import { sourceUrl, pieceArgs, driveBytesRead, lastDriveRefusal } from './_lib/driveSource.js';
 import { listLibrary } from './_lib/library.js';
 import { libraryStats } from './_lib/libraryStats.js';
@@ -49,7 +49,9 @@ const VERSION        = 1;
 // fileId -> JSON {w, h, sw, sh, rot, fps, vc, ac, d}: size as shown,
 // stored size, rotation, frame rate, video / audio codec ('' = no audio),
 // duration ms. An audio-only file is {audioOnly: 1, ac, d}; one whose
-// header couldn't be read is {err: <why>}. Every file checked has an entry.
+// header couldn't be read is {err: <why>}. An MP4 / MOV cut short also
+// has cut: <bytes missing>, and one whose box structure is broken bad: 1
+// (see mp4Truncation). Every file checked has an entry.
 const MEDIA_KEY      = 'rvp:media';
 const MEDIA_TODO_KEY = 'rvp:media:todo';
 const MEDIA_PARALLEL = 4;
@@ -327,6 +329,16 @@ async function checkMedia(mediaTodo, token, deadline) {
         console.log(`header check ${id.slice(0, 6)}…: ${err.audioOnly ? `audio only (${err.audioCodec})` : `unreadable: ${record.err}`}`);
       }
       transientStreak = 0;
+      try {
+        const box = await mp4Truncation(id, AbortSignal.timeout(MEDIA_TIMEOUT_MS));
+        if (box?.cut > 0) record.cut = box.cut;
+        if (box?.bad) record.bad = 1;
+        if (box?.cut > 0 || box?.bad) {
+          console.log(`header check ${id.slice(0, 6)}…: ${box.bad ? 'MP4 box structure broken' : `cut short, ${(box.cut / 1048576).toFixed(1)} MiB missing`}`);
+        }
+      } catch (err) {
+        // Not checked this time (Drive refused or too slow); the rest stands.
+      }
       const driveQuality = qualityOf(driveW, driveH);
       const headerQuality = info ? qualityOf(info.storedWidth, info.storedHeight) : null;
       if (driveQuality && headerQuality && driveQuality !== headerQuality) {
