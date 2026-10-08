@@ -45,6 +45,12 @@ const SEGMENT_TRIES  = 3;          // a broken source is swapped for another cli
 const SID_RE         = /^[\w-]{40,64}$/;
 const RES_OPTIONS    = new Set(['auto', '2160', '1440', '1080']);
 const FPS_OPTIONS    = new Set(['auto', '60', '30']);
+// Smooth frame: 'fit' letterboxes every clip into one 16:9 frame (seamless
+// everywhere); 'native' (experimental) keeps each clip's own shape, scaled so
+// its short side is the chosen height - the stream then changes shape between
+// clips, which VLC may or may not follow cleanly. Remove this and the
+// 'native' branch in smoothArgs to drop the experiment.
+const FRAME_OPTIONS  = new Set(['fit', 'native']);
 
 const CORS = {
   'Access-Control-Allow-Origin':  ALLOWED_ORIGIN,
@@ -158,6 +164,7 @@ async function createSession(req) {
   const smooth    = body.mode === 'smooth' || legacyRes;
   const res       = RES_OPTIONS.has(body.res) ? body.res : legacyRes ? body.mode : 'auto';
   const fpsChoice = FPS_OPTIONS.has(body.fps) ? body.fps : 'auto';
+  const frame     = FRAME_OPTIONS.has(body.frame) ? body.frame : 'fit';
   if (!Array.isArray(clips) || !clips.length || clips.length > MAX_INPUT) {
     return json({ error: 'bad clips' }, 400);
   }
@@ -189,6 +196,7 @@ async function createSession(req) {
     mode:  smooth ? 'smooth' : 'original',
     height,
     fps:   smooth ? await pickFps(fpsChoice, height, picked) : null,
+    ...(smooth && frame === 'native' ? { frame } : {}),
     clips: timeline(picked.map((c, i) => {
       const l = clipLength(lenChoice, starts[i]);
       const s = starts[i] ? highlightStart(starts[i], l) : pickStart(c.d, l);
@@ -209,6 +217,7 @@ async function createSession(req) {
     mode:   session.mode,
     height: session.height,
     fps:    session.fps,
+    frame:  session.frame || (session.mode === 'smooth' ? 'fit' : null),
     pick,
     highlights: starts.filter(s => s !== null).length,
     len:        lenChoice,
@@ -395,8 +404,12 @@ function smoothArgs(source, n, session, token, hasAudio) {
   // Fit inside the frame (letterbox/pillarbox, never crop), fixed fps, and
   // pad short sources with their last frame / silence so every segment is
   // exactly its slot's length.
-  const video = `[0:v:0]scale=${width}:${height}:force_original_aspect_ratio=decrease,`
-    + `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=${fps},`
+  const shape = session.frame === 'native'
+    // Experimental: own shape, short side = height (even dimensions).
+    ? `scale=w='if(gte(iw\\,ih)\\,-2\\,${height})':h='if(gte(iw\\,ih)\\,${height}\\,-2)',`
+    : `scale=${width}:${height}:force_original_aspect_ratio=decrease,`
+      + `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black,`;
+  const video = `[0:v:0]${shape}setsar=1,fps=${fps},`
     + `format=yuv420p,tpad=stop_mode=clone:stop_duration=${len}[v]`;
   const audio = `[${hasAudio ? '0:a:0' : '1:a'}]aresample=48000,aformat=channel_layouts=stereo,apad[a]`;
   return [
