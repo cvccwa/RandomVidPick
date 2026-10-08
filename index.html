@@ -268,7 +268,7 @@
     .browse-header > button { width: 2.75rem; padding: 0.5rem 0; display: inline-flex; align-items: center; justify-content: center; }
 
     /* Active filters: two rows that each scroll sideways - search, creators
-       and the rest; then the select button and the tags. */
+       and the rest; then the tags. */
     .browse-tagbar {
       display: flex;
       flex-direction: column;
@@ -276,32 +276,26 @@
       padding: 0.6rem 0 0 1rem;
       flex-shrink: 0;
     }
-    .filter-line { display: flex; align-items: center; gap: 0.4rem; }
-    .filter-round {
-      flex-shrink: 0;
-      width: 2rem;
-      height: 2rem;
-      border-radius: 50%;
-      background: var(--surface);
-      border: 1px solid var(--border);
-      color: var(--muted);
-      font-family: inherit;
-      font-size: 0.85rem;
-      padding: 0;
-      cursor: pointer;
-    }
-    .filter-round.active { background: var(--danger); border-color: var(--danger); color: #fff; }
-    .filter-row { flex: 1; min-width: 0; display: flex; gap: 0.4rem; overflow-x: auto; padding-right: 1rem; scrollbar-width: none; align-items: center; }
+    .browse-tagbar[hidden] { display: none; }
+    .filter-row { display: flex; gap: 0.4rem; overflow-x: auto; padding-right: 1rem; scrollbar-width: none; align-items: center; }
     .filter-row::-webkit-scrollbar { display: none; }
-    /* Filters button: opens the sheet; its ✕ half clears everything. */
-    .filters-pill { display: flex; flex-shrink: 0; border: 1px solid var(--border); border-radius: 4px; background: var(--surface); overflow: hidden; }
-    .filters-pill button { background: transparent; border: none; color: var(--text); font-family: inherit; font-size: 0.85rem; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+
+    /* Split pills: sort field | direction, and Filters | clear. */
+    .split-pill { display: flex; min-width: 0; border: 1px solid var(--border); border-radius: 4px; background: var(--surface); overflow: hidden; }
+    .split-pill > * { background: transparent; border: none; border-radius: 0; color: var(--text); font-family: inherit; font-size: 0.85rem; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+    .split-pill > * + * { border-left: 1px solid var(--border); }
+    .sort-pill { flex: 1; }
+    .sort-pill .browse-select { flex: 1; min-width: 0; padding: 0.5rem; }
+    .sort-pill .browse-dir { flex-shrink: 0; padding: 0.5rem 0.7rem; }
+    .filters-pill { flex-shrink: 0; }
     .filters-pill-main { font-weight: 600; padding: 0.5rem 0.9rem; }
-    .filters-pill-clear { padding: 0.5rem 0.7rem; border-left: 1px solid var(--border) !important; }
+    .filters-pill-clear { padding: 0.5rem 0.7rem; }
     .filters-pill-clear[hidden] { display: none; }
     .filters-pill.filtering { background: var(--accent); border-color: var(--accent); }
-    .filters-pill.filtering button { color: var(--on-accent); }
-    .filters-pill.filtering .filters-pill-clear { border-left-color: rgba(11, 18, 32, 0.35) !important; }
+    .filters-pill.filtering > * { color: var(--on-accent); }
+    .filters-pill.filtering > * + * { border-left-color: rgba(11, 18, 32, 0.35); }
+    .browse-select-btn { flex-shrink: 0; width: 2.75rem; padding: 0.5rem 0; font-size: 1rem; display: inline-flex; align-items: center; justify-content: center; }
+    .browse-select-btn.active { background: var(--danger); border-color: var(--danger); color: #fff; }
 
     /* Filters sheet */
     .filter-top { display: flex; align-items: center; justify-content: space-between; }
@@ -755,6 +749,7 @@
     <button class="browse-dir browse-random" id="browseCompileBtn" type="button" aria-label="Play a compilation of clips from this view (long-press for options)" title="Compilation from this view - long-press for options">🎬</button>
   </div>
   <div class="browse-controls">
+    <div class="split-pill sort-pill">
     <select class="browse-select" id="browseSort" aria-label="Sort by">
       <option value="name">Name</option>
       <option value="created">Upload date</option>
@@ -764,14 +759,14 @@
       <option value="random">Random</option>
     </select>
     <button class="browse-dir" id="browseDir" type="button" aria-label="Sort direction">↑ Asc</button>
-    <div class="filters-pill" id="browseFiltersPill">
+    </div>
+    <button class="browse-dir browse-select-btn" id="browseSelectBtn" type="button" aria-label="Select videos to tag" title="Select videos to tag">☑</button>
+    <div class="split-pill filters-pill" id="browseFiltersPill">
       <button class="filters-pill-main" id="browseFiltersBtn" type="button">Filters</button>
       <button class="filters-pill-clear" id="browseFiltersClear" type="button" aria-label="Clear all filters and the search" title="Clear all filters and the search" hidden>✕</button>
     </div>
   </div>
-  <div class="browse-tagbar" id="browseTagBar">
-    <button class="filter-round" id="browseSelectBtn" type="button" aria-label="Select videos to tag" title="Select videos to tag">☑</button>
-  </div>
+  <div class="browse-tagbar" id="browseTagBar" hidden></div>
   <div class="browse-count" id="browseCount"></div>
   <div class="browse-grid" id="browseGrid">
     <div class="browse-sentinel" id="browseSentinel"></div>

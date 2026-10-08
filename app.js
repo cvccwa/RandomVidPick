@@ -1508,8 +1508,8 @@ function chipButton(text, className, onclick, title) {
 // removable chips so it's clear what's narrowing the grid.
 // The active filters as chips under the controls, each tapped to remove:
 // row 1 the search, creators, then the General and Format filters; row 2
-// the select button, then the tags. The ✕ half of the Filters button
-// clears everything, search included.
+// the tags. The ✕ half of the Filters button clears everything, search
+// included.
 const UPLOAD_LABELS = { week: 'Past week', month: 'Past month', quarter: 'Past 3 months' };
 
 function lengthLabel(p) {
@@ -1573,10 +1573,10 @@ function refreshTagBar() {
   for (const t of p.excluded.filter(t => !isCreatorTag(t))) row2.push(chip(`− ${tagLabel(t)}`, 'excluded', remove('excluded', t)));
   if (p.untagged) row2.push(chip('Untagged', 'active', n => { n.untagged = false; }));
 
-  browseFiltersClear.hidden = !row1.length && !row2.length;
+  browseFiltersClear.hidden = browseTagBar.hidden = !row1.length && !row2.length;
   browseTagBar.innerHTML = '';
   if (row1.length) browseTagBar.append(el('div', { className: 'filter-row' }, ...row1));
-  browseTagBar.append(el('div', { className: 'filter-line' }, browseSelectBtn, el('div', { className: 'filter-row' }, ...row2)));
+  if (row2.length) browseTagBar.append(el('div', { className: 'filter-row' }, ...row2));
 }
 
 function setSelectMode(on) {
