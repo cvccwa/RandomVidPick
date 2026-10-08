@@ -267,18 +267,18 @@
     /* The four header buttons (sign out, manage, random, compile): same width. */
     .browse-header > button { width: 2.75rem; padding: 0.5rem 0; display: inline-flex; align-items: center; justify-content: center; }
 
-    /* Active filters: two rows that each scroll sideways (search, creators
-       and the rest; then tags), with clear-all before the first and the
-       select button before the second. */
+    /* Active filters: two rows that each scroll sideways - search, creators
+       and the rest; then the select button and the tags. */
     .browse-tagbar {
-      display: grid;
-      grid-template-columns: 2rem minmax(0, 1fr);
-      align-items: center;
-      gap: 0.4rem 0.5rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.4rem;
       padding: 0.6rem 0 0 1rem;
       flex-shrink: 0;
     }
+    .filter-line { display: flex; align-items: center; gap: 0.4rem; }
     .filter-round {
+      flex-shrink: 0;
       width: 2rem;
       height: 2rem;
       border-radius: 50%;
@@ -291,10 +291,17 @@
       cursor: pointer;
     }
     .filter-round.active { background: var(--danger); border-color: var(--danger); color: #fff; }
-    .filter-row { display: flex; gap: 0.4rem; overflow-x: auto; padding-right: 1rem; scrollbar-width: none; min-height: 2rem; align-items: center; }
+    .filter-row { flex: 1; min-width: 0; display: flex; gap: 0.4rem; overflow-x: auto; padding-right: 1rem; scrollbar-width: none; align-items: center; }
     .filter-row::-webkit-scrollbar { display: none; }
-    .browse-filters-btn { font-weight: 600; padding: 0.5rem 0.9rem; }
-    .browse-filters-btn.filtering { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+    /* Filters button: opens the sheet; its ✕ half clears everything. */
+    .filters-pill { display: flex; flex-shrink: 0; border: 1px solid var(--border); border-radius: 4px; background: var(--surface); overflow: hidden; }
+    .filters-pill button { background: transparent; border: none; color: var(--text); font-family: inherit; font-size: 0.85rem; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+    .filters-pill-main { font-weight: 600; padding: 0.5rem 0.9rem; }
+    .filters-pill-clear { padding: 0.5rem 0.7rem; border-left: 1px solid var(--border) !important; }
+    .filters-pill-clear[hidden] { display: none; }
+    .filters-pill.filtering { background: var(--accent); border-color: var(--accent); }
+    .filters-pill.filtering button { color: var(--on-accent); }
+    .filters-pill.filtering .filters-pill-clear { border-left-color: rgba(11, 18, 32, 0.35) !important; }
 
     /* Filters sheet */
     .filter-top { display: flex; align-items: center; justify-content: space-between; }
@@ -757,7 +764,10 @@
       <option value="random">Random</option>
     </select>
     <button class="browse-dir" id="browseDir" type="button" aria-label="Sort direction">↑ Asc</button>
-    <button class="browse-dir browse-filters-btn" id="browseFiltersBtn" type="button">Filters</button>
+    <div class="filters-pill" id="browseFiltersPill">
+      <button class="filters-pill-main" id="browseFiltersBtn" type="button">Filters</button>
+      <button class="filters-pill-clear" id="browseFiltersClear" type="button" aria-label="Clear all filters and the search" title="Clear all filters and the search" hidden>✕</button>
+    </div>
   </div>
   <div class="browse-tagbar" id="browseTagBar">
     <button class="filter-round" id="browseSelectBtn" type="button" aria-label="Select videos to tag" title="Select videos to tag">☑</button>

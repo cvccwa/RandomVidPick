@@ -77,6 +77,7 @@ const browseSentinel   = document.getElementById('browseSentinel');
 const browseSort       = document.getElementById('browseSort');
 const browseDir        = document.getElementById('browseDir');
 const browseFiltersBtn = document.getElementById('browseFiltersBtn');
+const browseFiltersClear = document.getElementById('browseFiltersClear');
 const browseSelectBtn  = document.getElementById('browseSelectBtn');
 const browseTagBar     = document.getElementById('browseTagBar');
 const browseRandomBtn  = document.getElementById('browseRandomBtn');
@@ -1476,6 +1477,7 @@ function closeBrowseView() {
 
 document.getElementById('browseManageBtn').addEventListener('click', () => openTagManager());
 browseFiltersBtn.addEventListener('click', () => openFilters());
+browseFiltersClear.addEventListener('click', () => { browseSearch.value = ''; applyFilters(FILTER_DEFAULTS); });
 browseSelectBtn.addEventListener('click', () => setSelectMode(!selectMode));
 
 browseSearch.addEventListener('input', () => {
@@ -1506,8 +1508,8 @@ function chipButton(text, className, onclick, title) {
 // removable chips so it's clear what's narrowing the grid.
 // The active filters as chips under the controls, each tapped to remove:
 // row 1 the search, creators, then the General and Format filters; row 2
-// the tags. The ✕ before row 1 clears everything, search included; the
-// select button always sits before row 2.
+// the select button, then the tags. The ✕ half of the Filters button
+// clears everything, search included.
 const UPLOAD_LABELS = { week: 'Past week', month: 'Past month', quarter: 'Past 3 months' };
 
 function lengthLabel(p) {
@@ -1534,7 +1536,7 @@ function refreshTagBar() {
   const p = browsePrefs;
   const count = activeFilterCount();
   browseFiltersBtn.textContent = count ? `Filters · ${count}` : 'Filters';
-  browseFiltersBtn.classList.toggle('filtering', count > 0);
+  browseFiltersBtn.parentElement.classList.toggle('filtering', count > 0);
 
   const chip = (label, className, change) => chipButton(`${label} ✕`, className, () => {
     const next = filterPrefs();
@@ -1571,17 +1573,10 @@ function refreshTagBar() {
   for (const t of p.excluded.filter(t => !isCreatorTag(t))) row2.push(chip(`− ${tagLabel(t)}`, 'excluded', remove('excluded', t)));
   if (p.untagged) row2.push(chip('Untagged', 'active', n => { n.untagged = false; }));
 
+  browseFiltersClear.hidden = !row1.length && !row2.length;
   browseTagBar.innerHTML = '';
-  if (row1.length || row2.length) {
-    browseTagBar.append(
-      el('button', {
-        type: 'button', className: 'filter-round filter-clear', textContent: '✕',
-        title: 'Clear all filters and the search', ariaLabel: 'Clear all filters and the search',
-        onclick: () => { browseSearch.value = ''; applyFilters(FILTER_DEFAULTS); },
-      }),
-      el('div', { className: 'filter-row' }, ...row1));
-  }
-  browseTagBar.append(browseSelectBtn, el('div', { className: 'filter-row' }, ...row2));
+  if (row1.length) browseTagBar.append(el('div', { className: 'filter-row' }, ...row1));
+  browseTagBar.append(el('div', { className: 'filter-line' }, browseSelectBtn, el('div', { className: 'filter-row' }, ...row2)));
 }
 
 function setSelectMode(on) {
