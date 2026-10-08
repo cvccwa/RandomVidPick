@@ -316,15 +316,19 @@ async function runBatch() {
 }
 
 // Library lengths/resolutions/bitrates to the log, at most hourly, when the
-// app checks progress (see _lib/libraryStats.js). Doesn't delay the reply.
+// app checks progress (see _lib/libraryStats.js). Awaited before replying:
+// Cloud Run throttles CPU once a response is sent, so work left running
+// after it may never finish. Costs the reply a second or two once an hour.
 let statsLoggedAt = 0;
-function logLibraryStats() {
+async function logLibraryStats() {
   if (Date.now() - statsLoggedAt < 3600e3) return;
   statsLoggedAt = Date.now();
-  getServiceAccountToken()
-    .then(listLibrary)
-    .then(videos => console.log(libraryStats(videos)))
-    .catch(err => { statsLoggedAt = 0; console.log(`library stats failed: ${err.message}`); });
+  try {
+    console.log(libraryStats(await listLibrary(await getServiceAccountToken())));
+  } catch (err) {
+    statsLoggedAt = 0;
+    console.log(`library stats failed: ${err.message}`);
+  }
 }
 
 export default async function handler(req) {
@@ -346,7 +350,7 @@ export default async function handler(req) {
       if (entry.failed) failed++;
       else if (entry.v === VERSION) analyzed++;
     }
-    logLibraryStats();
+    await logLibraryStats();
     return json({ analyzed, failed });
   }
   if (req.method !== 'POST') return json({ error: 'method not allowed' }, 405);
