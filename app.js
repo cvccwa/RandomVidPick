@@ -7,7 +7,7 @@ const VIDEO_MIME_TYPES = [
   'video/quicktime', 'video/x-msvideo', 'video/mpeg',
   'video/3gpp', 'video/x-flv', 'video/x-ms-wmv'
 ];
-const APP_VERSION = 'v43';
+const APP_VERSION = 'v44';
 const BROWSE_BATCH = 50;
 // Where api/ (stream, thumbnails, tags) is served from.
 const API_BASE = 'https://randomvidpick-139266625585.us-east1.run.app';
@@ -324,7 +324,7 @@ function librarySignature(videos) {
 // ─── META (durations + watched history, stored in KV via /api/meta) ──────────
 let metaWatched  = {};   // fileId -> last-watched epoch ms
 let metaTags     = {};   // fileId -> {tagName: source}  (m manual, f filename, i imported)
-let metaMedia    = {};   // fileId -> [width, height (as shown), fps, has audio 1/0, duration ms, stored short side, audio only 1/0], from the server's header check
+let metaMedia    = {};   // fileId -> [width, height (as shown), fps, has audio 1/0, duration ms, stored short side, audio only 1/0, video codec], from the server's header check
 let metaPromise  = null; // load once per page
 const pendingDurations = {};
 const pendingWatched   = new Set();
@@ -412,6 +412,10 @@ function markWatched(id) {
 
 function isRecentlyWatched(id) {
   return metaWatched[id] && Date.now() - metaWatched[id] < RECENT_MS;
+}
+
+function formatBytes(bytes) {
+  return bytes >= 1e9 ? `${(bytes / 1e9).toFixed(1)} GB` : `${Math.max(1, Math.round(bytes / 1e6))} MB`;
 }
 
 function formatDuration(ms) {
@@ -1320,7 +1324,7 @@ function renderNextBatch() {
 }
 
 function updateBrowseCount() {
-  const update = pendingLibrary ? ' · Library updated, tap to refresh' : ' · Long-press a video to tag it';
+  const update = pendingLibrary ? ' · Library updated, tap to refresh' : ' · Long-press a video for details & tags';
   browseCount.textContent = `Showing ${browseRendered} of ${browseFiltered.length}${update}`;
   browseCount.classList.toggle('has-update', Boolean(pendingLibrary));
 }
@@ -1640,7 +1644,41 @@ function openFilterPicker(kind) {
   );
 }
 
+// Read-only facts about one video, for the top of its long-press sheet:
+// what the computed tags are worked out from, plus length, size and folder.
+const CODEC_NAMES = { h264: 'H.264', hevc: 'HEVC (H.265)', av1: 'AV1', vp9: 'VP9', vp8: 'VP8', prores: 'ProRes',
+  mpeg4: 'MPEG-4 (DivX/Xvid)', wmv1: 'WMV', wmv2: 'WMV', wmv3: 'WMV', vc1: 'VC-1', mpeg2video: 'MPEG-2' };
+
+function detailsSection(video) {
+  const m = metaMedia[video.id];
+  const [w, h] = sizeOf(video);
+  const rows = [];
+  if (m && m[6]) {
+    rows.push(['Picture', 'None (audio only)']);
+  } else if (w && h) {
+    const q = qualityTag(video);
+    rows.push(['Resolution', `${w}×${h}${q ? ` · ${tagLabel(q)}` : ''}`]);
+    rows.push(['Orientation', tagLabel(shapeTag(video))]);
+  }
+  if (m && m[2]) rows.push(['Frame rate', `${Number(m[2].toFixed(2))} fps`]);
+  if (video.durationMs) rows.push(['Length', formatDuration(video.durationMs)]);
+  if (video.size) rows.push(['File size', formatBytes(video.size)]);
+  if (m) rows.push(['Audio', m[3] ? 'Yes' : 'None']);
+  if (m && m[7]) rows.push(['Format', CODEC_NAMES[m[7]] || m[7].toUpperCase()]);
+  if (video.path) rows.push(['Folder', video.path]);
+  const grid = el('div', { className: 'sheet-details' });
+  for (const [label, value] of rows) {
+    grid.append(el('span', { className: 'sheet-details-label', textContent: label }),
+      el('span', { textContent: value }));
+  }
+  return el('div', { className: 'sheet-section' },
+    el('div', { className: 'sheet-section-title', textContent: 'ℹ️ Details' }),
+    grid,
+    m ? null : el('div', { className: 'sheet-note', textContent: 'Frame rate, audio and format show once the server has read this file.' }));
+}
+
 // Tag editor for one or many videos, split into Creator and Tags sections.
+// For a single video it opens with its details (detailsSection) on top.
 // Each tag is in one of three states:
 //   'all'  - every chosen video has it (or will, once saved)
 //   'none' - no chosen video has it (or will lose it)
@@ -1737,6 +1775,7 @@ function openTagEditor(ids) {
   const title = ids.length === 1 ? displayName(findVideo(ids[0]).name) : `${ids.length} videos`;
   openSheet(
     el('div', { className: 'sheet-title', textContent: title }),
+    ids.length === 1 ? detailsSection(findVideo(ids[0])) : null,
     section('creator'),
     section('tag'),
     el('div', { className: 'sheet-row sheet-actions' },
