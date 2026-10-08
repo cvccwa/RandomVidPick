@@ -2,14 +2,17 @@ import { spawn } from 'node:child_process';
 import { getServiceAccountToken, kvCommand } from './_lib/serviceAccount.js';
 import { isAuthorized } from './_lib/auth.js';
 import { FFMPEG, TRANSIENT_RE, probeInfo } from './_lib/media.js';
-import { sourceUrl, driveBytesRead, lastDriveRefusal } from './_lib/driveSource.js';
+import { sourceUrl, pieceArgs, driveBytesRead, lastDriveRefusal } from './_lib/driveSource.js';
 import { listLibrary } from './_lib/library.js';
 import { libraryStats } from './_lib/libraryStats.js';
 
 // Highlight analysis for smart compilations. Each video is sampled about
 // once a minute (MIN_SAMPLES..MAX_SAMPLES points); at each, WINDOW_S
-// seconds are measured for motion (how much the picture changes frame to
-// frame) and loudness. A second pass then samples around the best few
+// seconds from the keyframe at or before that spot are measured for motion
+// (how much the picture changes frame to frame) and loudness. Starting at a
+// keyframe means nothing before it has to be read and decoded, and reads
+// go through driveSource's small-piece mode, so a sample costs ~1-3 MB of
+// Drive downloads instead of tens. A second pass then samples around the best few
 // spots to land on the actual peak within those scenes. The strongest few
 // moments are kept in KV (PEAKS_KEY: fileId -> JSON) for /api/compile to
 // cut around.
@@ -33,13 +36,16 @@ const TODO_KEY       = 'rvp:analyze:todo';
 const LISTED_KEY     = 'rvp:analyze:listedAt';
 const LOCK_KEY       = 'rvp:analyze:lock';
 const VERSION        = 1;
-const MIN_SAMPLES    = 16;
-const MAX_SAMPLES    = 48;
-const SAMPLE_EVERY_S = 60;
+// Density is tunable without a code change: denser catches short bursts
+// (a 3 s burst is caught about (3 + WINDOW_S) / spacing of the time) at
+// proportionally more Drive reads.
+const MIN_SAMPLES    = Number(process.env.ANALYZE_MIN_SAMPLES) || 16;
+const MAX_SAMPLES    = Number(process.env.ANALYZE_MAX_SAMPLES) || 48;
+const SAMPLE_EVERY_S = Number(process.env.ANALYZE_SAMPLE_EVERY_S) || 60;
 const REFINE_TOP     = 3;                 // spots refined in the second pass
 const REFINE_OFFSETS = [-1 / 3, 1 / 3, 2 / 3]; // x coarse spacing; forward-leaning, as clips run forward
 const EXTENT_DROP    = 0.15;              // neighbours within this of a peak's score count as the same busy stretch
-const WINDOW_S       = 2;
+const WINDOW_S       = 1;    // 0.5 s was cheaper but noisier; 2 s needs decoding up to it
 const KEEP_PEAKS     = 5;
 const MIN_DURATION_S = 30;   // shorter videos just get random cuts
 const RUN_BUDGET_S   = 120;  // well under Cloud Scheduler's default 180 s attempt deadline
@@ -94,6 +100,8 @@ function measure(id, t, token, hasAudio) {
     const graph = hasAudio ? `${video};[0:a:0]volumedetect[a]` : video;
     const ff = spawn(FFMPEG, [
       '-hide_banner', '-nostats', '-loglevel', 'info',
+      ...pieceArgs(),
+      '-noaccurate_seek', // start at the keyframe before t rather than decoding up to t
       '-ss', t.toFixed(2), '-t', String(WINDOW_S),
       '-i', sourceUrl(id, 'analyze'),
       '-filter_complex', graph,
@@ -191,24 +199,27 @@ export async function analyzeVideo(id, durationMs, token, stopAt = Infinity) {
   scoreSamples(samples);
 
   // Best first, spaced apart so the peaks aren't all one scene. Each peak
-  // is [time, score, length]: length is how long the busy stretch around
-  // it lasts, judged from neighbouring samples that score nearly as high -
-  // coarse (samples are tens of seconds apart), but enough to tell a
-  // short burst from a sustained scene for variable clip lengths.
+  // is [time, score, length, from]: length is how long the busy stretch
+  // around it lasts, judged from neighbouring samples that score nearly as
+  // high - coarse (samples are tens of seconds apart), but enough to tell a
+  // short burst from a sustained scene for variable clip lengths - and
+  // `from` is where that stretch starts, so clips can open at the start of
+  // the action rather than wherever the strongest sample landed in it.
   const byTime = [...samples].sort((a, b) => a.t - b.t);
   const extentOf = s => {
     let i = byTime.indexOf(s);
     let j = i;
     while (i > 0 && byTime[i - 1].score >= s.score - EXTENT_DROP) i--;
     while (j < byTime.length - 1 && byTime[j + 1].score >= s.score - EXTENT_DROP) j++;
-    return byTime[j].t + WINDOW_S - byTime[i].t;
+    return { length: byTime[j].t + WINDOW_S - byTime[i].t, from: byTime[i].t };
   };
   const gap = Math.max(15, d / 30);
   const peaks = [];
   for (const s of [...samples].sort((a, b) => b.score - a.score)) {
     if (peaks.length >= KEEP_PEAKS) break;
     if (peaks.every(p => Math.abs(p[0] - s.t) >= gap)) {
-      peaks.push([Math.round(s.t * 10) / 10, Math.round(s.score * 1000) / 1000, Math.round(extentOf(s))]);
+      const { length, from } = extentOf(s);
+      peaks.push([Math.round(s.t * 10) / 10, Math.round(s.score * 1000) / 1000, Math.round(length), Math.round(from * 10) / 10]);
     }
   }
   return { v: VERSION, d: Math.round(d), peaks };
