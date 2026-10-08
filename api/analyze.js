@@ -4,6 +4,7 @@ import { isAuthorized } from './_lib/auth.js';
 import { FFMPEG, TRANSIENT_RE, probeInfo } from './_lib/media.js';
 import { sourceUrl, driveBytesRead, lastDriveRefusal } from './_lib/driveSource.js';
 import { listLibrary } from './_lib/library.js';
+import { libraryStats } from './_lib/libraryStats.js';
 
 // Highlight analysis for smart compilations. Each video is sampled about
 // once a minute (MIN_SAMPLES..MAX_SAMPLES points); at each, WINDOW_S
@@ -314,6 +315,18 @@ async function runBatch() {
   };
 }
 
+// Library lengths/resolutions/bitrates to the log, at most hourly, when the
+// app checks progress (see _lib/libraryStats.js). Doesn't delay the reply.
+let statsLoggedAt = 0;
+function logLibraryStats() {
+  if (Date.now() - statsLoggedAt < 3600e3) return;
+  statsLoggedAt = Date.now();
+  getServiceAccountToken()
+    .then(listLibrary)
+    .then(videos => console.log(libraryStats(videos)))
+    .catch(err => { statsLoggedAt = 0; console.log(`library stats failed: ${err.message}`); });
+}
+
 export default async function handler(req) {
   const origin = req.headers.get('origin');
   if (origin && origin !== ALLOWED_ORIGIN) return new Response('forbidden', { status: 403 });
@@ -333,6 +346,7 @@ export default async function handler(req) {
       if (entry.failed) failed++;
       else if (entry.v === VERSION) analyzed++;
     }
+    logLibraryStats();
     return json({ analyzed, failed });
   }
   if (req.method !== 'POST') return json({ error: 'method not allowed' }, 405);
