@@ -79,7 +79,9 @@ const PEAK_CHOICES = 3;
 const PEAK_LEAD_S = 3; // start a little before the measured moment
 const PEAK_SCORE_SPREAD = 0.25;
 
-// -> { start, extent } for one of the video's best moments, or null.
+// -> { t, from, extent } for one of the video's best moments, or null:
+// the peak's time, where its busy stretch starts (newer analyses only) and
+// how long the stretch lasts.
 function highlightPick(raw) {
   try {
     // Best first; only moments close to the video's best are candidates, so
@@ -87,11 +89,21 @@ function highlightPick(raw) {
     const all = JSON.parse(raw).peaks || [];
     if (!all.length) return null;
     const peaks = all.filter(p => p[1] >= all[0][1] - PEAK_SCORE_SPREAD).slice(0, PEAK_CHOICES);
-    const [t, , extent] = peaks[Math.floor(Math.random() * peaks.length)];
-    return { start: Math.max(0, t - PEAK_LEAD_S), extent: extent || 0 };
+    const [t, , extent, from] = peaks[Math.floor(Math.random() * peaks.length)];
+    return { t, from, extent: extent || 0 };
   } catch (err) {
     return null;
   }
+}
+
+// Where a highlight clip of `len` seconds starts: at the start of the busy
+// stretch (a second early), so a sustained scene opens at its beginning -
+// but never so early that the peak falls outside the clip (a long stretch
+// with a short fixed length). Older analyses without `from` lead the peak
+// by PEAK_LEAD_S.
+function highlightStart(pick, len) {
+  if (pick.from === undefined) return Math.max(0, pick.t - PEAK_LEAD_S);
+  return Math.max(0, pick.from - 1, pick.t - (len - 2));
 }
 
 function clipLength(lenChoice, pick) {
@@ -179,7 +191,7 @@ async function createSession(req) {
     fps:   smooth ? await pickFps(fpsChoice, height, picked) : null,
     clips: timeline(picked.map((c, i) => {
       const l = clipLength(lenChoice, starts[i]);
-      const s = starts[i] ? starts[i].start : pickStart(c.d, l);
+      const s = starts[i] ? highlightStart(starts[i], l) : pickStart(c.d, l);
       return { id: c.id, s: Math.round(s * 10) / 10, l };
     })),
   };

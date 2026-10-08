@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { sourceUrl } from './driveSource.js';
+import { sourceUrl, pieceArgs } from './driveSource.js';
 
 // Shared by compilations (api/compile.js) and highlight analysis
 // (api/analyze.js). ffmpeg reads Drive files through driveSource.js so the
@@ -26,7 +26,7 @@ function probeError(stderr) {
 export function probeInfo(id, token, purpose = 'compile') {
   if (probeCache.has(id)) return Promise.resolve(probeCache.get(id));
   return new Promise((resolve, reject) => {
-    const ff = spawn(FFMPEG, ['-hide_banner', '-i', sourceUrl(id, purpose)],
+    const ff = spawn(FFMPEG, ['-hide_banner', ...(purpose === 'analyze' ? pieceArgs() : []), '-i', sourceUrl(id, purpose)],
       { stdio: ['ignore', 'ignore', 'pipe'] });
     let stderr = '';
     ff.stderr.on('data', d => { if (stderr.length < 20000) stderr += d; });
