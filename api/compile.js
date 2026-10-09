@@ -361,7 +361,9 @@ function cutClip(clip, len, token, signal, dumpExtra, pieces) {
       if (!settled) {
         settled = true;
         const why = stderr.split('\n').filter(l => /error|invalid/i.test(l)).slice(-3).join(' | ');
-        reject(new Error(`ffmpeg exit ${code}: ${why.slice(0, 300)}`));
+        const err = new Error(`ffmpeg exit ${code}: ${why.slice(0, 300)}`);
+        err.refused = /HTTP error 4\d\d|Server returned 4\d\d/.test(stderr);
+        reject(err);
       }
     });
     ff.on('error', err => { if (!settled) { settled = true; reject(err); } });
@@ -377,7 +379,8 @@ async function openClip(clip, len, token, signal) {
   try {
     cut = await cutClip(clip, len, token, signal, false, PIECE_UNITS > 0);
   } catch (err) {
-    if (signal?.aborted || !PIECE_UNITS) throw err;
+    // Drive refusing isn't about the format: a plain read would be refused too.
+    if (signal?.aborted || !PIECE_UNITS || err.refused) throw err;
     console.log(`compile clip ${clip.id.slice(0, 6)}… failed in pieces (${err.message.slice(0, 120)}), trying a plain read`);
     cut = await cutClip(clip, len, token, signal, false, false);
   }
