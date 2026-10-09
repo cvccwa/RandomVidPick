@@ -100,9 +100,9 @@ function mediaUrl(id) {
 // Pieces are whole PIECE_BYTES units, cached per file, so the start and
 // index every sample re-reads come from memory. Analysis gets one unit per
 // request. Compilations read long runs, so a request that carries straight
-// on from where the last one for that file ended gets more units - 2, then
-// PIECE_GROWTH times as many as the last - up to maxUnits (more when Drive
-// is slow to answer): a jump (the header, the index, the seek to the clip) costs one
+// on from where the last one for that file ended gets PIECE_GROWTH times as
+// many units as the last, up to maxUnits (more when Drive is slow to
+// answer): a jump (the header, the index, the seek to the clip) costs one
 // small unit, a straight run soon moves in big pieces with few requests.
 // Measured offline: ~16x less read per analysed video and ~3x less per
 // compilation clip than plain pass-through.
@@ -268,13 +268,9 @@ async function servePiece(req, res, id, purpose, maxUnits, signal, budget) {
   const cap = maxUnits > 1
     ? Math.min(MAX_RUN_UNITS, Math.max(maxUnits, Math.ceil(driveWaitS * PIECE_BYTES_PER_S / PIECE_BYTES)))
     : maxUnits;
-  // 1 unit after a jump, then 2, then x PIECE_GROWTH: ffmpeg's first read
-  // past a jump is often just the rest of one frame (opening a file it
-  // looks at the first frame, a few KB past the first unit), and a real
-  // run still reaches big pieces by its third request.
   const carriesOn = last && last.next === start;
   const from = carriesOn ? last.from : start;
-  let count = !carriesOn ? 1 : last.count === 1 ? Math.min(2, cap) : Math.min(last.count * PIECE_GROWTH, cap);
+  let count = carriesOn ? Math.min(last.count * PIECE_GROWTH, cap) : 1;
   // Aligned, so repeated reads of the same region hit the cache.
   const first = Math.floor(start / PIECE_BYTES);
   const pieceStart = first * PIECE_BYTES;
@@ -391,6 +387,13 @@ export function sourceUrl(id, purpose, { pieces = purpose === 'analyze' ? 1 : 0,
 // response ends - straight away, and only once, so the end of the file or a
 // refusal ends the read instead of retrying for minutes - and inspect only
 // the container's index, not megabytes of the file, before seeking.
-export function pieceArgs() {
-  return ['-reconnect', '1', '-reconnect_at_eof', '1', '-reconnect_delay_max', '0', '-probesize', '32768', '-analyzeduration', '0'];
+//
+// With `noProbe`, ffmpeg also skips reading the first frames to fill in
+// stream details: the container's index has what decoding and stream copy
+// need, and that read costs an extra piece of a video's first keyframe (a
+// megabyte or more at 4K). Not for reading a file's details (probeInfo):
+// the frame rate comes from that read.
+export function pieceArgs({ noProbe = false } = {}) {
+  return ['-reconnect', '1', '-reconnect_at_eof', '1', '-reconnect_delay_max', '0', '-probesize', '32768', '-analyzeduration', '0',
+    ...(noProbe ? ['-nofind_stream_info'] : [])];
 }

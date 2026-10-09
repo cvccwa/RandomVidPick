@@ -327,7 +327,7 @@ function cutClip(clip, len, token, signal, dumpExtra, pieces) {
   return new Promise((resolve, reject) => {
     const ff = spawn(FFMPEG, [
       '-hide_banner', '-nostats', '-loglevel', 'info',
-      ...(pieces ? pieceArgs() : []),
+      ...(pieces ? pieceArgs({ noProbe: true }) : []),
       '-ss', String(clip.s),
       // Stream copy starts at the keyframe before the cut: allow for it.
       '-i', sourceUrl(clip.id, 'compile', { pieces: pieces ? PIECE_UNITS : 0, secs: len + 3, dur: clip.dur }),
@@ -465,7 +465,7 @@ function smoothArgs(source, n, session, token, hasAudio, keyframeAt, needS) {
   return [
     // info: the input listing shows what the file really holds (runJob).
     '-hide_banner', '-nostats', '-loglevel', 'info',
-    ...(PIECE_UNITS ? pieceArgs() : []),
+    ...(PIECE_UNITS ? pieceArgs({ noProbe: true }) : []),
     // Start at the keyframe at or before the cut point (keyframeStart) -
     // a hair after it, so rounding can't land the seek on the one before.
     '-ss', keyframeAt === null ? String(source.s) : (keyframeAt + 0.001).toFixed(3),

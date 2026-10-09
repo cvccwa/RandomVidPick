@@ -85,7 +85,7 @@ export function probeInfo(id, token, purpose = 'compile', signal, pieces = true)
 // then comes from the cache.
 export function keyframeBefore(id, t, purpose, signal, pieces = 1) {
   return new Promise(resolve => {
-    const ff = spawn(FFPROBE, ['-v', 'error', ...pieceArgs(), '-select_streams', 'v:0',
+    const ff = spawn(FFPROBE, ['-v', 'error', ...pieceArgs({ noProbe: true }), '-select_streams', 'v:0',
       '-read_intervals', `${t}%+#1`, '-show_entries', 'packet=pts_time,dts_time,flags:format=start_time',
       '-of', 'json', sourceUrl(id, purpose, { pieces })], { stdio: ['ignore', 'pipe', 'pipe'] });
     const kill = () => ff.kill('SIGKILL');
