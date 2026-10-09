@@ -1,8 +1,8 @@
 import { spawn } from 'node:child_process';
 import { getServiceAccountToken, kvCommand, b64url } from './_lib/serviceAccount.js';
 import { isAuthorized, ID_RE } from './_lib/auth.js';
-import { FFMPEG, probeInfo } from './_lib/media.js';
-import { sourceUrl } from './_lib/driveSource.js';
+import { FFMPEG, probeInfo, inputStreams } from './_lib/media.js';
+import { sourceUrl, pieceArgs, driveBytesRead } from './_lib/driveSource.js';
 
 // Compilation mode: random ~10s clips from many videos, played back to back
 // in VLC as one HLS stream.
@@ -140,13 +140,29 @@ function pickHeight(res, pool) {
 // least half of those are 50 fps or more. 4K stays at 30 under Auto - 4K60
 // is far more than the compile service can encode in real time.
 const FPS_SAMPLE = 6;
-async function pickFps(fps, height, picked) {
+async function pickFps(fps, height, picked, media) {
   if (fps !== 'auto') return Number(fps);
   if (height >= 2160) return 30;
   const token = await getServiceAccountToken();
-  const rates = (await Promise.all(picked.slice(0, FPS_SAMPLE).map(c =>
-    probeInfo(c.id, token).then(info => info.fps, () => 0)))).filter(r => r > 0);
+  const rates = (await Promise.all(picked.slice(0, FPS_SAMPLE).map((c, i) => media[i]?.fps
+    || probeInfo(c.id, token, 'compile', undefined, PIECE_UNITS > 0).then(info => info.fps, () => 0)))).filter(r => r > 0);
   return rates.length && rates.filter(r => r >= 47).length * 2 >= rates.length ? 60 : 30;
+}
+
+// What the header check (api/analyze.js) recorded for each clip's file:
+// { a: 1/0 audio, vc: video codec, fps }, or null when it hasn't checked it
+// or couldn't read it.
+const MEDIA_KEY = 'rvp:media';
+async function storedMedia(picked) {
+  const raw = await kvCommand(['HMGET', MEDIA_KEY, ...picked.map(c => c.id)]).catch(() => []);
+  return picked.map((c, i) => {
+    try {
+      const r = JSON.parse((raw || [])[i]);
+      return r.vc ? { a: r.ac ? 1 : 0, vc: r.vc, fps: r.fps || 0 } : null;
+    } catch (err) {
+      return null;
+    }
+  });
 }
 
 async function createSession(req) {
@@ -191,15 +207,19 @@ async function createSession(req) {
     (raw || []).forEach((r, i) => { if (r) starts[i] = highlightPick(r); });
   }
   const height = smooth ? pickHeight(res, picked) : null;
+  const media = smooth ? await storedMedia(picked) : [];
   const session = {
     mode:  smooth ? 'smooth' : 'original',
     height,
-    fps:   smooth ? await pickFps(fpsChoice, height, picked) : null,
+    fps:   smooth ? await pickFps(fpsChoice, height, picked, media) : null,
     ...(smooth && frame === 'native' ? { frame } : {}),
     clips: timeline(picked.map((c, i) => {
       const l = clipLength(lenChoice, starts[i]);
       const s = starts[i] ? highlightStart(starts[i], l) : pickStart(c.d, l);
-      return { id: c.id, s: Math.round(s * 10) / 10, l };
+      // a / vc: audio and video codec from the header check, so the encode
+      // needn't read the header first to find out (see runJob).
+      const m = media[i];
+      return { id: c.id, s: Math.round(s * 10) / 10, l, ...(m ? { a: m.a, vc: m.vc } : {}) };
     })),
   };
 
@@ -393,6 +413,12 @@ function encoderFor(height, fps) {
   return ['-preset', preset, '-crf', '20', '-maxrate', `${maxrate}M`, '-bufsize', `${maxrate * 2}M`];
 }
 
+// Smooth encodes read Drive in pieces (see driveSource.js) of up to
+// PIECE_UNITS x 256 KB - more when Drive is slow to answer - so little
+// more than the clip itself is fetched: ~3x less than plain pass-through.
+// COMPILE_PIECES=0 goes back to pass-through.
+const PIECE_UNITS = process.env.COMPILE_PIECES === '0' ? 0 : 8;
+
 // source = the clip whose video is cut (a stand-in if clip n's source
 // failed); n = the timeline slot it fills, which sets length and offset.
 function smoothArgs(source, n, session, token, hasAudio) {
@@ -412,9 +438,11 @@ function smoothArgs(source, n, session, token, hasAudio) {
     + `format=yuv420p,tpad=stop_mode=clone:stop_duration=${len}[v]`;
   const audio = `[${hasAudio ? '0:a:0' : '1:a'}]aresample=48000,aformat=channel_layouts=stereo,apad[a]`;
   return [
-    '-hide_banner', '-nostats', '-loglevel', 'error',
+    // info: the input listing shows what the file really holds (runJob).
+    '-hide_banner', '-nostats', '-loglevel', 'info',
+    ...(PIECE_UNITS ? pieceArgs() : []),
     '-ss', String(source.s),
-    '-i', sourceUrl(source.id, 'compile'),
+    '-i', sourceUrl(source.id, 'compile', { pieces: PIECE_UNITS }),
     ...(hasAudio ? [] : ['-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo']),
     '-filter_complex', `${video};${audio}`,
     '-map', '[v]', '-map', '[a]',
@@ -454,6 +482,7 @@ const START_REPORT_MS = 5 * 60e3;
 let startTimes = [];
 let startSwaps = 0;
 let startReportTimer = null;
+let startReportBytes = 0;
 function noteStart(seconds, swapped) {
   if (swapped) startSwaps++; else startTimes.push(seconds);
   if (startReportTimer) return;
@@ -461,9 +490,12 @@ function noteStart(seconds, swapped) {
     startReportTimer = null;
     const t = startTimes.sort((a, b) => a - b);
     const at = q => t[Math.min(t.length - 1, Math.floor(q * t.length))].toFixed(1);
+    const bytes = driveBytesRead('compile');
+    const mbPerClip = (bytes - startReportBytes) / 1e6 / Math.max(1, t.length + startSwaps);
+    startReportBytes = bytes;
     console.log(`smooth start times (${START_REPORT_MS / 60e3} min): ${t.length} clips`
       + (t.length ? `, median ${at(0.5)} s, 90% ${at(0.9)} s, max ${t[t.length - 1].toFixed(1)} s` : '')
-      + `, ${startSwaps} swapped for being slow`);
+      + `, ${startSwaps} swapped for being slow, Drive ${mbPerClip.toFixed(1)} MB per clip${PIECE_UNITS ? '' : ' (pieces off)'}`);
     startTimes = [];
     startSwaps = 0;
   }, START_REPORT_MS);
@@ -533,7 +565,7 @@ async function runJob(job, session, n, emit) {
     if (job.cancelled) break;
     const clip = session.clips[i];
     const label = `${clip.id.slice(0, 6)}… at ${clip.s} s`;
-    // One attempt = probe + encode of this source. If it hasn't produced
+    // One attempt = (probe +) encode of this source. If it hasn't produced
     // real output in time (see FIRST_OUTPUT_S) it is dropped for another.
     const attempt = new AbortController();
     job.kill = () => attempt.abort();
@@ -551,43 +583,32 @@ async function runJob(job, session, n, emit) {
       attempt.abort();
     }, 250);
     try {
-      const { hasAudio, videoCodec } = await probeInfo(clip.id, token, 'compile', attempt.signal);
-      if (job.cancelled) break;
-      if (SLOW_CODECS.has(videoCodec)) {
-        console.log(`compile smooth clip ${i} skipped: ${videoCodec} is too slow to decode live (${label})`);
-        continue;
-      }
-      const ok = await new Promise(resolve => {
-        const ff = spawn(FFMPEG, smoothArgs(clip, n, session, token, hasAudio),
-          { stdio: ['ignore', 'pipe', 'pipe'] });
-        const kill = () => ff.kill('SIGKILL');
-        attempt.signal.addEventListener('abort', kill, { once: true });
-        if (attempt.signal.aborted) kill();
-        let stderr = '';
-        let size = 0;
-        const pending = [];
-        const release = () => {
+      // Audio and codec as the header check recorded them, else read the
+      // header now. A file replaced since its check may differ: the encode
+      // checks its own input listing, and on a mismatch starts over once
+      // with what it found (the header is cached by then, so that costs
+      // almost nothing).
+      let info = clip.vc ? { hasAudio: clip.a === 1, videoCodec: clip.vc }
+        : await probeInfo(clip.id, token, 'compile', attempt.signal, PIECE_UNITS > 0);
+      for (let tries = 0; tries < 2 && !job.cancelled && !attempt.signal.aborted; tries++) {
+        if (SLOW_CODECS.has(info.videoCodec)) {
+          console.log(`compile smooth clip ${i} skipped: ${info.videoCodec} is too slow to decode live (${label})`);
+          break;
+        }
+        const result = await encodeClip(job, clip, n, session, token, info, attempt.signal, emit, () => {
           released = true;
           noteStart((Date.now() - started) / 1000, false);
-        };
-        ff.stderr.on('data', d => { if (stderr.length < 4000) stderr += d; });
-        ff.stdout.on('data', c => {
-          size += c.length;
-          // Hold output back until it's clearly a real encode, so a failed
-          // source can still be swapped without the viewer seeing it.
-          if (released) { job.chunks.push(c); emit(); return; }
-          pending.push(c);
-          if (size >= MIN_SEGMENT_B) { release(); job.chunks.push(...pending); emit(); }
         });
-        ff.on('error', () => resolve(false));
-        ff.on('close', code => {
-          attempt.signal.removeEventListener('abort', kill);
-          if (!released && code === 0 && size > 0) { release(); job.chunks.push(...pending); }
-          if (!released && !attempt.signal.aborted) console.log(`compile smooth clip ${i} failed: exit ${code} ${stderr.trim().slice(0, 200)}`);
-          resolve(released);
-        });
-      });
-      if (ok) { job.done = true; emit(); return; }
+        if (result.ok) { job.done = true; emit(); return; }
+        const found = result.found;
+        if (!found || (found.hasAudio === info.hasAudio && !SLOW_CODECS.has(found.videoCodec))) {
+          if (!attempt.signal.aborted) console.log(`compile smooth clip ${i} failed: exit ${result.code} ${result.why} (${label})`);
+          break;
+        }
+        console.log(`compile smooth clip ${i}: file has ${found.videoCodec}${found.hasAudio ? '' : ', no audio'}, `
+          + `not ${info.videoCodec}${info.hasAudio ? '' : ', no audio'} as recorded (${label})`);
+        info = found;
+      }
     } catch (err) {
       if (!attempt.signal.aborted) console.log(`compile smooth clip ${i} failed: ${err.message}`);
     } finally {
@@ -597,6 +618,58 @@ async function runJob(job, session, n, emit) {
   job.failed = true;
   job.done = true;
   emit();
+}
+
+// One ffmpeg encode of `clip` into job.chunks, assuming `info` (audio,
+// codec). Resolves { ok: true } once it has finished with real output,
+// else { ok: false, found, code, why } - found = what the input listing
+// showed (null if it never got that far), why = ffmpeg's error lines.
+function encodeClip(job, clip, n, session, token, info, signal, emit, onRelease) {
+  return new Promise(resolve => {
+    const ff = spawn(FFMPEG, smoothArgs(clip, n, session, token, info.hasAudio),
+      { stdio: ['ignore', 'pipe', 'pipe'] });
+    const kill = () => ff.kill('SIGKILL');
+    signal.addEventListener('abort', kill, { once: true });
+    if (signal.aborted) kill();
+    let stderr = '';
+    let found = null;
+    let size = 0;
+    let released = false;
+    const pending = [];
+    const release = () => {
+      released = true;
+      onRelease();
+      job.chunks.push(...pending);
+      emit();
+    };
+    ff.stderr.on('data', d => {
+      if (stderr.length < 64000) stderr += d;
+      if (found) return;
+      found = inputStreams(stderr);
+      // A stream it should use is missing, it has audio being replaced by
+      // silence, or a codec too slow to keep up: stop now.
+      if (found && (found.hasAudio !== info.hasAudio || SLOW_CODECS.has(found.videoCodec))) kill();
+      else if (found && size >= MIN_SEGMENT_B && !released) release();
+    });
+    ff.stdout.on('data', c => {
+      size += c.length;
+      // Hold output back until it's clearly a real encode of the right
+      // file, so a failed source can still be swapped without the viewer
+      // seeing it.
+      if (released) { job.chunks.push(c); emit(); return; }
+      pending.push(c);
+      if (size >= MIN_SEGMENT_B && found) release();
+    });
+    ff.on('error', err => resolve({ ok: false, found: null, code: -1, why: err.message }));
+    ff.on('close', code => {
+      signal.removeEventListener('abort', kill);
+      found ||= inputStreams(stderr);
+      const mismatch = found && (found.hasAudio !== info.hasAudio || SLOW_CODECS.has(found.videoCodec));
+      if (!released && code === 0 && size > 0 && !mismatch) release();
+      const why = stderr.split('\n').filter(l => /error|invalid|failed|no such|matches no/i.test(l)).slice(-3).join(' | ');
+      resolve({ ok: released, found, code, why: why.slice(0, 300) });
+    });
+  });
 }
 
 // Keep only jobs near where this viewer is now; a seek abandons the rest.

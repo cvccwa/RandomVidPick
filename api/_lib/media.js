@@ -30,12 +30,12 @@ function probeError(stderr) {
 
 // A file's audio presence, frame rate, duration (seconds), codecs and
 // picture size as players show it, from ffmpeg's stream listing - reads
-// only the container header. width/height are 0 when the header doesn't
-// say.
-export function probeInfo(id, token, purpose = 'compile', signal) {
+// only the container header, in small pieces unless `pieces` is false.
+// width/height are 0 when the header doesn't say.
+export function probeInfo(id, token, purpose = 'compile', signal, pieces = true) {
   if (probeCache.has(id)) return Promise.resolve(probeCache.get(id));
   return new Promise((resolve, reject) => {
-    const ff = spawn(FFMPEG, ['-hide_banner', ...(purpose === 'analyze' ? pieceArgs() : []), '-i', sourceUrl(id, purpose)],
+    const ff = spawn(FFMPEG, ['-hide_banner', ...(pieces ? pieceArgs() : []), '-i', sourceUrl(id, purpose, { pieces: pieces ? 1 : 0 })],
       { stdio: ['ignore', 'ignore', 'pipe'] });
     const kill = () => ff.kill('SIGKILL');
     signal?.addEventListener('abort', kill, { once: true });
@@ -74,6 +74,20 @@ export function probeInfo(id, token, purpose = 'compile', signal) {
       resolve(info);
     });
   });
+}
+
+// Audio presence and video codec from the input listing ffmpeg prints
+// (log level info) before it starts - what an encode actually found in the
+// file. null until the listing is complete.
+export function inputStreams(stderr) {
+  const end = stderr.search(/Stream mapping:|Output #0|matches no streams/);
+  if (end === -1) return null;
+  const listing = stderr.slice(0, end);
+  const videoLine = (listing.match(/Stream #0:\d+[^:]*: Video:.*/g) || []).find(l => !/attached pic/.test(l));
+  return {
+    hasAudio: /Stream #0:\d+[^:]*: Audio:/.test(listing),
+    videoCodec: videoLine ? (/Video: (\w+)/.exec(videoLine) || [])[1] || '' : '',
+  };
 }
 
 // The stream line gives the stored size, which is what resolution (quality)
