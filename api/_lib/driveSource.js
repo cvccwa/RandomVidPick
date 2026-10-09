@@ -243,13 +243,16 @@ export async function readDriveBytes(id, start, length, purpose = 'analyze', sig
 // Where the last piece for each file ended, how many units it had and
 // where its straight run began, so a request that carries straight on can
 // get a bigger one.
-const runs = new Map(); // `${purpose}:${id}` -> { next, count, from }
+const runs = new Map(); // `${purpose}:${id}` -> { next, count, from, over }
 
 // A clip needs about `secs` of the file from where its run starts. At the
 // file's average rate (size / duration) that's a byte budget; pieces
 // don't reach past it, so the last one doesn't fetch megabytes after the
-// clip ends - past the budget (a busier stretch than average) the run
-// carries on in pieces of BUDGET_OVER_UNITS.
+// clip ends. Past the budget (a busier stretch than average) the run
+// carries on with pieces that start at BUDGET_OVER_UNITS and double each
+// time, so a clip that needs much more than estimated still gets big
+// reads after a few requests, and one that needs a little more wastes
+// little.
 const BUDGET_SLACK = 1.05;
 const BUDGET_EXTRA_BYTES = 256 * 1024;
 const BUDGET_OVER_UNITS = 2;
@@ -275,9 +278,11 @@ async function servePiece(req, res, id, purpose, maxUnits, signal, budget) {
   const first = Math.floor(start / PIECE_BYTES);
   const pieceStart = first * PIECE_BYTES;
   const budgetEnd = runBudgetEnd(id, from, budget);
+  let over = 0; // units in this piece if it's past the budget
   if (budgetEnd < Infinity) {
     const allowed = Math.ceil((budgetEnd - pieceStart) / PIECE_BYTES);
-    count = Math.min(count, allowed >= 1 ? allowed : BUDGET_OVER_UNITS);
+    if (allowed >= 1) count = Math.min(count, allowed);
+    else count = over = Math.min(carriesOn && last.over ? last.over * 2 : BUDGET_OVER_UNITS, cap);
   }
   const p = await fetchPiece(id, first, count, signal, purpose);
   if (!p.ok) {
@@ -290,7 +295,7 @@ async function servePiece(req, res, id, purpose, maxUnits, signal, budget) {
   }
   const end = Math.min(m[2] ? Number(m[2]) : p.size - 1, pieceStart + p.buf.length - 1);
   runs.delete(runKey);
-  runs.set(runKey, { next: end + 1, count, from });
+  runs.set(runKey, { next: end + 1, count, from, over });
   if (runs.size > 200) runs.delete(runs.keys().next().value);
   res.writeHead(206, {
     'Content-Type':   p.type,
