@@ -6,6 +6,7 @@ import { sourceUrl, pieceArgs, readDriveBytes } from './driveSource.js';
 // bytes are counted and Drive's refusal reasons logged.
 export const DRIVE_API = process.env.DRIVE_API_BASE || 'https://www.googleapis.com';
 export const FFMPEG    = process.env.FFMPEG_PATH || 'ffmpeg';
+export const FFPROBE   = process.env.FFPROBE_PATH || 'ffprobe';
 
 const probeCache = new Map(); // file id -> { hasAudio, fps, duration }
 
@@ -72,6 +73,41 @@ export function probeInfo(id, token, purpose = 'compile', signal, pieces = true)
       if (probeCache.size > 500) probeCache.delete(probeCache.keys().next().value);
       probeCache.set(id, info);
       resolve(info);
+    });
+  });
+}
+
+// Where a seek to `t` seconds lands: { at } = the time of the keyframe at
+// or before it (on the same scale as ffmpeg's -ss), null if it can't tell;
+// refused = Drive refused the read. Reads
+// the container's index and the keyframe itself, in pieces of up to
+// `pieces` units - what an encode starting there reads first anyway, so it
+// then comes from the cache.
+export function keyframeBefore(id, t, purpose, signal, pieces = 1) {
+  return new Promise(resolve => {
+    const ff = spawn(FFPROBE, ['-v', 'error', ...pieceArgs(), '-select_streams', 'v:0',
+      '-read_intervals', `${t}%+#1`, '-show_entries', 'packet=pts_time,dts_time,flags:format=start_time',
+      '-of', 'json', sourceUrl(id, purpose, { pieces })], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const kill = () => ff.kill('SIGKILL');
+    signal?.addEventListener('abort', kill, { once: true });
+    let out = '';
+    let err = '';
+    ff.stdout.on('data', d => { if (out.length < 20000) out += d; });
+    ff.stderr.on('data', d => { if (err.length < 4000) err += d; });
+    ff.on('error', () => resolve({ at: null, refused: false }));
+    ff.on('close', () => {
+      signal?.removeEventListener('abort', kill);
+      const refused = /HTTP error 4\d\d|Server returned 4\d\d/.test(err);
+      try {
+        const j = JSON.parse(out);
+        const p = (j.packets || [])[0];
+        const at = Number(p?.pts_time ?? p?.dts_time);
+        if (!p || !/K/.test(p.flags || '') || !Number.isFinite(at)) return resolve({ at: null, refused });
+        // ffmpeg's -ss counts from the file's start time; packet times don't.
+        resolve({ at: at - (Number(j.format?.start_time) || 0), refused });
+      } catch (e) {
+        resolve({ at: null, refused });
+      }
     });
   });
 }
