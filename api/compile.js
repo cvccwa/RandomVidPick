@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { getServiceAccountToken, kvCommand, b64url } from './_lib/serviceAccount.js';
 import { isAuthorized, ID_RE } from './_lib/auth.js';
-import { FFMPEG, probeInfo, inputStreams } from './_lib/media.js';
+import { FFMPEG, probeInfo, inputStreams, keyframeBefore } from './_lib/media.js';
 import { sourceUrl, pieceArgs, driveBytesRead } from './_lib/driveSource.js';
 
 // Compilation mode: random ~10s clips from many videos, played back to back
@@ -27,10 +27,15 @@ import { sourceUrl, pieceArgs, driveBytesRead } from './_lib/driveSource.js';
 // to the playlist and segments (VLC can't send headers); it lives in KV for
 // SESSION_TTL_S. Only a clip's worth of each source file is ever fetched.
 //
-// Clip length (len): a fixed 5/10/15/20 s, or 'auto' - with highlights,
-// each clip lasts about as long as the busy stretch it was cut from
-// (AUTO_MIN_S..AUTO_MAX_S); without, CLIP_S. Each clip stores its length
-// (l) and its start on the compilation timeline (o).
+// Clip length (len) goes with the pick: highlights are always 'auto' - each
+// clip lasts about as long as the busy stretch it was cut from
+// (AUTO_MIN_S..AUTO_MAX_S), CLIP_S for videos not analysed yet - and random
+// picks a fixed 5/10/15/20 s. Each clip stores its length (l) and its start
+// on the compilation timeline (o).
+//
+// Smooth clips start on the keyframe at or before their cut point (see
+// keyframeStart), so nothing before the clip is downloaded just to be
+// decoded and thrown away.
 
 const ALLOWED_ORIGIN = 'https://cvccwa.github.io';
 const CLIP_S         = 10;   // default clip length
@@ -200,7 +205,8 @@ async function createSession(req) {
   }
   const picked = pool.slice(0, MAX_CLIPS);
   const pick = body.pick === 'highlights' ? 'highlights' : 'random';
-  const lenChoice = LEN_OPTIONS.has(String(body.len)) ? String(body.len) : 'auto';
+  const lenChoice = pick === 'highlights' ? 'auto'
+    : LEN_OPTIONS.has(String(body.len)) && String(body.len) !== 'auto' ? String(body.len) : String(CLIP_S);
   const starts = picked.map(() => null);
   if (pick === 'highlights') {
     const raw = await kvCommand(['HMGET', PEAKS_KEY, ...picked.map(c => c.id)]).catch(() => []);
@@ -218,8 +224,9 @@ async function createSession(req) {
       const s = starts[i] ? highlightStart(starts[i], l) : pickStart(c.d, l);
       // a / vc: audio and video codec from the header check, so the encode
       // needn't read the header first to find out (see runJob).
+      // h: cut around an analysed highlight (keyframeStart keeps its peak in).
       const m = media[i];
-      return { id: c.id, s: Math.round(s * 10) / 10, l, ...(m ? { a: m.a, vc: m.vc } : {}) };
+      return { id: c.id, s: Math.round(s * 10) / 10, l, ...(starts[i] ? { h: 1 } : {}), ...(m ? { a: m.a, vc: m.vc } : {}) };
     })),
   };
 
@@ -421,7 +428,7 @@ const PIECE_UNITS = process.env.COMPILE_PIECES === '0' ? 0 : 8;
 
 // source = the clip whose video is cut (a stand-in if clip n's source
 // failed); n = the timeline slot it fills, which sets length and offset.
-function smoothArgs(source, n, session, token, hasAudio) {
+function smoothArgs(source, n, session, token, hasAudio, keyframeAt) {
   const { height } = session;
   const len = lenOf(session, n);
   const fps = session.fps || 30;
@@ -434,14 +441,17 @@ function smoothArgs(source, n, session, token, hasAudio) {
     ? `scale=w='if(gte(iw\\,ih)\\,-2\\,${height})':h='if(gte(iw\\,ih)\\,${height}\\,-2)',`
     : `scale=${width}:${height}:force_original_aspect_ratio=decrease,`
       + `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black,`;
-  const video = `[0:v:0]${shape}setsar=1,fps=${fps},`
+  // fps starting at 0 fills the first frame slot if the cut skipped it.
+  const video = `[0:v:0]${shape}setsar=1,fps=${fps}:start_time=0,`
     + `format=yuv420p,tpad=stop_mode=clone:stop_duration=${len}[v]`;
   const audio = `[${hasAudio ? '0:a:0' : '1:a'}]aresample=48000,aformat=channel_layouts=stereo,apad[a]`;
   return [
     // info: the input listing shows what the file really holds (runJob).
     '-hide_banner', '-nostats', '-loglevel', 'info',
     ...(PIECE_UNITS ? pieceArgs() : []),
-    '-ss', String(source.s),
+    // Start at the keyframe at or before the cut point (keyframeStart) -
+    // a hair after it, so rounding can't land the seek on the one before.
+    '-ss', keyframeAt === null ? String(source.s) : (keyframeAt + 0.001).toFixed(3),
     '-i', sourceUrl(source.id, 'compile', { pieces: PIECE_UNITS }),
     ...(hasAudio ? [] : ['-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo']),
     '-filter_complex', `${video};${audio}`,
@@ -483,8 +493,11 @@ let startTimes = [];
 let startSwaps = 0;
 let startReportTimer = null;
 let startReportBytes = 0;
-function noteStart(seconds, swapped) {
+let snapMoves = [];   // seconds each keyframe-started clip moved earlier
+let snapSkipped = 0;  // cut exactly: keyframe too far back, or unknown
+function noteStart(seconds, swapped, start) {
   if (swapped) startSwaps++; else startTimes.push(seconds);
+  if (start?.snap) snapMoves.push(start.by); else if (start) snapSkipped++;
   if (startReportTimer) return;
   startReportTimer = setTimeout(() => {
     startReportTimer = null;
@@ -496,8 +509,16 @@ function noteStart(seconds, swapped) {
     console.log(`smooth start times (${START_REPORT_MS / 60e3} min): ${t.length} clips`
       + (t.length ? `, median ${at(0.5)} s, 90% ${at(0.9)} s, max ${t[t.length - 1].toFixed(1)} s` : '')
       + `, ${startSwaps} swapped for being slow, Drive ${mbPerClip.toFixed(1)} MB per clip${PIECE_UNITS ? '' : ' (pieces off)'}`);
+    const m = snapMoves.sort((a, b) => a - b);
+    if (m.length || snapSkipped) {
+      console.log(`keyframe starts (${START_REPORT_MS / 60e3} min): ${m.length} clips moved earlier`
+        + (m.length ? ` (median ${m[Math.floor(m.length / 2)].toFixed(1)} s, max ${m[m.length - 1].toFixed(1)} s)` : '')
+        + `, ${snapSkipped} cut exactly`);
+    }
     startTimes = [];
     startSwaps = 0;
+    snapMoves = [];
+    snapSkipped = 0;
   }, START_REPORT_MS);
   startReportTimer.unref?.();
 }
@@ -557,6 +578,25 @@ function startJob(sid, session, n, urgent) {
   return job;
 }
 
+// Cutting at an exact spot means downloading and decoding everything from
+// the keyframe before it - up to several seconds of video, thrown away. A
+// clip starts at that keyframe instead when it's close enough: a random cut
+// can move up to MAX_RANDOM_SNAP_S earlier (the spot is arbitrary anyway); a
+// highlight up to MAX_HIGHLIGHT_SNAP_S, which its clip has slack for, so
+// the peak and the stretch after it stay in. Further than that (videos with
+// rare keyframes) the clip is cut exactly, as before.
+const MAX_RANDOM_SNAP_S    = 10;
+const MAX_HIGHLIGHT_SNAP_S = 3;
+async function keyframeStart(clip, signal) {
+  if (!clip.s) return { snap: false, by: 0, at: null };
+  const { at, refused } = await keyframeBefore(clip.id, clip.s, 'compile', signal, PIECE_UNITS || 8);
+  if (refused) return { refused };
+  if (at === null || at > clip.s) return { snap: false, by: null, at: null };
+  const by = clip.s - at;
+  const snap = by <= (clip.h ? MAX_HIGHLIGHT_SNAP_S : MAX_RANDOM_SNAP_S);
+  return { snap, by, at: snap ? at : null };
+}
+
 async function runJob(job, session, n, emit) {
   const token = await getServiceAccountToken();
   const limitS = FIRST_OUTPUT_S[session.height] || FIRST_OUTPUT_S[1080];
@@ -590,14 +630,19 @@ async function runJob(job, session, n, emit) {
       // almost nothing).
       let info = clip.vc ? { hasAudio: clip.a === 1, videoCodec: clip.vc }
         : await probeInfo(clip.id, token, 'compile', attempt.signal, PIECE_UNITS > 0);
+      const start = SLOW_CODECS.has(info.videoCodec) ? { snap: false, by: null, at: null } : await keyframeStart(clip, attempt.signal);
+      if (start.refused) {
+        console.log(`compile smooth clip ${i} failed: Drive refused the read (${label})`);
+        continue;
+      }
       for (let tries = 0; tries < 2 && !job.cancelled && !attempt.signal.aborted; tries++) {
         if (SLOW_CODECS.has(info.videoCodec)) {
           console.log(`compile smooth clip ${i} skipped: ${info.videoCodec} is too slow to decode live (${label})`);
           break;
         }
-        const result = await encodeClip(job, clip, n, session, token, info, attempt.signal, emit, () => {
+        const result = await encodeClip(job, clip, n, session, token, info, start.at, attempt.signal, emit, () => {
           released = true;
-          noteStart((Date.now() - started) / 1000, false);
+          noteStart((Date.now() - started) / 1000, false, start);
         });
         if (result.ok) { job.done = true; emit(); return; }
         const found = result.found;
@@ -624,9 +669,9 @@ async function runJob(job, session, n, emit) {
 // codec). Resolves { ok: true } once it has finished with real output,
 // else { ok: false, found, code, why } - found = what the input listing
 // showed (null if it never got that far), why = ffmpeg's error lines.
-function encodeClip(job, clip, n, session, token, info, signal, emit, onRelease) {
+function encodeClip(job, clip, n, session, token, info, keyframeAt, signal, emit, onRelease) {
   return new Promise(resolve => {
-    const ff = spawn(FFMPEG, smoothArgs(clip, n, session, token, info.hasAudio),
+    const ff = spawn(FFMPEG, smoothArgs(clip, n, session, token, info.hasAudio, keyframeAt),
       { stdio: ['ignore', 'pipe', 'pipe'] });
     const kill = () => ff.kill('SIGKILL');
     signal.addEventListener('abort', kill, { once: true });
@@ -665,7 +710,10 @@ function encodeClip(job, clip, n, session, token, info, signal, emit, onRelease)
       signal.removeEventListener('abort', kill);
       found ||= inputStreams(stderr);
       const mismatch = found && (found.hasAudio !== info.hasAudio || SLOW_CODECS.has(found.videoCodec));
-      if (!released && code === 0 && size > 0 && !mismatch) release();
+      // Drive refusing partway through ends ffmpeg's input like the end of
+      // the file, and it exits 0 with next to nothing: not a real clip.
+      const inputRefused = /HTTP error \d{3}|Server returned \d{3}/.test(stderr);
+      if (!released && code === 0 && size > 0 && !mismatch && !inputRefused) release();
       const why = stderr.split('\n').filter(l => /error|invalid|failed|no such|matches no/i.test(l)).slice(-3).join(' | ');
       resolve({ ok: released, found, code, why: why.slice(0, 300) });
     });

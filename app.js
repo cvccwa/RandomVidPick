@@ -7,7 +7,7 @@ const VIDEO_MIME_TYPES = [
   'video/quicktime', 'video/x-msvideo', 'video/mpeg',
   'video/3gpp', 'video/x-flv', 'video/x-ms-wmv'
 ];
-const APP_VERSION = 'v47';
+const APP_VERSION = 'v48';
 const BROWSE_BATCH = 50;
 // Where api/ (stream, thumbnails, tags) is served from.
 const API_BASE = 'https://randomvidpick-139266625585.us-east1.run.app';
@@ -2255,13 +2255,16 @@ const COMPILE_FPS = [['auto', 'Auto'], ['60', '60 fps'], ['30', '30 fps']];
 // Highlights cuts around each video's loudest / most active moments
 // (analysed in the background by api/analyze.js); Random picks anywhere.
 const COMPILE_PICK = [['highlights', 'Highlights'], ['random', 'Random']];
-// Auto: with highlights, each clip lasts about as long as the action it was
-// cut from (6-20 s); otherwise 10 s.
+// Length goes with the pick: Highlights are always Auto - each clip lasts
+// about as long as the action it was cut from (6-20 s; 10 s for videos not
+// analysed yet) - and Random uses a fixed length. compilePrefs.len keeps the
+// Random length.
 const COMPILE_LEN  = [['auto', 'Auto'], ['5', '5 s'], ['10', '10 s'], ['15', '15 s'], ['20', '20 s']];
+const compileLen = () => (compilePrefs.pick === 'highlights' ? 'auto' : compilePrefs.len);
 // Smooth only. Native keeps each clip's own shape instead of fitting all of
 // them into one 16:9 frame; see FRAME_OPTIONS in api/compile.js.
 const COMPILE_FRAME = [['fit', 'Fit 16:9'], ['native', 'Native']];
-let compilePrefs = { mode: 'smooth', res: 'auto', fps: 'auto', pick: 'highlights', len: 'auto', frame: 'fit' };
+let compilePrefs = { mode: 'smooth', res: 'auto', fps: 'auto', pick: 'highlights', len: '10', frame: 'fit' };
 try {
   const saved = localStorage.getItem('rvp_compile_mode');
   if (saved && saved.startsWith('{')) {
@@ -2271,7 +2274,7 @@ try {
       res:  COMPILE_RES.some(r => r[0] === p.res) ? p.res : 'auto',
       fps:  COMPILE_FPS.some(f => f[0] === p.fps) ? p.fps : 'auto',
       pick: COMPILE_PICK.some(k => k[0] === p.pick) ? p.pick : 'highlights',
-      len:  COMPILE_LEN.some(k => k[0] === p.len) ? p.len : 'auto',
+      len:  p.len !== 'auto' && COMPILE_LEN.some(k => k[0] === p.len) ? p.len : '10',
       frame: COMPILE_FRAME.some(k => k[0] === p.frame) ? p.frame : 'fit',
     };
   } else if (saved === 'original') {
@@ -2298,6 +2301,17 @@ function openCompileMenu() {
       chipButton(label, compilePrefs[key] === value ? 'active' : '', () => {
         compilePrefs[key] = value; saveCompilePrefs(); openCompileMenu();
       }))));
+  // Highlights: only Auto. Random: only the fixed lengths.
+  const highlights = compilePrefs.pick === 'highlights';
+  const lengthRow = el('div', { className: 'sheet-section' },
+    el('div', { className: 'sheet-section-title', textContent: 'Clip length' }),
+    el('div', { className: 'sheet-chips' }, ...COMPILE_LEN.map(([value, label]) => {
+      const chip = chipButton(label, compileLen() === value ? 'active' : '', () => {
+        compilePrefs.len = value; saveCompilePrefs(); openCompileMenu();
+      });
+      chip.disabled = highlights ? value !== 'auto' : value === 'auto';
+      return chip;
+    })));
   const smooth = compilePrefs.mode === 'smooth';
   const highlightNote = el('div', { className: 'sheet-note', textContent: 'Checking highlight analysis…' });
   loadHighlightProgress().then(text => { highlightNote.textContent = text; });
@@ -2313,8 +2327,11 @@ function openCompileMenu() {
     smooth ? el('div', { className: 'sheet-note', textContent: 'Fit puts every clip in one 16:9 frame (black bars on other shapes). Native keeps each clip\'s own shape; VLC resizes to match (a brief black flash when the shape changes).' }) : null,
     choiceRow('Clip picks', COMPILE_PICK, 'pick'),
     highlightNote,
-    choiceRow('Clip length', COMPILE_LEN, 'len'),
-    el('div', { className: 'sheet-note', textContent: 'Auto follows the action: short bursts get short clips, sustained scenes up to 20 s (needs Highlights; otherwise 10 s).' }),
+    lengthRow,
+    el('div', { className: 'sheet-note', textContent: highlights
+      ? 'Highlights follow the action: short bursts get short clips, sustained scenes up to 20 s. Videos not analysed yet get 10 s.'
+      : 'Every clip is the same length. Auto needs Highlights.' }),
+    smooth ? el('div', { className: 'sheet-note', textContent: 'Clips start on the keyframe just before the chosen spot, a little early, so less is downloaded from Drive.' }) : null,
     el('div', { className: 'sheet-row sheet-actions' },
       el('button', { type: 'button', className: 'sheet-btn primary', textContent: 'Done', onclick: closeSheet })));
 }
@@ -2363,7 +2380,7 @@ browseCompileBtn.addEventListener('click', async () => {
         res:   compilePrefs.res,
         fps:   compilePrefs.fps,
         pick:  compilePrefs.pick,
-        len:   compilePrefs.len,
+        len:   compileLen(),
         frame: compilePrefs.frame,
         clips: browseFiltered.map(v => { const [w, h] = sizeOf(v); return { id: v.id, d: v.durationMs || 0, w, h }; }),
       }),
