@@ -22,21 +22,28 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 const REPORT_EVERY_MS = 5 * 60e3;
 const totals = new Map(); // purpose -> bytes since start (never reset)
-let recent = new Map();   // purpose -> { bytes, requests, refused } since last report
+let recent = new Map();   // purpose -> { bytes, requests, refused, waits } since last report
 let reportTimer = null;
 
-export function countDriveBytes(purpose, bytes, { request = false, refused = false } = {}) {
+export function countDriveBytes(purpose, bytes, { request = false, refused = false, waitS } = {}) {
   totals.set(purpose, (totals.get(purpose) || 0) + bytes);
-  const r = recent.get(purpose) || { bytes: 0, requests: 0, refused: 0 };
+  const r = recent.get(purpose) || { bytes: 0, requests: 0, refused: 0, waits: [] };
   r.bytes += bytes;
   if (request) r.requests++;
   if (refused) r.refused++;
+  if (waitS !== undefined && r.waits.length < 2000) r.waits.push(waitS);
   recent.set(purpose, r);
   if (!reportTimer) {
     reportTimer = setTimeout(() => {
       reportTimer = null;
+      // Drive's time to answer (first byte), for piece requests.
+      const waitNote = w => {
+        if (!w.length) return '';
+        const t = w.sort((a, b) => a - b);
+        return `, Drive answers in ${t[Math.floor(t.length / 2)].toFixed(2)} s (90% ${t[Math.floor(t.length * 0.9)].toFixed(2)} s)`;
+      };
       const parts = [...recent].map(([p, v]) =>
-        `${p} ${(v.bytes / 1048576).toFixed(1)} MiB / ${v.requests} req${v.refused ? ` (${v.refused} refused)` : ''}`);
+        `${p} ${(v.bytes / 1048576).toFixed(1)} MiB / ${v.requests} req${v.refused ? ` (${v.refused} refused)` : ''}${waitNote(v.waits)}`);
       console.log(`drive reads (${REPORT_EVERY_MS / 60e3} min): ${parts.join(', ')}`);
       recent = new Map();
     }, REPORT_EVERY_MS);
@@ -111,6 +118,7 @@ const MAX_RUN_UNITS = 32; // 8 MB
 const PIECE_BYTES_PER_S = 20e6;
 let driveWaitS = 0.2; // Drive's time to answer, smoothed
 const units = new Map();    // `${id}:${index}` -> { buf, size, type }, oldest first
+const fileSizes = new Map(); // id -> total bytes, from Drive's Content-Range
 const inFlight = new Map(); // `${id}:${index}` -> promise for the fetch covering it
 let pieceCacheBytes = 0;
 
@@ -142,8 +150,9 @@ async function fetchRun(id, first, count, signal, purpose) {
       headers: { Authorization: `Bearer ${token}`, Range: `bytes=${start}-${start + count * PIECE_BYTES - 1}` },
       signal,
     });
-    if (drive.ok) driveWaitS = driveWaitS * 0.8 + (Date.now() - asked) / 1000 * 0.2;
-    countDriveBytes(purpose, 0, { request: true, refused: !drive.ok });
+    const waitS = (Date.now() - asked) / 1000;
+    if (drive.ok) driveWaitS = driveWaitS * 0.8 + waitS * 0.2;
+    countDriveBytes(purpose, 0, { request: true, refused: !drive.ok, waitS: drive.ok ? waitS : undefined });
     if (drive.ok || !RETRYABLE.has(drive.status) || attempt >= RETRY_DELAYS_MS.length) break;
     drive.body?.cancel();
     await sleep(RETRY_DELAYS_MS[attempt]);
@@ -157,6 +166,8 @@ async function fetchRun(id, first, count, signal, purpose) {
   countDriveBytes(purpose, buf.length);
   const size = Number((/\/(\d+)$/.exec(drive.headers.get('content-range') || '') || [])[1]) || buf.length;
   const type = drive.headers.get('content-type') || 'application/octet-stream';
+  fileSizes.set(id, size);
+  if (fileSizes.size > 500) fileSizes.delete(fileSizes.keys().next().value);
   for (let i = 0; i * PIECE_BYTES < buf.length; i++) {
     // Copied out, so evicting a unit frees it (a slice would keep the
     // whole run's buffer alive).
@@ -229,11 +240,29 @@ export async function readDriveBytes(id, start, length, purpose = 'analyze', sig
   return { buf: Buffer.concat(parts), size };
 }
 
-// Where the last piece for each file ended and how many units it had, so a
-// request that carries straight on can get a bigger one.
-const runs = new Map(); // `${purpose}:${id}` -> { next, count }
+// Where the last piece for each file ended, how many units it had and
+// where its straight run began, so a request that carries straight on can
+// get a bigger one.
+const runs = new Map(); // `${purpose}:${id}` -> { next, count, from, over }
 
-async function servePiece(req, res, id, purpose, maxUnits, signal) {
+// A clip needs about `secs` of the file from where its run starts. At the
+// file's average rate (size / duration) that's a byte budget; pieces
+// don't reach past it, so the last one doesn't fetch megabytes after the
+// clip ends. Past the budget (a busier stretch than average) the run
+// carries on with pieces that start at BUDGET_OVER_UNITS and double each
+// time, so a clip that needs much more than estimated still gets big
+// reads after a few requests, and one that needs a little more wastes
+// little.
+const BUDGET_SLACK = 1.05;
+const BUDGET_EXTRA_BYTES = 256 * 1024;
+const BUDGET_OVER_UNITS = 2;
+function runBudgetEnd(id, from, budget) {
+  const size = fileSizes.get(id);
+  if (!budget || !size) return Infinity;
+  return from + budget.secs * (size / budget.dur) * BUDGET_SLACK + BUDGET_EXTRA_BYTES;
+}
+
+async function servePiece(req, res, id, purpose, maxUnits, signal, budget) {
   const m = /^bytes=(\d+)-(\d*)$/.exec((req.headers.range || 'bytes=0-').trim());
   if (!m) { res.writeHead(416); return res.end(); }
   const start = Number(m[1]);
@@ -242,10 +271,19 @@ async function servePiece(req, res, id, purpose, maxUnits, signal) {
   const cap = maxUnits > 1
     ? Math.min(MAX_RUN_UNITS, Math.max(maxUnits, Math.ceil(driveWaitS * PIECE_BYTES_PER_S / PIECE_BYTES)))
     : maxUnits;
-  const count = last && last.next === start ? Math.min(last.count * PIECE_GROWTH, cap) : 1;
+  const carriesOn = last && last.next === start;
+  const from = carriesOn ? last.from : start;
+  let count = carriesOn ? Math.min(last.count * PIECE_GROWTH, cap) : 1;
   // Aligned, so repeated reads of the same region hit the cache.
   const first = Math.floor(start / PIECE_BYTES);
   const pieceStart = first * PIECE_BYTES;
+  const budgetEnd = runBudgetEnd(id, from, budget);
+  let over = 0; // units in this piece if it's past the budget
+  if (budgetEnd < Infinity) {
+    const allowed = Math.ceil((budgetEnd - pieceStart) / PIECE_BYTES);
+    if (allowed >= 1) count = Math.min(count, allowed);
+    else count = over = Math.min(carriesOn && last.over ? last.over * 2 : BUDGET_OVER_UNITS, cap);
+  }
   const p = await fetchPiece(id, first, count, signal, purpose);
   if (!p.ok) {
     res.writeHead(p.status, { 'Content-Type': 'application/json' });
@@ -257,7 +295,7 @@ async function servePiece(req, res, id, purpose, maxUnits, signal) {
   }
   const end = Math.min(m[2] ? Number(m[2]) : p.size - 1, pieceStart + p.buf.length - 1);
   runs.delete(runKey);
-  runs.set(runKey, { next: end + 1, count });
+  runs.set(runKey, { next: end + 1, count, from, over });
   if (runs.size > 200) runs.delete(runs.keys().next().value);
   res.writeHead(206, {
     'Content-Type':   p.type,
@@ -275,10 +313,12 @@ async function relay(req, res) {
   const id = decodeURIComponent(url.pathname.slice(1));
   const purpose = url.searchParams.get('for') || 'other';
   const maxUnits = Number(url.searchParams.get('pieces')) || 0;
+  const secs = Number(url.searchParams.get('secs')), dur = Number(url.searchParams.get('dur'));
+  const budget = secs > 0 && dur > 0 ? { secs, dur } : null;
   const aborter = new AbortController();
   res.on('close', () => aborter.abort());
   try {
-    if (maxUnits > 0 && req.method === 'GET') return await servePiece(req, res, id, purpose, maxUnits, aborter.signal);
+    if (maxUnits > 0 && req.method === 'GET') return await servePiece(req, res, id, purpose, maxUnits, aborter.signal, budget);
     const token = await getServiceAccountToken();
     const headers = { Authorization: `Bearer ${token}` };
     if (req.headers.range) headers.Range = req.headers.range;
@@ -340,14 +380,25 @@ const PORT = await startServer();
 // The URL ffmpeg should read a Drive file from; `purpose` labels the bytes.
 // With `pieces` (max units per piece) it is read in piece mode - ffmpeg
 // must then be run with pieceArgs(). Analysis always reads in pieces.
-export function sourceUrl(id, purpose, { pieces = purpose === 'analyze' ? 1 : 0 } = {}) {
-  return `http://127.0.0.1:${PORT}/${encodeURIComponent(id)}?for=${purpose}${pieces ? `&pieces=${pieces}` : ''}`;
+// `secs` (seconds needed from where the read starts) and `dur` (the
+// file's length in seconds) set a byte budget for long runs (see
+// runBudgetEnd).
+export function sourceUrl(id, purpose, { pieces = purpose === 'analyze' ? 1 : 0, secs = 0, dur = 0 } = {}) {
+  const budget = pieces && secs > 0 && dur > 0 ? `&secs=${secs}&dur=${dur}` : '';
+  return `http://127.0.0.1:${PORT}/${encodeURIComponent(id)}?for=${purpose}${pieces ? `&pieces=${pieces}` : ''}${budget}`;
 }
 
 // ffmpeg input options for reading in pieces: reconnect when a short
 // response ends - straight away, and only once, so the end of the file or a
 // refusal ends the read instead of retrying for minutes - and inspect only
 // the container's index, not megabytes of the file, before seeking.
-export function pieceArgs() {
-  return ['-reconnect', '1', '-reconnect_at_eof', '1', '-reconnect_delay_max', '0', '-probesize', '32768', '-analyzeduration', '0'];
+//
+// With `noProbe`, ffmpeg also skips reading the first frames to fill in
+// stream details: the container's index has what decoding and stream copy
+// need, and that read costs an extra piece of a video's first keyframe (a
+// megabyte or more at 4K). Not for reading a file's details (probeInfo):
+// the frame rate comes from that read.
+export function pieceArgs({ noProbe = false } = {}) {
+  return ['-reconnect', '1', '-reconnect_at_eof', '1', '-reconnect_delay_max', '0', '-probesize', '32768', '-analyzeduration', '0',
+    ...(noProbe ? ['-nofind_stream_info'] : [])];
 }

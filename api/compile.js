@@ -155,15 +155,15 @@ async function pickFps(fps, height, picked, media) {
 }
 
 // What the header check (api/analyze.js) recorded for each clip's file:
-// { a: 1/0 audio, vc: video codec, fps }, or null when it hasn't checked it
-// or couldn't read it.
+// { a: 1/0 audio, vc: video codec, fps, d: duration ms }, or null when it
+// hasn't checked it or couldn't read it.
 const MEDIA_KEY = 'rvp:media';
 async function storedMedia(picked) {
   const raw = await kvCommand(['HMGET', MEDIA_KEY, ...picked.map(c => c.id)]).catch(() => []);
   return picked.map((c, i) => {
     try {
       const r = JSON.parse((raw || [])[i]);
-      return r.vc ? { a: r.ac ? 1 : 0, vc: r.vc, fps: r.fps || 0 } : null;
+      return r.vc ? { a: r.ac ? 1 : 0, vc: r.vc, fps: r.fps || 0, d: r.d || 0 } : null;
     } catch (err) {
       return null;
     }
@@ -225,8 +225,10 @@ async function createSession(req) {
       // a / vc: audio and video codec from the header check, so the encode
       // needn't read the header first to find out (see runJob).
       // h: cut around an analysed highlight (keyframeStart keeps its peak in).
+      // dur: the file's length in seconds, which sizes its reads (sourceUrl).
       const m = media[i];
-      return { id: c.id, s: Math.round(s * 10) / 10, l, ...(starts[i] ? { h: 1 } : {}), ...(m ? { a: m.a, vc: m.vc } : {}) };
+      const dur = Math.round((m?.d || c.d) / 1000);
+      return { id: c.id, s: Math.round(s * 10) / 10, l, ...(dur > 0 ? { dur } : {}), ...(starts[i] ? { h: 1 } : {}), ...(m ? { a: m.a, vc: m.vc } : {}) };
     })),
   };
 
@@ -319,13 +321,16 @@ const NEEDS_DX = new Set(['mpeg4']);
 // Runs ffmpeg for one clip. Resolves once ffmpeg has reported the source
 // codec and started writing, with the bytes so far, the rest of stdout and
 // the codec; rejects if it exits without output (unreadable file, cut past
-// the end, codec the TS muxer refuses).
-function cutClip(clip, len, token, signal, dumpExtra) {
+// the end, codec the TS muxer refuses). With `pieces` it reads Drive in
+// pieces, as smooth encodes do.
+function cutClip(clip, len, token, signal, dumpExtra, pieces) {
   return new Promise((resolve, reject) => {
     const ff = spawn(FFMPEG, [
       '-hide_banner', '-nostats', '-loglevel', 'info',
+      ...(pieces ? pieceArgs({ noProbe: true }) : []),
       '-ss', String(clip.s),
-      '-i', sourceUrl(clip.id, 'compile'),
+      // Stream copy starts at the keyframe before the cut: allow for it.
+      '-i', sourceUrl(clip.id, 'compile', { pieces: pieces ? PIECE_UNITS : 0, secs: len + 3, dur: clip.dur }),
       '-t', String(len),
       '-map', '0:v:0', '-map', '0:a:0?',
       '-c', 'copy',
@@ -356,19 +361,33 @@ function cutClip(clip, len, token, signal, dumpExtra) {
       if (!settled) {
         settled = true;
         const why = stderr.split('\n').filter(l => /error|invalid/i.test(l)).slice(-3).join(' | ');
-        reject(new Error(`ffmpeg exit ${code}: ${why.slice(0, 300)}`));
+        const err = new Error(`ffmpeg exit ${code}: ${why.slice(0, 300)}`);
+        err.refused = /HTTP error 4\d\d|Server returned 4\d\d/.test(stderr);
+        reject(err);
       }
     });
     ff.on('error', err => { if (!settled) { settled = true; reject(err); } });
   });
 }
 
+// Piece mode looks at only the container's index before cutting, which is
+// all MP4 / MOV / MKV / WebM need; a file whose stream details are only in
+// the data itself (some AVI, MPEG-TS) fails that way and is cut again with
+// a plain read.
 async function openClip(clip, len, token, signal) {
-  let cut = await cutClip(clip, len, token, signal, false);
+  let cut;
+  try {
+    cut = await cutClip(clip, len, token, signal, false, PIECE_UNITS > 0);
+  } catch (err) {
+    // Drive refusing isn't about the format: a plain read would be refused too.
+    if (signal?.aborted || !PIECE_UNITS || err.refused) throw err;
+    console.log(`compile clip ${clip.id.slice(0, 6)}… failed in pieces (${err.message.slice(0, 120)}), trying a plain read`);
+    cut = await cutClip(clip, len, token, signal, false, false);
+  }
   if (COPY_OK.has(cut.codec)) return cut;
   cut.kill();
   if (NEEDS_DX.has(cut.codec)) {
-    cut = await cutClip(clip, len, token, signal, true);
+    cut = await cutClip(clip, len, token, signal, true, PIECE_UNITS > 0);
     if (cut.codec !== 'unknown') return cut;
     cut.kill();
   }
@@ -428,7 +447,8 @@ const PIECE_UNITS = process.env.COMPILE_PIECES === '0' ? 0 : 8;
 
 // source = the clip whose video is cut (a stand-in if clip n's source
 // failed); n = the timeline slot it fills, which sets length and offset.
-function smoothArgs(source, n, session, token, hasAudio, keyframeAt) {
+// needS: seconds of the file the encode reads from where it starts.
+function smoothArgs(source, n, session, token, hasAudio, keyframeAt, needS) {
   const { height } = session;
   const len = lenOf(session, n);
   const fps = session.fps || 30;
@@ -448,11 +468,11 @@ function smoothArgs(source, n, session, token, hasAudio, keyframeAt) {
   return [
     // info: the input listing shows what the file really holds (runJob).
     '-hide_banner', '-nostats', '-loglevel', 'info',
-    ...(PIECE_UNITS ? pieceArgs() : []),
+    ...(PIECE_UNITS ? pieceArgs({ noProbe: true }) : []),
     // Start at the keyframe at or before the cut point (keyframeStart) -
     // a hair after it, so rounding can't land the seek on the one before.
     '-ss', keyframeAt === null ? String(source.s) : (keyframeAt + 0.001).toFixed(3),
-    '-i', sourceUrl(source.id, 'compile', { pieces: PIECE_UNITS }),
+    '-i', sourceUrl(source.id, 'compile', { pieces: PIECE_UNITS, secs: needS, dur: source.dur }),
     ...(hasAudio ? [] : ['-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo']),
     '-filter_complex', `${video};${audio}`,
     '-map', '[v]', '-map', '[a]',
@@ -640,7 +660,10 @@ async function runJob(job, session, n, emit) {
           console.log(`compile smooth clip ${i} skipped: ${info.videoCodec} is too slow to decode live (${label})`);
           break;
         }
-        const result = await encodeClip(job, clip, n, session, token, info, start.at, attempt.signal, emit, () => {
+        // From a keyframe start it reads the clip; from an exact cut, also
+        // the stretch back to the keyframe before it.
+        const needS = lenOf(session, n) + 0.5 + (start.snap ? 0 : start.by ?? 3);
+        const result = await encodeClip(job, clip, n, session, token, info, start.at, needS, attempt.signal, emit, () => {
           released = true;
           noteStart((Date.now() - started) / 1000, false, start);
         });
@@ -669,9 +692,9 @@ async function runJob(job, session, n, emit) {
 // codec). Resolves { ok: true } once it has finished with real output,
 // else { ok: false, found, code, why } - found = what the input listing
 // showed (null if it never got that far), why = ffmpeg's error lines.
-function encodeClip(job, clip, n, session, token, info, keyframeAt, signal, emit, onRelease) {
+function encodeClip(job, clip, n, session, token, info, keyframeAt, needS, signal, emit, onRelease) {
   return new Promise(resolve => {
-    const ff = spawn(FFMPEG, smoothArgs(clip, n, session, token, info.hasAudio, keyframeAt),
+    const ff = spawn(FFMPEG, smoothArgs(clip, n, session, token, info.hasAudio, keyframeAt, needS),
       { stdio: ['ignore', 'pipe', 'pipe'] });
     const kill = () => ff.kill('SIGKILL');
     signal.addEventListener('abort', kill, { once: true });
