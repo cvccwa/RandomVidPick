@@ -146,9 +146,12 @@ function pickHeight(res, pool) {
 // Smooth-mode frame rate. Drive doesn't report it, so Auto reads it from the
 // first clips that will play (container header only) and uses 60 when at
 // least half of those are 50 fps or more. 4K stays at 30 under Auto - 4K60
-// is far more than the compile service can encode in real time.
+// is far more than the compile service can encode in real time. A chosen
+// 60 drops to 30 when the header check found every clip at under 50 fps:
+// 30 fps videos encoded at 60 only repeat each frame, at twice the work.
 const FPS_SAMPLE = 6;
 async function pickFps(fps, height, picked, media) {
+  if (fps === '60' && media.length && media.every(m => m?.fps > 0 && m.fps < 47)) return 30;
   if (fps !== 'auto') return Number(fps);
   if (height >= 2160) return 30;
   const token = await getServiceAccountToken();
