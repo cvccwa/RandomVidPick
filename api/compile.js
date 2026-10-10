@@ -235,6 +235,7 @@ async function createSession(req) {
   const sid = b64url(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))));
   await kvCommand(['SET', `rvp:comp:${sid}`, JSON.stringify(session), 'EX', SESSION_TTL_S]);
   sessions.set(sid, session);
+  touchStats(statsFor(sid, session), session);
   if (session.mode === 'smooth' && session.height >= WARM_START_HEIGHT) await warmStart(sid, session);
 
   const base = new URL(req.url);
@@ -250,6 +251,53 @@ async function createSession(req) {
     highlights: starts.filter(s => s !== null).length,
     len:        lenChoice,
   });
+}
+
+// One log line per compilation, once VLC has stopped asking for segments
+// for SUMMARY_IDLE_MS: settings, clips played and encoded, Drive read
+// (total, per clip, per second of clip), how long the first clip took to
+// arrive, start times, stand-ins, slow swaps, failures, decoder errors -
+// so runs back to back don't blend the way the 5-minute summaries do.
+// Drive bytes are the service's total from the session's start to its
+// last activity (a segment served, an encode ending), so a second session
+// at the same time would be counted in both.
+const SUMMARY_IDLE_MS = 90e3;
+const sessionStats = new Map(); // sid -> stats
+function statsFor(sid, session) {
+  if (session.stats) return session.stats;
+  const st = {
+    sid, created: Date.now(), bytes0: driveBytesRead('compile'), bytesEnd: driveBytesRead('compile'), served: new Set(),
+    encoded: 0, encodedS: 0, starts: [], firstWaitS: null, standIns: 0, slow: 0, failed: 0, decodeErrors: 0, timer: null,
+  };
+  Object.defineProperty(session, 'stats', { value: st, enumerable: false });
+  sessionStats.set(sid, st);
+  return st;
+}
+function touchStats(st, session) {
+  st.bytesEnd = driveBytesRead('compile');
+  clearTimeout(st.timer);
+  st.timer = setTimeout(() => logSessionSummary(st, session), SUMMARY_IDLE_MS);
+  st.timer.unref?.();
+}
+function logSessionSummary(st, session) {
+  sessionStats.delete(st.sid);
+  const mb = (st.bytesEnd - st.bytes0) / 1e6;
+  const smooth = session.mode === 'smooth';
+  const lens = [...new Set(session.clips.map(c => c.l || CLIP_S))];
+  const t = st.starts.sort((a, b) => a - b);
+  const parts = [
+    smooth ? `smooth ${session.height}p${session.fps} ${session.frame || 'fit'}` : 'original',
+    `${session.clips.length} clips of ${lens.length === 1 ? `${lens[0]} s` : `${Math.min(...lens)}-${Math.max(...lens)} s`}`,
+    `played ${st.served.size}`,
+  ];
+  if (smooth) parts.push(`encoded ${st.encoded}`);
+  const perClip = mb / Math.max(1, smooth ? st.encoded : st.served.size);
+  const secs = smooth ? st.encodedS : [...st.served].reduce((a, n) => a + lenOf(session, n), 0);
+  parts.push(`Drive ${mb.toFixed(0)} MB = ${perClip.toFixed(1)} MB per clip, ${(mb / Math.max(1, secs)).toFixed(2)} MB per second`);
+  if (st.firstWaitS !== null) parts.push(`first clip after ${st.firstWaitS.toFixed(1)} s`);
+  if (t.length) parts.push(`starts median ${t[Math.floor(t.length / 2)].toFixed(1)} s, max ${t[t.length - 1].toFixed(1)} s`);
+  if (smooth) parts.push(`${st.standIns} stand-ins, ${st.slow} slow, ${st.failed} failed, ${st.decodeErrors} decoder errors`);
+  console.log(`compile session ${st.sid.slice(0, 6)}…: ${parts.join('; ')}`);
 }
 
 // Sessions are read on every segment request; keep recent ones in memory.
@@ -300,6 +348,25 @@ function playlist(sid, session) {
 
 // The clip at n first, then a couple of random others from the session to
 // fall back on if its source won't cut.
+// The clip that plays in slot n when trying clip i: clip n itself, or -
+// standing in for one that failed or was too slow - clip i's video at a
+// fresh spot well away from its own clip, so the viewer doesn't see a
+// clip that is already in the compilation a second time. null when the
+// video is too short to have such a spot.
+function slotClip(session, i, n) {
+  const clip = session.clips[i];
+  if (i === n) return clip;
+  const len = lenOf(session, n);
+  for (let t = 0; t < 6; t++) {
+    const s = pickStart((clip.dur || 0) * 1000, len);
+    if (Math.abs(s - clip.s) >= (clip.l || CLIP_S) + len) {
+      const { h, ...rest } = clip; // no longer cut around a highlight
+      return { ...rest, s: Math.round(s * 10) / 10, standIn: true };
+    }
+  }
+  return null;
+}
+
 function fallbackOrder(clips, n) {
   const order = [n];
   while (order.length < SEGMENT_TRIES && order.length < clips.length) {
@@ -395,14 +462,18 @@ async function openClip(clip, len, token, signal) {
 }
 
 async function originalSegment(session, n, signal) {
+  const requestedAt = Date.now();
   const { clips } = session;
   const token = await getServiceAccountToken();
   // Try the clip at n; if its source won't cut, fall back to other clips
   // from the same session so playback keeps going.
   for (const i of fallbackOrder(clips, n)) {
+    const clip = slotClip(session, i, n);
+    if (!clip) continue;
     try {
       // A stand-in clip plays for this slot's length.
-      const { chunks, rest, kill } = await openClip(clips[i], lenOf(session, n), token, signal);
+      const { chunks, rest, kill } = await openClip(clip, lenOf(session, n), token, signal);
+      if (n === 0 && session.stats && session.stats.firstWaitS === null) session.stats.firstWaitS = (Date.now() - requestedAt) / 1000;
       // Once the viewer disconnects (VLC seeks or closes) the stream is
       // cancelled; ffmpeg's remaining output must not touch it after that.
       let open = true;
@@ -410,7 +481,10 @@ async function originalSegment(session, n, signal) {
         start(ctrl) {
           for (const c of chunks) ctrl.enqueue(new Uint8Array(c));
           rest.on('data', c => { if (open) ctrl.enqueue(new Uint8Array(c)); });
-          rest.on('end', () => { if (open) { open = false; ctrl.close(); } });
+          rest.on('end', () => {
+            if (session.stats) session.stats.bytesEnd = driveBytesRead('compile');
+            if (open) { open = false; ctrl.close(); }
+          });
           rest.on('error', err => { if (open) { open = false; ctrl.error(err); } });
           rest.resume();
         },
@@ -464,8 +538,11 @@ function smoothArgs(source, n, session, token, hasAudio, keyframeAt, needS) {
       + `:h='if(gte(iw\\,ih)\\,${height}\\,round(ih*${height}/iw/16)*16)',`
     : `scale=${width}:${height}:force_original_aspect_ratio=decrease,`
       + `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black,`;
+  // Square pixels first: a video stored with stretched pixels (a sample
+  // aspect ratio, e.g. 1080x1080 shown as 608x1080) then has its shown
+  // shape for Fit and Native. The scale is skipped when pixels are square.
   // fps starting at 0 fills the first frame slot if the cut skipped it.
-  const video = `[0:v:0]${shape}setsar=1,fps=${fps}:start_time=0,`
+  const video = `[0:v:0]scale=trunc(iw*sar/2)*2:ih,setsar=1,${shape}setsar=1,fps=${fps}:start_time=0,`
     + `format=yuv420p,tpad=stop_mode=clone:stop_duration=${len}[v]`;
   const audio = `[${hasAudio ? '0:a:0' : '1:a'}]aresample=48000,aformat=channel_layouts=stereo,apad[a]`;
   return [
@@ -612,8 +689,11 @@ const MAX_RANDOM_SNAP_S    = 10;
 const MAX_HIGHLIGHT_SNAP_S = 3;
 async function keyframeStart(clip, signal) {
   if (!clip.s) return { snap: false, by: 0, at: null };
-  const { at, refused } = await keyframeBefore(clip.id, clip.s, 'compile', signal, PIECE_UNITS || 8);
+  const { at, duration, refused } = await keyframeBefore(clip.id, clip.s, 'compile', signal, PIECE_UNITS || 8);
   if (refused) return { refused };
+  // A cut at or past the end (the length wasn't known when it was picked)
+  // would play nothing but padding.
+  if (duration && clip.s > duration - 1) return { pastEnd: duration };
   if (at === null || at > clip.s) return { snap: false, by: null, at: null };
   const by = clip.s - at;
   const snap = by <= (clip.h ? MAX_HIGHLIGHT_SNAP_S : MAX_RANDOM_SNAP_S);
@@ -626,8 +706,9 @@ async function runJob(job, session, n, emit) {
   const graceS = WAITING_GRACE_S[session.height] || WAITING_GRACE_S[1080];
   for (const i of fallbackOrder(session.clips, n)) {
     if (job.cancelled) break;
-    const clip = session.clips[i];
-    const label = `${clip.id.slice(0, 6)}… at ${clip.s} s`;
+    const clip = slotClip(session, i, n);
+    if (!clip) continue;
+    const label = `${clip.id.slice(0, 6)}… at ${clip.s} s${clip.standIn ? `, standing in for clip ${n}` : ''}`;
     // One attempt = (probe +) encode of this source. If it hasn't produced
     // real output in time (see FIRST_OUTPUT_S) it is dropped for another.
     const attempt = new AbortController();
@@ -643,6 +724,7 @@ async function runJob(job, session, n, emit) {
       console.log(`compile smooth clip ${i} too slow: no output after ${ranS.toFixed(1)} s`
         + `${waitedS >= graceS ? ` (VLC waiting ${waitedS.toFixed(1)} s)` : ''} (${label}), trying another`);
       noteStart(ranS, true);
+      if (session.stats) session.stats.slow++;
       attempt.abort();
     }, 250);
     try {
@@ -658,6 +740,10 @@ async function runJob(job, session, n, emit) {
         console.log(`compile smooth clip ${i} failed: Drive refused the read (${label})`);
         continue;
       }
+      if (start.pastEnd) {
+        console.log(`compile smooth clip ${i} skipped: cut is past the end of the ${start.pastEnd.toFixed(0)} s video (${label})`);
+        continue;
+      }
       for (let tries = 0; tries < 2 && !job.cancelled && !attempt.signal.aborted; tries++) {
         if (SLOW_CODECS.has(info.videoCodec)) {
           console.log(`compile smooth clip ${i} skipped: ${info.videoCodec} is too slow to decode live (${label})`);
@@ -669,13 +755,24 @@ async function runJob(job, session, n, emit) {
         const result = await encodeClip(job, clip, n, session, token, info, start.at, needS, attempt.signal, emit, () => {
           released = true;
           noteStart((Date.now() - started) / 1000, false, start);
+          session.stats?.starts.push((Date.now() - started) / 1000);
         });
+        if (result.decodeErrors?.length && session.stats) session.stats.decodeErrors += result.decodeErrors.length;
         if (result.decodeErrors?.length) {
           console.log(`compile smooth clip ${i}: ${result.decodeErrors.length} decoder errors`
             + `${start.snap && start.by > 0 ? ` (started on the keyframe ${start.by.toFixed(2)} s early)` : ''} (${label}): `
             + result.decodeErrors.slice(0, 3).join(' | ').slice(0, 300));
         }
-        if (result.ok) { job.done = true; emit(); return; }
+        if (result.ok) {
+          if (clip.standIn) console.log(`compile smooth clip ${n} played a stand-in: ${label}`);
+          if (session.stats) {
+            session.stats.bytesEnd = driveBytesRead('compile');
+            session.stats.encoded++;
+            session.stats.encodedS += lenOf(session, n);
+            if (clip.standIn) session.stats.standIns++;
+          }
+          job.done = true; emit(); return;
+        }
         const found = result.found;
         if (!found || (found.hasAudio === info.hasAudio && !SLOW_CODECS.has(found.videoCodec))) {
           if (!attempt.signal.aborted) console.log(`compile smooth clip ${i} failed: exit ${result.code} ${result.why} (${label})`);
@@ -690,6 +787,10 @@ async function runJob(job, session, n, emit) {
     } finally {
       clearInterval(timer);
     }
+  }
+  if (!job.cancelled && session.stats) {
+    session.stats.failed++;
+    session.stats.bytesEnd = driveBytesRead('compile');
   }
   job.failed = true;
   job.done = true;
@@ -754,7 +855,10 @@ function encodeClip(job, clip, n, session, token, info, keyframeAt, needS, signa
       // Drive refusing partway through ends ffmpeg's input like the end of
       // the file, and it exits 0 with next to nothing: not a real clip.
       const inputRefused = /HTTP error \d{3}|Server returned \d{3}/.test(stderr);
-      if (!released && code === 0 && size > 0 && !mismatch && !inputRefused) release();
+      // ffmpeg's closing summary ("video:0kB audio:...") - an output with no
+      // video at all (a cut past the end) is padding, not a clip.
+      const noVideo = /video:\s*0\s*(?:KiB|kB)/.test(stderr);
+      if (!released && code === 0 && size > 0 && !mismatch && !inputRefused && !noVideo) release();
       const why = stderr.split('\n').filter(l => /error|invalid|failed|no such|matches no/i.test(l)).slice(-3).join(' | ');
       resolve({ ok: released, found, code, why: why.slice(0, 300), decodeErrors: decodeErrors(stderr) });
     });
@@ -819,6 +923,7 @@ function warmStart(sid, session) {
 }
 
 function smoothSegment(sid, session, n) {
+  const requestedAt = Date.now();
   pruneJobs(sid, n);
   const job = startJob(sid, session, n, true);
   // VLC is now waiting for this segment: a source still not producing
@@ -838,6 +943,8 @@ function smoothSegment(sid, session, n) {
       if (!job.chunks.length) return;
       answered = true;
       job.listeners.delete(answer);
+      // How long VLC waited for the first clip to start arriving.
+      if (n === 0 && session.stats && session.stats.firstWaitS === null) session.stats.firstWaitS = (Date.now() - requestedAt) / 1000;
       let sent = 0;
       let open = true;
       let listener = null;
@@ -889,6 +996,9 @@ export default async function handler(req) {
     const n = Number(url.searchParams.get('n'));
     if (!Number.isInteger(n) || n < 0 || n >= session.clips.length) return new Response('bad segment', { status: 400 });
     if (req.method === 'HEAD') return new Response(null, { headers: { 'Content-Type': 'video/mp2t' } });
+    const st = statsFor(sid, session);
+    st.served.add(n);
+    touchStats(st, session);
     return session.mode === 'smooth'
       ? smoothSegment(sid, session, n)
       : originalSegment(session, n, req.signal);
