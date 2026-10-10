@@ -656,7 +656,7 @@ function startJob(sid, session, n, urgent) {
     if (urgent) promoteWaiter(existing);
     return existing;
   }
-  const job = { chunks: [], done: false, failed: false, listeners: new Set(), kill: () => {}, waiter: null, waitingSince: null };
+  const job = { key, started: false, chunks: [], done: false, failed: false, listeners: new Set(), kill: () => {}, waiter: null, waitingSince: null };
   jobs.set(key, job);
   const emit = () => job.listeners.forEach(fn => fn());
 
@@ -664,6 +664,7 @@ function startJob(sid, session, n, urgent) {
     const got = await acquireEncodeSlot(job, urgent);
     job.waiter = null;
     if (!got) throw new Error('cancelled before start');
+    job.started = true;
     try {
       await runJob(job, session, n, emit);
     } finally {
@@ -700,6 +701,53 @@ async function keyframeStart(clip, signal) {
   return { snap, by, at: snap ? at : null };
 }
 
+// Opening a clip - its audio and codec, and the keyframe it starts on - is
+// mostly waiting on Drive, with little CPU. So while one clip encodes, the
+// clips queued after it are opened already, and each encode starts as soon
+// as its turn comes. The reads are the ones its turn would make anyway, and
+// stay in the piece cache for the encode; only a seek wastes the opens it
+// passes.
+async function openSmooth(clip, token, signal) {
+  const info = clip.vc ? { hasAudio: clip.a === 1, videoCodec: clip.vc }
+    : await probeInfo(clip.id, token, 'compile', signal, PIECE_UNITS > 0);
+  const start = SLOW_CODECS.has(info.videoCodec) ? { snap: false, by: null, at: null } : await keyframeStart(clip, signal);
+  return { info, start };
+}
+const opens = new Map(); // `${sid}:${n}` -> { clip, ctrl, promise }, for the slot's own clip
+const OPEN_KEEP_MS = 120e3;
+function openAhead(sid, session, n) {
+  const key = `${sid}:${n}`;
+  if (n >= session.clips.length || opens.has(key) || jobs.get(key)?.started) return;
+  const clip = session.clips[n];
+  const ctrl = new AbortController();
+  const promise = getServiceAccountToken().then(token => openSmooth(clip, token, ctrl.signal));
+  promise.catch(() => {});
+  opens.set(key, { clip, ctrl, promise });
+  // Never taken (the viewer stopped): let it go.
+  setTimeout(() => { if (opens.get(key)?.promise === promise) dropOpen(key); }, OPEN_KEEP_MS).unref?.();
+}
+function takeOpen(job, clip) {
+  const open = opens.get(job.key);
+  if (!open || open.clip !== clip) return null;
+  opens.delete(job.key);
+  return open.promise;
+}
+function dropOpen(key) {
+  const open = opens.get(key);
+  if (!open) return;
+  open.ctrl.abort();
+  opens.delete(key);
+}
+// Waits for an open started earlier, unless this attempt is dropped first.
+function untilAborted(promise, signal) {
+  return new Promise((resolve, reject) => {
+    const stop = () => reject(new Error('aborted'));
+    if (signal.aborted) return stop();
+    signal.addEventListener('abort', stop, { once: true });
+    promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', stop));
+  });
+}
+
 async function runJob(job, session, n, emit) {
   const token = await getServiceAccountToken();
   const limitS = FIRST_OUTPUT_S[session.height] || FIRST_OUTPUT_S[1080];
@@ -733,9 +781,10 @@ async function runJob(job, session, n, emit) {
       // checks its own input listing, and on a mismatch starts over once
       // with what it found (the header is cached by then, so that costs
       // almost nothing).
-      let info = clip.vc ? { hasAudio: clip.a === 1, videoCodec: clip.vc }
-        : await probeInfo(clip.id, token, 'compile', attempt.signal, PIECE_UNITS > 0);
-      const start = SLOW_CODECS.has(info.videoCodec) ? { snap: false, by: null, at: null } : await keyframeStart(clip, attempt.signal);
+      const opened = clip.standIn ? null : takeOpen(job, clip);
+      let { info, start } = await (opened
+        ? untilAborted(opened, attempt.signal).catch(err => { if (attempt.signal.aborted) throw err; return openSmooth(clip, token, attempt.signal); })
+        : openSmooth(clip, token, attempt.signal));
       if (start.refused) {
         console.log(`compile smooth clip ${i} failed: Drive refused the read (${label})`);
         continue;
@@ -877,6 +926,10 @@ function pruneJobs(sid, n) {
       jobs.delete(key);
     }
   }
+  for (const key of opens.keys()) {
+    const [osid, on] = key.split(':');
+    if (osid === sid ? (Number(on) < n || Number(on) > n + ENCODE_AHEAD) : opens.size > 8) dropOpen(key);
+  }
 }
 
 // Warm start: for 4K, encode the first clip (with the next ones queued
@@ -894,6 +947,8 @@ const WARM_START_TIMEOUT_S = 45;
 // (the usual case once playing), this moves straight on down the line.
 function encodeAheadAfter(sid, session, n, job, k = 1) {
   if (k > ENCODE_AHEAD || n + k >= session.clips.length) return;
+  // Open the next clip while this one encodes (see openSmooth).
+  if (!job.done) openAhead(sid, session, n + k);
   // A job dropped by a seek (pruneJobs) ends the chain: the request for
   // the new position starts its own.
   const next = () => { if (!job.cancelled) encodeAheadAfter(sid, session, n, startJob(sid, session, n + k, false), k + 1); };
