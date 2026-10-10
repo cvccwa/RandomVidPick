@@ -327,6 +327,7 @@ function librarySignature(videos) {
 let metaWatched  = {};   // fileId -> last-watched epoch ms
 let metaTags     = {};   // fileId -> {tagName: source}  (m manual, f filename, i imported)
 let metaMedia    = {};   // fileId -> [width, height (as shown), fps, has audio 1/0, duration ms, stored short side, audio only 1/0], from the server's header check
+let metaHighlights = new Set(); // fileIds whose highlight analysis found moments (compilations cut around them)
 let metaPromise  = null; // load once per page
 const pendingDurations = {};
 const pendingWatched   = new Set();
@@ -349,6 +350,7 @@ function ensureMeta() {
         // Same for tags edited before the load returned.
         metaTags = { ...(meta.tags || {}), ...metaTags };
         metaMedia = meta.media || {};
+        metaHighlights = new Set(meta.highlights || []);
         for (const v of videoCache || []) {
           if (!v.durationMs && meta.durations && meta.durations[v.id]) {
             v.durationMs = meta.durations[v.id];
@@ -759,12 +761,14 @@ const SORT_DEFAULT_DIR = { name: 'asc', created: 'desc', duration: 'desc', size:
 //   lenMin/lenMax  minutes; 0 / LEN_MAX mean no bound
 //   formats   computed tags picked in the Format tab ('quality:1080p',
 //             'fps:60', 'shape:Portrait'): any within a group, all groups
-//   creators  any of them; excluded: creators or tags to hide
+//   highlights  only videos with analysed highlights
+//   creators  any of them; noCreator: also (or only) videos with no creator
+//   excluded: creators or tags to hide
 //   tags, tagMode ('all' | 'any'), untagged
 const LEN_MAX = 120;
 const FILTER_DEFAULTS = {
-  watched: 'any', folder: null, uploaded: 'any', lenMin: 0, lenMax: LEN_MAX,
-  formats: [], creators: [], tags: [], excluded: [], tagMode: 'all', untagged: false,
+  watched: 'any', folder: null, uploaded: 'any', lenMin: 0, lenMax: LEN_MAX, highlights: false,
+  formats: [], creators: [], noCreator: false, tags: [], excluded: [], tagMode: 'all', untagged: false,
 };
 let browsePrefs = { sort: 'name', dir: 'asc', ...structuredClone(FILTER_DEFAULTS) };
 let randomRank  = new Map(); // fileId -> position, reshuffled on demand
@@ -872,10 +876,15 @@ function filterVideos(query, p = browsePrefs) {
     });
   }
 
+  if (p.highlights) list = list.filter(v => metaHighlights.has(v.id));
+
   if (p.untagged) list = list.filter(v => !tagNames(v.id).length);
 
-  // Creators: a video matches if it has any of the chosen creators.
-  if (p.creators.length) list = list.filter(v => p.creators.some(c => c in tagsOf(v.id)));
+  // Creators: a video matches if it has any of the chosen creators - or,
+  // with "Unknown creator", no creator at all.
+  if (p.creators.length || p.noCreator) {
+    list = list.filter(v => (p.noCreator && !creatorsOf(v.id).length) || p.creators.some(c => c in tagsOf(v.id)));
+  }
 
   // Exclusions (creators or tags): hide any video carrying one.
   if (p.excluded.length) list = list.filter(v => !p.excluded.some(t => t in tagsOf(v.id)));
@@ -1521,8 +1530,8 @@ function lengthLabel(p) {
 
 function activeFilterCount(p = browsePrefs) {
   return (p.watched !== 'any') + (p.folder != null) + (p.uploaded !== 'any')
-    + (p.lenMin > 0 || p.lenMax < LEN_MAX) + p.formats.length
-    + p.creators.length + p.tags.length + p.excluded.length + p.untagged;
+    + (p.lenMin > 0 || p.lenMax < LEN_MAX) + p.highlights + p.formats.length
+    + p.creators.length + p.noCreator + p.tags.length + p.excluded.length + p.untagged;
 }
 
 function applyFilters(next) {
@@ -1556,9 +1565,11 @@ function refreshTagBar() {
   }
   const remove = (key, name) => n => { n[key] = n[key].filter(t => t !== name); };
   for (const c of p.creators) row1.push(chip(`👤 ${tagLabel(c)}`, 'active', remove('creators', c)));
+  if (p.noCreator) row1.push(chip('👤 Unknown creator', 'active', n => { n.noCreator = false; }));
   for (const c of p.excluded.filter(isCreatorTag)) row1.push(chip(`− 👤 ${tagLabel(c)}`, 'excluded', remove('excluded', c)));
   if (p.lenMin > 0 || p.lenMax < LEN_MAX) row1.push(chip(lengthLabel(p), 'active', n => { n.lenMin = 0; n.lenMax = LEN_MAX; }));
   if (p.uploaded !== 'any') row1.push(chip(UPLOAD_LABELS[p.uploaded], 'active', n => { n.uploaded = 'any'; }));
+  if (p.highlights) row1.push(chip('✨ Has highlights', 'active', n => { n.highlights = false; }));
   if (p.folder != null) row1.push(chip(`📁 ${p.folder || '(root folder)'}`, 'active', n => { n.folder = null; }));
   if (p.watched !== 'any') {
     row1.push(chip(p.watched === 'only' ? 'Watched recently' : 'Not watched recently',
@@ -1666,9 +1677,9 @@ function openFilters(tab = 'general') {
   const showBtn = el('button', { type: 'button', className: 'sheet-btn primary filter-show', onclick: () => { closeSheet(); applyFilters(draft); } });
 
   const tabCount = t => t === 'general'
-    ? (draft.watched !== 'any') + (draft.folder != null) + (draft.uploaded !== 'any') + (draft.lenMin > 0 || draft.lenMax < LEN_MAX)
+    ? (draft.watched !== 'any') + (draft.folder != null) + (draft.uploaded !== 'any') + (draft.lenMin > 0 || draft.lenMax < LEN_MAX) + draft.highlights
     : t === 'format' ? draft.formats.length
-    : t === 'creator' ? draft.creators.length + draft.excluded.filter(isCreatorTag).length
+    : t === 'creator' ? draft.creators.length + draft.noCreator + draft.excluded.filter(isCreatorTag).length
     : draft.tags.length + draft.excluded.filter(n => !isCreatorTag(n)).length + draft.untagged;
 
   const segmented = (options, value, onPick) => el('div', { className: 'segmented' },
@@ -1677,6 +1688,11 @@ function openFilters(tab = 'general') {
       onclick: () => { onPick(v); render(); },
     })));
   const sectionTitle = text => el('div', { className: 'sheet-section-title', textContent: text });
+  // A one-button on/off toggle, styled like the segmented controls.
+  const toggle = (key, label) => el('div', { className: 'segmented fit' }, el('button', {
+    type: 'button', className: draft[key] ? 'on' : '', textContent: label,
+    ariaPressed: String(draft[key]), onclick: () => { draft[key] = !draft[key]; render(); },
+  }));
 
   const general = () => {
     const lenValue = el('span', { className: 'filter-value', textContent: lengthLabel(draft) });
@@ -1719,6 +1735,9 @@ function openFilters(tab = 'general') {
       el('div', { className: 'sheet-section' }, sectionTitle('Folder'), folder),
       el('div', { className: 'sheet-section' }, sectionTitle('Watched in the last 30 days'),
         segmented([['any', 'Any'], ['only', 'Only these'], ['hide', 'Hide these']], draft.watched, v => { draft.watched = v; })),
+      el('div', { className: 'sheet-section' }, sectionTitle('Highlights'),
+        el('div', { className: 'sheet-row' }, toggle('highlights', 'Has highlights')),
+        el('div', { className: 'sheet-note', textContent: `${(videoCache || []).filter(v => metaHighlights.has(v.id)).length.toLocaleString()} videos analysed so far; compilations cut around their busiest moments.` })),
     ];
   };
 
@@ -1793,14 +1812,13 @@ function openFilters(tab = 'general') {
     fill();
     return [
       el('div', { className: 'sheet-row' }, search, sort),
-      isCreator ? null : el('div', { className: 'sheet-row' },
+      isCreator ? el('div', { className: 'sheet-row' }, toggle('noCreator', 'Unknown creator'),
+        el('span', { className: 'sheet-note', textContent: `${(videoCache || []).filter(v => !creatorsOf(v.id).length).length.toLocaleString()} videos without a creator` }))
+      : el('div', { className: 'sheet-row' },
         segmented([['all', 'Match all'], ['any', 'Match any']], draft.tagMode, v => { draft.tagMode = v; }),
-        el('div', { className: 'segmented fit' }, el('button', {
-          type: 'button', className: draft.untagged ? 'on' : '', textContent: 'Untagged only',
-          ariaPressed: String(draft.untagged), onclick: () => { draft.untagged = !draft.untagged; render(); },
-        }))),
+        toggle('untagged', 'Untagged only')),
       el('div', { className: 'sheet-note', textContent: (isCreator
-        ? 'Shows videos by any ✓ creator. '
+        ? 'Shows videos by any ✓ creator (and, with Unknown creator, those without one). '
         : draft.tagMode === 'any' ? 'Videos with at least one ✓ tag. ' : 'Videos with every ✓ tag. ')
         + 'Tap once to include (✓), twice to exclude (✕), again to clear.' }),
       list,
