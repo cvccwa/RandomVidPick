@@ -125,15 +125,18 @@ function clipLength(lenChoice, pick) {
 // Smooth-mode output height. Videos are classed by their short side, so a
 // portrait 1080x1920 counts as 1080p. Auto takes the highest class that at
 // least half the (known) clips reach - a few 4K videos in a mostly-1080p
-// view don't make the whole compilation 4K.
+// view don't make the whole compilation 4K. A chosen height is capped at
+// the highest class among the clips (when every clip's size is known):
+// 1080p videos encoded as 4K are only enlarged, at four times the encoding
+// work, with no added detail.
 function classOf(w, h) {
   const short = Math.min(w, h);
   return short >= 2000 ? 2160 : short >= 1300 ? 1440 : 1080;
 }
 
 function pickHeight(res, pool) {
-  if (res !== 'auto') return Number(res);
   const known = pool.filter(c => c.w > 0 && c.h > 0).map(c => classOf(c.w, c.h));
+  if (res !== 'auto') return known.length && known.length === pool.length ? Math.min(Number(res), Math.max(...known)) : Number(res);
   for (const h of [2160, 1440]) {
     if (known.length && known.filter(k => k >= h).length * 2 >= known.length) return h;
   }
