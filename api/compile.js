@@ -300,6 +300,25 @@ function playlist(sid, session) {
 
 // The clip at n first, then a couple of random others from the session to
 // fall back on if its source won't cut.
+// The clip that plays in slot n when trying clip i: clip n itself, or -
+// standing in for one that failed or was too slow - clip i's video at a
+// fresh spot well away from its own clip, so the viewer doesn't see a
+// clip that is already in the compilation a second time. null when the
+// video is too short to have such a spot.
+function slotClip(session, i, n) {
+  const clip = session.clips[i];
+  if (i === n) return clip;
+  const len = lenOf(session, n);
+  for (let t = 0; t < 6; t++) {
+    const s = pickStart((clip.dur || 0) * 1000, len);
+    if (Math.abs(s - clip.s) >= (clip.l || CLIP_S) + len) {
+      const { h, ...rest } = clip; // no longer cut around a highlight
+      return { ...rest, s: Math.round(s * 10) / 10, standIn: true };
+    }
+  }
+  return null;
+}
+
 function fallbackOrder(clips, n) {
   const order = [n];
   while (order.length < SEGMENT_TRIES && order.length < clips.length) {
@@ -400,9 +419,11 @@ async function originalSegment(session, n, signal) {
   // Try the clip at n; if its source won't cut, fall back to other clips
   // from the same session so playback keeps going.
   for (const i of fallbackOrder(clips, n)) {
+    const clip = slotClip(session, i, n);
+    if (!clip) continue;
     try {
       // A stand-in clip plays for this slot's length.
-      const { chunks, rest, kill } = await openClip(clips[i], lenOf(session, n), token, signal);
+      const { chunks, rest, kill } = await openClip(clip, lenOf(session, n), token, signal);
       // Once the viewer disconnects (VLC seeks or closes) the stream is
       // cancelled; ffmpeg's remaining output must not touch it after that.
       let open = true;
@@ -464,8 +485,11 @@ function smoothArgs(source, n, session, token, hasAudio, keyframeAt, needS) {
       + `:h='if(gte(iw\\,ih)\\,${height}\\,round(ih*${height}/iw/16)*16)',`
     : `scale=${width}:${height}:force_original_aspect_ratio=decrease,`
       + `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black,`;
+  // Square pixels first: a video stored with stretched pixels (a sample
+  // aspect ratio, e.g. 1080x1080 shown as 608x1080) then has its shown
+  // shape for Fit and Native. The scale is skipped when pixels are square.
   // fps starting at 0 fills the first frame slot if the cut skipped it.
-  const video = `[0:v:0]${shape}setsar=1,fps=${fps}:start_time=0,`
+  const video = `[0:v:0]scale=trunc(iw*sar/2)*2:ih,setsar=1,${shape}setsar=1,fps=${fps}:start_time=0,`
     + `format=yuv420p,tpad=stop_mode=clone:stop_duration=${len}[v]`;
   const audio = `[${hasAudio ? '0:a:0' : '1:a'}]aresample=48000,aformat=channel_layouts=stereo,apad[a]`;
   return [
@@ -612,8 +636,11 @@ const MAX_RANDOM_SNAP_S    = 10;
 const MAX_HIGHLIGHT_SNAP_S = 3;
 async function keyframeStart(clip, signal) {
   if (!clip.s) return { snap: false, by: 0, at: null };
-  const { at, refused } = await keyframeBefore(clip.id, clip.s, 'compile', signal, PIECE_UNITS || 8);
+  const { at, duration, refused } = await keyframeBefore(clip.id, clip.s, 'compile', signal, PIECE_UNITS || 8);
   if (refused) return { refused };
+  // A cut at or past the end (the length wasn't known when it was picked)
+  // would play nothing but padding.
+  if (duration && clip.s > duration - 1) return { pastEnd: duration };
   if (at === null || at > clip.s) return { snap: false, by: null, at: null };
   const by = clip.s - at;
   const snap = by <= (clip.h ? MAX_HIGHLIGHT_SNAP_S : MAX_RANDOM_SNAP_S);
@@ -626,8 +653,9 @@ async function runJob(job, session, n, emit) {
   const graceS = WAITING_GRACE_S[session.height] || WAITING_GRACE_S[1080];
   for (const i of fallbackOrder(session.clips, n)) {
     if (job.cancelled) break;
-    const clip = session.clips[i];
-    const label = `${clip.id.slice(0, 6)}… at ${clip.s} s`;
+    const clip = slotClip(session, i, n);
+    if (!clip) continue;
+    const label = `${clip.id.slice(0, 6)}… at ${clip.s} s${clip.standIn ? `, standing in for clip ${n}` : ''}`;
     // One attempt = (probe +) encode of this source. If it hasn't produced
     // real output in time (see FIRST_OUTPUT_S) it is dropped for another.
     const attempt = new AbortController();
@@ -658,6 +686,10 @@ async function runJob(job, session, n, emit) {
         console.log(`compile smooth clip ${i} failed: Drive refused the read (${label})`);
         continue;
       }
+      if (start.pastEnd) {
+        console.log(`compile smooth clip ${i} skipped: cut is past the end of the ${start.pastEnd.toFixed(0)} s video (${label})`);
+        continue;
+      }
       for (let tries = 0; tries < 2 && !job.cancelled && !attempt.signal.aborted; tries++) {
         if (SLOW_CODECS.has(info.videoCodec)) {
           console.log(`compile smooth clip ${i} skipped: ${info.videoCodec} is too slow to decode live (${label})`);
@@ -675,7 +707,10 @@ async function runJob(job, session, n, emit) {
             + `${start.snap && start.by > 0 ? ` (started on the keyframe ${start.by.toFixed(2)} s early)` : ''} (${label}): `
             + result.decodeErrors.slice(0, 3).join(' | ').slice(0, 300));
         }
-        if (result.ok) { job.done = true; emit(); return; }
+        if (result.ok) {
+          if (clip.standIn) console.log(`compile smooth clip ${n} played a stand-in: ${label}`);
+          job.done = true; emit(); return;
+        }
         const found = result.found;
         if (!found || (found.hasAudio === info.hasAudio && !SLOW_CODECS.has(found.videoCodec))) {
           if (!attempt.signal.aborted) console.log(`compile smooth clip ${i} failed: exit ${result.code} ${result.why} (${label})`);
@@ -754,7 +789,10 @@ function encodeClip(job, clip, n, session, token, info, keyframeAt, needS, signa
       // Drive refusing partway through ends ffmpeg's input like the end of
       // the file, and it exits 0 with next to nothing: not a real clip.
       const inputRefused = /HTTP error \d{3}|Server returned \d{3}/.test(stderr);
-      if (!released && code === 0 && size > 0 && !mismatch && !inputRefused) release();
+      // ffmpeg's closing summary ("video:0kB audio:...") - an output with no
+      // video at all (a cut past the end) is padding, not a clip.
+      const noVideo = /video:\s*0\s*(?:KiB|kB)/.test(stderr);
+      if (!released && code === 0 && size > 0 && !mismatch && !inputRefused && !noVideo) release();
       const why = stderr.split('\n').filter(l => /error|invalid|failed|no such|matches no/i.test(l)).slice(-3).join(' | ');
       resolve({ ok: released, found, code, why: why.slice(0, 300), decodeErrors: decodeErrors(stderr) });
     });
