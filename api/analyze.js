@@ -12,10 +12,19 @@ import { libraryStats } from './_lib/libraryStats.js';
 // (how much the picture changes frame to frame) and loudness. Starting at a
 // keyframe means nothing before it has to be read and decoded, and reads
 // go through driveSource's small-piece mode, so a sample costs ~1-3 MB of
-// Drive downloads instead of tens. A second pass then samples around the best few
-// spots to land on the actual peak within those scenes. The strongest few
-// moments are kept in KV (PEAKS_KEY: fileId -> JSON) for /api/compile to
-// cut around.
+// Drive downloads instead of tens. Samples around the best spots then land
+// on the actual peak within those scenes. The strongest few moments are
+// kept in KV (PEAKS_KEY: fileId -> JSON) for /api/compile to cut around.
+//
+// Videos are analysed in PASSES visits rather than all at once: each visit
+// measures a third of the grid of spots (pass 1 the middle of every third,
+// later passes the spots in between, never one twice) and refines around
+// the best spot not yet refined, then re-ranks everything measured so far.
+// Every video gets its first visit before any gets a second, so the whole
+// library has highlights at a third of the cost, and they sharpen as later
+// passes come round. The raw measurements are kept with the peaks (s), as
+// is where it has refined (r) and the passes done (pass); entries from
+// before multi-pass have no pass and count as complete.
 //
 //   POST /api/analyze   analyse a batch for up to RUN_BUDGET_S, then stop
 //                       (Cloud Scheduler with `Authorization: Bearer
@@ -62,7 +71,9 @@ const MEDIA_TIMEOUT_MS = 30e3;
 const MIN_SAMPLES    = Number(process.env.ANALYZE_MIN_SAMPLES) || 16;
 const MAX_SAMPLES    = Number(process.env.ANALYZE_MAX_SAMPLES) || 48;
 const SAMPLE_EVERY_S = Number(process.env.ANALYZE_SAMPLE_EVERY_S) || 60;
-const REFINE_TOP     = 3;                 // spots refined in the second pass
+const PASSES         = 3;
+const PASS_RESIDUE   = [1, 0, 2];         // grid spots (index mod 3) each pass measures
+const REFINE_PER_PASS = 1;                // spots refined per pass, the best not yet refined
 const REFINE_OFFSETS = [-1 / 3, 1 / 3, 2 / 3]; // x coarse spacing; forward-leaning, as clips run forward
 const EXTENT_DROP    = 0.15;              // neighbours within this of a peak's score count as the same busy stretch
 const WINDOW_S       = 1;    // 0.5 s was cheaper but noisier; 2 s needs decoding up to it
@@ -180,17 +191,24 @@ class OutOfTime extends Error {}
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-export async function analyzeVideo(id, durationMs, token, stopAt = Infinity) {
+// One visit to a video: the next of its PASSES passes, building on what
+// earlier visits measured (`prior`, its stored entry, or null).
+export async function analyzeVideo(id, durationMs, token, stopAt = Infinity, prior = null) {
   // Time-limited: a damaged file can keep ffmpeg reconnecting indefinitely.
   const info = await probeInfo(id, token, 'analyze', AbortSignal.timeout(MEASURE_TIMEOUT_MS));
-  const d = durationMs > 0 ? durationMs / 1000 : info.duration;
-  if (!(d >= MIN_DURATION_S)) return { v: VERSION, d: Math.round(d || 0), peaks: [] };
+  // Whole seconds, as stored, so every pass lays out the same grid.
+  const d = prior?.d || Math.round(durationMs > 0 ? durationMs / 1000 : info.duration || 0);
+  if (!(d >= MIN_DURATION_S)) return { v: VERSION, d: Math.round(d || 0), pass: PASSES, peaks: [] };
+  const pass = Math.min(PASSES, (prior?.pass || 0) + 1);
 
+  // The full grid: about one spot a minute across the middle of the video.
   const lo = d * 0.08;
   const span = d * 0.84 - WINDOW_S;
   const count = Math.min(MAX_SAMPLES, Math.max(MIN_SAMPLES, Math.round(d / SAMPLE_EVERY_S)));
   const step = span / count;
-  const samples = [];
+  const samples = (prior?.s || []).map(([t, motion, loud]) => ({ t, motion, loud }));
+  const refined = [...(prior?.r || [])];
+  const measuredBefore = samples.length;
   const sampleAt = async t => {
     if (Date.now() > stopAt) throw new OutOfTime('out of time');
     let pause = SAMPLE_PAUSE_MS;
@@ -203,19 +221,27 @@ export async function analyzeVideo(id, durationMs, token, stopAt = Infinity) {
     await sleep(Math.max(0, Math.min(pause, stopAt - Date.now())));
   };
 
-  // Pass 1: evenly across the middle of the video.
-  await runLimited(Array.from({ length: count }, (_, i) => () => sampleAt(lo + step * (i + 0.5))), SAMPLE_PARALLEL);
-  if (!samples.length) {
-    // Every spot failed to read: almost always Drive refusing requests, not the file.
+  // A spot this close to one already measured (a refine from an earlier
+  // pass) would measure the same second again.
+  const fresh = t => samples.every(x => Math.abs(x.t - t) >= step / 6);
+  // This pass's share of the grid.
+  const spots = Array.from({ length: count }, (_, i) => i)
+    .filter(i => i % 3 === PASS_RESIDUE[pass - 1]).map(i => lo + step * (i + 0.5)).filter(fresh);
+  await runLimited(spots.map(t => () => sampleAt(t)), SAMPLE_PARALLEL);
+  if (samples.length === measuredBefore) {
+    // Every spot failed to read: almost always Drive refusing requests, not
+    // the file. Whatever earlier passes found stays stored.
     const err = new Error('no samples measured');
     err.transient = true;
     throw err;
   }
   scoreSamples(samples);
 
-  // Pass 2: around the best few spots, to find the peak inside each scene.
-  const best = [...samples].sort((a, b) => b.score - a.score).slice(0, REFINE_TOP);
-  const refine = best.flatMap(s => REFINE_OFFSETS.map(k => s.t + k * step)).filter(t => t >= lo && t <= lo + span);
+  // Around the best spot not yet refined, to find the peak inside its scene.
+  const best = [...samples].sort((a, b) => b.score - a.score)
+    .filter(s => refined.every(c => Math.abs(c - s.t) >= step / 2)).slice(0, REFINE_PER_PASS);
+  refined.push(...best.map(s => Math.round(s.t * 10) / 10));
+  const refine = best.flatMap(s => REFINE_OFFSETS.map(k => s.t + k * step)).filter(t => t >= lo && t <= lo + span && fresh(t));
   await runLimited(refine.map(t => () => sampleAt(t)), SAMPLE_PARALLEL);
   scoreSamples(samples);
 
@@ -243,7 +269,11 @@ export async function analyzeVideo(id, durationMs, token, stopAt = Infinity) {
       peaks.push([Math.round(s.t * 10) / 10, Math.round(s.score * 1000) / 1000, Math.round(length), Math.round(from * 10) / 10]);
     }
   }
-  return { v: VERSION, d: Math.round(d), peaks };
+  return {
+    v: VERSION, d: Math.round(d), pass, peaks,
+    s: samples.map(x => [Math.round(x.t * 10) / 10, Math.round(x.motion * 1000) / 1000, x.loud === null ? null : Math.round(x.loud * 10) / 10]),
+    r: refined,
+  };
 }
 
 // Scores every sample 0..1 against the others in the same video.
@@ -263,15 +293,22 @@ async function loadTodo(token) {
   const [library, stored, checked] = await Promise.all([
     listLibrary(token), kvCommand(['HGETALL', PEAKS_KEY]), kvCommand(['HKEYS', MEDIA_KEY])]);
   const doneSet = new Set();
+  const passesDone = new Map(); // id -> passes done so far, for videos part-way through
   for (let i = 0; i + 1 < (stored || []).length; i += 2) {
     let entry = {};
     try { entry = JSON.parse(stored[i + 1]); } catch (err) { /* re-analyse */ continue; }
     // Failures not marked permanent (older entries included) are retried.
     const retry = entry.failed && (!entry.permanent || Date.now() - (entry.at || 0) > RETRY_FAILED_MS);
-    if (entry.v === VERSION && !retry) doneSet.add(stored[i]);
+    if (entry.v !== VERSION || retry) continue;
+    const passes = entry.failed ? PASSES : entry.pass ?? PASSES;
+    if (passes >= PASSES) doneSet.add(stored[i]);
+    else passesDone.set(stored[i], passes);
   }
   const checkedSet = new Set(checked || []);
-  const todo = library.filter(v => !doneSet.has(v.id)).map(v => [v.id, v.durationMs]);
+  // Fewest passes first: every video gets its first visit before any gets a
+  // second (sort is stable, so library order holds within a pass).
+  const todo = library.filter(v => !doneSet.has(v.id))
+    .map(v => [v.id, v.durationMs, passesDone.get(v.id) || 0]).sort((a, b) => a[2] - b[2]);
   const mediaTodo = library.filter(v => !checkedSet.has(v.id)).map(v => [v.id, v.width, v.height]);
   await Promise.all([
     kvCommand(['SET', TODO_KEY, JSON.stringify(todo)]),
@@ -396,6 +433,7 @@ async function runBatch() {
   if (!todo.length) return { analyzed: 0, remaining: 0 };
 
   const finished = new Set();
+  let revisits = 0;
   let videoSeconds = 0;
   let transientStreak = 0;
   let stopReason = null;
@@ -405,9 +443,12 @@ async function runBatch() {
       && runBytes() < budgetBytes) {
       const [id, durationMs] = todo[next++];
       const videoStart = Date.now();
+      let prior = null;
+      try { prior = JSON.parse(await kvCommand(['HGET', PEAKS_KEY, id])); } catch (err) { /* first visit */ }
+      if (prior?.failed || prior?.v !== VERSION || !prior?.pass) prior = null;
       let result;
       try {
-        result = await analyzeVideo(id, durationMs, token, started + HARD_STOP_S * 1000);
+        result = await analyzeVideo(id, durationMs, token, started + HARD_STOP_S * 1000, prior);
       } catch (err) {
         if (err instanceof OutOfTime) continue; // left in the to-do list for next run
         if (err.transient) {
@@ -419,11 +460,14 @@ async function runBatch() {
           continue;
         }
         console.log(`analyze ${id.slice(0, 6)}… failed: ${err.message}`);
-        result = { v: VERSION, failed: true, permanent: true, at: Date.now(), peaks: [] };
+        // A later pass failing keeps what earlier ones found, and stops there.
+        result = prior?.peaks?.length ? { ...prior, pass: PASSES }
+          : { v: VERSION, failed: true, permanent: true, at: Date.now(), peaks: [] };
       }
       transientStreak = 0;
       await kvCommand(['HSET', PEAKS_KEY, id, JSON.stringify(result)]);
       finished.add(id);
+      if (prior) revisits++;
       videoSeconds += (Date.now() - videoStart) / 1000;
     }
   }
@@ -439,6 +483,7 @@ async function runBatch() {
   ]);
   return {
     analyzed: finished.size,
+    revisits,
     remaining: remaining.length,
     ranSeconds: ranS,
     secondsPerVideo: finished.size ? Math.round(videoSeconds / finished.size) : null,
@@ -502,7 +547,8 @@ export default async function handler(req) {
       : result.ranSeconds === undefined
       ? 'analyze run: nothing left to analyse'
       : `analyze run: ${result.analyzed} analysed in ${result.ranSeconds} s `
-        + `(~${result.secondsPerVideo} s per video, ${PARALLEL} at once), ${result.remaining} left; `
+        + `(${result.analyzed - result.revisits} first passes, ${result.revisits} later; `
+        + `~${result.secondsPerVideo} s per video, ${PARALLEL} at once), ${result.remaining} due a pass; `
         + `read ${result.readMB} MB from Drive (${result.dayReadGB} of ${DAILY_GB} GB today)`
         + (result.stopReason ? `; stopped early, Drive refusing: ${result.stopReason}` : ''));
     return json(result);

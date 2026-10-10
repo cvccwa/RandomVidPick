@@ -510,13 +510,18 @@ const MIN_SEGMENT_B  = 128 * 1024; // less than this from an encode = it failed
 // Encoder speed/size by workload (pixels per second). veryfast keeps
 // 1080p30 well ahead of real time; heavier outputs use faster presets so
 // the encode keeps up, at the cost of more bits - capped by maxrate so
-// data use stays bounded.
+// data use stays bounded. 4K always takes ultrafast: with superfast a real
+// 4K30 compilation took about 8.4 s to make each 5 s clip and froze, and
+// ultrafast takes about 3.4 s. Ultrafast leaves out deblocking (which
+// smooths the edges of compression blocks); turned back on, it costs no
+// measurable time.
 const MAXRATE_MBPS = { 1080: 12, 1440: 20, 2160: 35 };
 function encoderFor(height, fps) {
   const pixelRate = Math.round(height * 16 / 9) * height * fps;
-  const preset = pixelRate <= 130e6 ? 'veryfast' : pixelRate <= 260e6 ? 'superfast' : 'ultrafast';
+  const preset = height >= 2160 ? 'ultrafast' : pixelRate <= 130e6 ? 'veryfast' : 'superfast';
   const maxrate = Math.round((MAXRATE_MBPS[height] || 12) * (fps > 30 ? 1.5 : 1));
-  return ['-preset', preset, '-crf', '20', '-maxrate', `${maxrate}M`, '-bufsize', `${maxrate * 2}M`];
+  return ['-preset', preset, ...(preset === 'ultrafast' ? ['-deblock', '0:0'] : []),
+    '-crf', '20', '-maxrate', `${maxrate}M`, '-bufsize', `${maxrate * 2}M`];
 }
 
 // Smooth encodes read Drive in pieces (see driveSource.js) of up to
