@@ -457,8 +457,11 @@ function smoothArgs(source, n, session, token, hasAudio, keyframeAt, needS) {
   // pad short sources with their last frame / silence so every segment is
   // exactly its slot's length.
   const shape = session.frame === 'native'
-    // Own shape, short side = height (even dimensions).
-    ? `scale=w='if(gte(iw\\,ih)\\,-2\\,${height})':h='if(gte(iw\\,ih)\\,${height}\\,-2)',`
+    // Own shape, short side = height, long side rounded to a multiple of
+    // 16 - so near-16:9 sources (1920x1078, 1916x1080) all come out at
+    // the same size as true 16:9 ones, and VLC doesn't reset between them.
+    ? `scale=w='if(gte(iw\\,ih)\\,round(iw*${height}/ih/16)*16\\,${height})'`
+      + `:h='if(gte(iw\\,ih)\\,${height}\\,round(ih*${height}/iw/16)*16)',`
     : `scale=${width}:${height}:force_original_aspect_ratio=decrease,`
       + `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black,`;
   // fps starting at 0 fills the first frame slot if the cut skipped it.
@@ -667,6 +670,11 @@ async function runJob(job, session, n, emit) {
           released = true;
           noteStart((Date.now() - started) / 1000, false, start);
         });
+        if (result.decodeErrors?.length) {
+          console.log(`compile smooth clip ${i}: ${result.decodeErrors.length} decoder errors`
+            + `${start.snap && start.by > 0 ? ` (started on the keyframe ${start.by.toFixed(2)} s early)` : ''} (${label}): `
+            + result.decodeErrors.slice(0, 3).join(' | ').slice(0, 300));
+        }
         if (result.ok) { job.done = true; emit(); return; }
         const found = result.found;
         if (!found || (found.hasAudio === info.hasAudio && !SLOW_CODECS.has(found.videoCodec))) {
@@ -688,10 +696,20 @@ async function runJob(job, session, n, emit) {
   emit();
 }
 
+// Lines where the video decoder reported damage (missing reference
+// frames, broken slices...): what shows as blocky or smeared colour.
+const DECODER_LINE_RE = /^\[(h264|hevc|mpeg4|mpeg2video|vp8|vp9|av1|prores|mjpeg)[^\]]*@ 0x[0-9a-f]+\]/;
+const DECODE_ERROR_RE = /error while decoding|concealing|could not find ref|missing picture|decode_slice_header|invalid nal|non-existing|corrupt|reference picture missing|co located|Decoding error/i;
+function decodeErrors(stderr) {
+  return stderr.split('\n').filter(l => DECODE_ERROR_RE.test(l) && (DECODER_LINE_RE.test(l) || /Decoding error/.test(l)))
+    .map(l => l.trim());
+}
+
 // One ffmpeg encode of `clip` into job.chunks, assuming `info` (audio,
 // codec). Resolves { ok: true } once it has finished with real output,
 // else { ok: false, found, code, why } - found = what the input listing
 // showed (null if it never got that far), why = ffmpeg's error lines.
+// Either way decodeErrors lists the decoder's damage reports.
 function encodeClip(job, clip, n, session, token, info, keyframeAt, needS, signal, emit, onRelease) {
   return new Promise(resolve => {
     const ff = spawn(FFMPEG, smoothArgs(clip, n, session, token, info.hasAudio, keyframeAt, needS),
@@ -738,7 +756,7 @@ function encodeClip(job, clip, n, session, token, info, keyframeAt, needS, signa
       const inputRefused = /HTTP error \d{3}|Server returned \d{3}/.test(stderr);
       if (!released && code === 0 && size > 0 && !mismatch && !inputRefused) release();
       const why = stderr.split('\n').filter(l => /error|invalid|failed|no such|matches no/i.test(l)).slice(-3).join(' | ');
-      resolve({ ok: released, found, code, why: why.slice(0, 300) });
+      resolve({ ok: released, found, code, why: why.slice(0, 300), decodeErrors: decodeErrors(stderr) });
     });
   });
 }
@@ -765,9 +783,28 @@ function pruneJobs(sid, n) {
 const WARM_START_HEIGHT    = 2160;
 const WARM_START_TIMEOUT_S = 45;
 
+// The next ENCODE_AHEAD segments are encoded one after another, each once
+// the one before it is done: an encode with the CPU to itself finishes
+// sooner, and the nearest segment - the one VLC needs next - is always
+// the one being worked on. When the segments were already encoded ahead
+// (the usual case once playing), this moves straight on down the line.
+function encodeAheadAfter(sid, session, n, job, k = 1) {
+  if (k > ENCODE_AHEAD || n + k >= session.clips.length) return;
+  // A job dropped by a seek (pruneJobs) ends the chain: the request for
+  // the new position starts its own.
+  const next = () => { if (!job.cancelled) encodeAheadAfter(sid, session, n, startJob(sid, session, n + k, false), k + 1); };
+  if (job.done) return next();
+  const check = () => {
+    if (!job.done) return;
+    job.listeners.delete(check);
+    next();
+  };
+  job.listeners.add(check);
+}
+
 function warmStart(sid, session) {
   const first = startJob(sid, session, 0, true);
-  for (let k = 1; k <= ENCODE_AHEAD && k < session.clips.length; k++) startJob(sid, session, k, false);
+  encodeAheadAfter(sid, session, 0, first);
   return new Promise(resolve => {
     const timer = setTimeout(finish, WARM_START_TIMEOUT_S * 1000);
     function finish() {
@@ -787,9 +824,7 @@ function smoothSegment(sid, session, n) {
   // VLC is now waiting for this segment: a source still not producing
   // output gets only WAITING_GRACE_S more (see runJob).
   if (!job.done && !job.chunks.length) job.waitingSince ??= Date.now();
-  for (let k = 1; k <= ENCODE_AHEAD && n + k < session.clips.length; k++) {
-    startJob(sid, session, n + k, false); // encode ahead
-  }
+  encodeAheadAfter(sid, session, n, job);
 
   return new Promise(resolve => {
     let answered = false;

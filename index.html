@@ -308,6 +308,9 @@
     .filter-tab.active { background: var(--border); color: var(--text); font-weight: 600; }
     .filter-tab-count { color: var(--accent); font-size: 0.7rem; }
     .sheet.filter-sheet { height: 85dvh; max-height: 85dvh; overflow: hidden; }
+    /* Sheets whose title and buttons stay put while the middle scrolls. */
+    .sheet.pinned-sheet { overflow: hidden; }
+    .sheet-scroll { display: flex; flex-direction: column; gap: 0.75rem; flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
     .filter-body { display: flex; flex-direction: column; gap: 1rem; flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
     /* Creator / Tags: the search row stays at the top while the list scrolls. */
     .filter-body > .sheet-row:first-child { position: sticky; top: 0; z-index: 1; background: var(--bg); padding-bottom: 0.25rem; }

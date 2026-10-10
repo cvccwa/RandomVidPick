@@ -7,7 +7,7 @@ const VIDEO_MIME_TYPES = [
   'video/quicktime', 'video/x-msvideo', 'video/mpeg',
   'video/3gpp', 'video/x-flv', 'video/x-ms-wmv'
 ];
-const APP_VERSION = 'v48';
+const APP_VERSION = 'v49';
 const BROWSE_BATCH = 50;
 // Where api/ (stream, thumbnails, tags) is served from.
 const API_BASE = 'https://randomvidpick-139266625585.us-east1.run.app';
@@ -2288,7 +2288,10 @@ function saveCompilePrefs() {
   try { localStorage.setItem('rvp_compile_mode', JSON.stringify(compilePrefs)); } catch (err) { /* ignore */ }
 }
 
+let lastHighlightNote = null;
 function openCompileMenu() {
+  // Picking a setting redraws the menu: keep its scroll position.
+  const keepScroll = sheetBackdrop.hidden ? 0 : (sheet.querySelector('.sheet-scroll')?.scrollTop || 0);
   const modeRow = (id, label, note) => el('div', {
     className: 'tri-row' + (compilePrefs.mode === id ? ' include' : ''),
     onclick: () => { compilePrefs.mode = id; saveCompilePrefs(); openCompileMenu(); },
@@ -2313,27 +2316,35 @@ function openCompileMenu() {
       return chip;
     })));
   const smooth = compilePrefs.mode === 'smooth';
-  const highlightNote = el('div', { className: 'sheet-note', textContent: 'Checking highlight analysis…' });
-  loadHighlightProgress().then(text => { highlightNote.textContent = text; });
+  // The last answer shows straight away (a redraw doesn't flicker or
+  // change the menu's height) and is refreshed in the background.
+  const highlightNote = el('div', { className: 'sheet-note', textContent: lastHighlightNote || 'Checking highlight analysis…' });
+  loadHighlightProgress().then(text => { lastHighlightNote = text; highlightNote.textContent = text; });
+  // The title and Done stay put; only the settings between them scroll
+  // (as in the Filters sheet).
   openSheet(
-    el('div', { className: 'sheet-title', textContent: 'Compilation mode' }),
-    el('div', { className: 'sheet-section' },
-      modeRow('original', 'Original', 'Untouched quality · brief flash between clips'),
-      modeRow('smooth', 'Smooth', 'Seamless playback and seeking · every clip re-encoded to one format')),
-    smooth ? choiceRow('Resolution', COMPILE_RES, 'res') : null,
-    smooth ? choiceRow('Frame rate', COMPILE_FPS, 'fps') : null,
-    smooth ? el('div', { className: 'sheet-note', textContent: 'Auto picks what most clips in the view are. Auto frame rate stays at 30 for 4K; 4K at 60 fps will likely stall.' }) : null,
-    smooth ? choiceRow('Frame', COMPILE_FRAME, 'frame') : null,
-    smooth ? el('div', { className: 'sheet-note', textContent: 'Fit puts every clip in one 16:9 frame (black bars on other shapes). Native keeps each clip\'s own shape; VLC resizes to match (a brief black flash when the shape changes).' }) : null,
-    choiceRow('Clip picks', COMPILE_PICK, 'pick'),
-    highlightNote,
-    lengthRow,
-    el('div', { className: 'sheet-note', textContent: highlights
-      ? 'Highlights follow the action: short bursts get short clips, sustained scenes up to 20 s. Videos not analysed yet get 10 s.'
-      : 'Every clip is the same length. Auto needs Highlights.' }),
-    smooth ? el('div', { className: 'sheet-note', textContent: 'Clips start on the keyframe just before the chosen spot, a little early, so less is downloaded from Drive.' }) : null,
+    el('div', { className: 'filter-top' },
+      el('div', { className: 'sheet-title filter-title', textContent: 'Compilation mode' })),
+    el('div', { className: 'sheet-scroll' },
+      el('div', { className: 'sheet-section' },
+        modeRow('original', 'Original', 'Untouched quality · brief flash between clips'),
+        modeRow('smooth', 'Smooth', 'Seamless playback and seeking · every clip re-encoded to one format')),
+      smooth ? choiceRow('Resolution', COMPILE_RES, 'res') : null,
+      smooth ? choiceRow('Frame rate', COMPILE_FPS, 'fps') : null,
+      smooth ? el('div', { className: 'sheet-note', textContent: 'Auto picks what most clips in the view are. Auto frame rate stays at 30 for 4K; 4K at 60 fps will likely stall.' }) : null,
+      smooth ? choiceRow('Frame', COMPILE_FRAME, 'frame') : null,
+      smooth ? el('div', { className: 'sheet-note', textContent: 'Fit puts every clip in one 16:9 frame (black bars on other shapes). Native keeps each clip\'s own shape; VLC resizes to match (a brief black flash when the shape changes).' }) : null,
+      choiceRow('Clip picks', COMPILE_PICK, 'pick'),
+      highlightNote,
+      lengthRow,
+      el('div', { className: 'sheet-note', textContent: highlights
+        ? 'Highlights follow the action: short bursts get short clips, sustained scenes up to 20 s. Videos not analysed yet get 10 s.'
+        : 'Every clip is the same length. Auto needs Highlights.' }),
+      smooth ? el('div', { className: 'sheet-note', textContent: 'Clips start on the keyframe just before the chosen spot, a little early, so less is downloaded from Drive.' }) : null),
     el('div', { className: 'sheet-row sheet-actions' },
       el('button', { type: 'button', className: 'sheet-btn primary', textContent: 'Done', onclick: closeSheet })));
+  sheet.classList.add('pinned-sheet');
+  sheet.querySelector('.sheet-scroll').scrollTop = keepScroll;
 }
 attachLongPress(browseCompileBtn, openCompileMenu);
 
