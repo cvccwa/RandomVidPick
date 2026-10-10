@@ -125,15 +125,18 @@ function clipLength(lenChoice, pick) {
 // Smooth-mode output height. Videos are classed by their short side, so a
 // portrait 1080x1920 counts as 1080p. Auto takes the highest class that at
 // least half the (known) clips reach - a few 4K videos in a mostly-1080p
-// view don't make the whole compilation 4K.
+// view don't make the whole compilation 4K. A chosen height is capped at
+// the highest class among the clips (when every clip's size is known):
+// 1080p videos encoded as 4K are only enlarged, at four times the encoding
+// work, with no added detail.
 function classOf(w, h) {
   const short = Math.min(w, h);
   return short >= 2000 ? 2160 : short >= 1300 ? 1440 : 1080;
 }
 
 function pickHeight(res, pool) {
-  if (res !== 'auto') return Number(res);
   const known = pool.filter(c => c.w > 0 && c.h > 0).map(c => classOf(c.w, c.h));
+  if (res !== 'auto') return known.length && known.length === pool.length ? Math.min(Number(res), Math.max(...known)) : Number(res);
   for (const h of [2160, 1440]) {
     if (known.length && known.filter(k => k >= h).length * 2 >= known.length) return h;
   }
@@ -143,9 +146,12 @@ function pickHeight(res, pool) {
 // Smooth-mode frame rate. Drive doesn't report it, so Auto reads it from the
 // first clips that will play (container header only) and uses 60 when at
 // least half of those are 50 fps or more. 4K stays at 30 under Auto - 4K60
-// is far more than the compile service can encode in real time.
+// is far more than the compile service can encode in real time. A chosen
+// 60 drops to 30 when the header check found every clip at under 50 fps:
+// 30 fps videos encoded at 60 only repeat each frame, at twice the work.
 const FPS_SAMPLE = 6;
 async function pickFps(fps, height, picked, media) {
+  if (fps === '60' && media.length && media.every(m => m?.fps > 0 && m.fps < 47)) return 30;
   if (fps !== 'auto') return Number(fps);
   if (height >= 2160) return 30;
   const token = await getServiceAccountToken();
